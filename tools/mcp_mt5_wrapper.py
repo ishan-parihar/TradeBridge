@@ -11,7 +11,7 @@ from mcp.server import Server
 import mcp.server.stdio
 
 
-BASE_URL = os.environ.get("MCP_HTTP_URL", "http://127.0.0.1:9131")
+BASE_URL = os.environ.get("MCP_HTTP_URL", "http://127.0.0.1:8010")
 
 
 async def _post_json(path: str, body: dict[str, Any]) -> dict[str, Any]:
