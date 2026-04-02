@@ -1,0 +1,14 @@
+[Unit]
+Description=MT5 Bridge Gateway
+After=network.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=MT5_TERMINAL_PATH=/home/ishanp/.local/share/bottles/bottles/Apps/drive_c/Program Files/MetaTrader 5
+WorkingDirectory=/home/ishanp/Documents/GitHub/MT5-mcp
+ExecStart=sh -c 'poetry run uvicorn apps.bridge_gateway.main:app --host 0.0.0.0 --port 8020'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+from typing import Any, Literal, Optional
+from pydantic import BaseModel, Field
+
+
+class HealthStatus(BaseModel):
+    state: Literal[
+        "healthy",
+        "degraded_read_only",
+        "degraded_write_blocked",
+        "disconnected",
+        "incident",
+    ] = "disconnected"
+    details: Optional[str] = None
+
+
+class TerminalStatus(BaseModel):
+    connected: bool
+    login: Optional[int] = None
+    server: Optional[str] = None
+    build: Optional[int] = None
+    path: Optional[str] = None
+    message: Optional[str] = None
+
+
+class AccountSummary(BaseModel):
+    account_id: Optional[str] = None
+    name: Optional[str] = None
+    balance: Optional[float] = None
+    equity: Optional[float] = None
+    margin: Optional[float] = None
+    free_margin: Optional[float] = None
+    currency: Optional[str] = None
+    environment: Literal["paper", "demo", "live"] = "demo"
+
+
+class Position(BaseModel):
+    position_id: str
+    symbol: str
+    side: Literal["buy", "sell"]
+    volume: float
+    entry_price: float
+    mark_price: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    unrealized_pnl: Optional[float] = None
+    strategy_id: Optional[str] = None
+    opened_at: Optional[str] = None
+    source: Optional[str] = None
+
+
+class Order(BaseModel):
+    order_id: str
+    symbol: str
+    side: Literal["buy", "sell"]
+    kind: Literal["market", "limit", "stop", "stop_limit"]
+    volume: float
+    price: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    status: Optional[str] = None
+
+
+class Bar(BaseModel):
+    time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    tick_volume: Optional[int] = None
+
+
+class Bars(BaseModel):
+    symbol: str
+    timeframe: str
+    as_of: Optional[str] = None
+    data: list[Bar]
+    source: Optional[str] = None
+    staleness_ms: Optional[int] = None
+
+
+class MarginEstimateRequest(BaseModel):
+    symbol: str
+    side: Literal["buy", "sell"]
+    volume_lots: float
+    price_hint: Optional[float] = None
+
+
+class MarginEstimate(BaseModel):
+    required_margin: float
+    leverage: Optional[float] = None
+    comment: Optional[str] = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class TradeIntent(BaseModel):
+    intent_id: str
+    strategy_id: str
+    account_id: str
+    environment: Literal["paper", "demo", "live"] = "demo"
+    symbol: str
+    side: Literal["buy", "sell"]
+    order_kind: Literal["market", "limit", "stop", "stop_limit"] = "market"
+    volume_lots: float
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    deviation_points: Optional[int] = 20
+    time_in_force: Optional[str] = "GTC"
+    rationale: Optional[str] = None
+    risk_tag: Optional[str] = None
+    approval_mode: Optional[
+        Literal[
+            "observe_only",
+            "recommend_only",
+            "human_approval_required",
+            "bounded_auto",
+            "full_auto",
+        ]
+    ] = "human_approval_required"
+    idempotency_key: Optional[str] = None
+    requested_at: Optional[str] = None
+
+
+class SimulationResult(BaseModel):
+    intent_id: str
+    status: Literal["simulated", "error"] = "simulated"
+    message: Optional[str] = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionResult(BaseModel):
+    intent_id: str
+    status: Literal[
+        "accepted",
+        "rejected",
+        "submitted",
+        "filled",
+        "partial",
+        "cancelled",
+        "error",
+    ]
+    adapter: Optional[str] = None
+    broker_order_id: Optional[str] = None
+    position_id: Optional[str] = None
+    retcode: Optional[str] = None
+    message: Optional[str] = None
+    requested_price: Optional[float] = None
+    executed_price: Optional[float] = None
+    slippage_points: Optional[int] = None
+    timestamp: Optional[str] = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+# Minimal request models for write-path scaffolding
+class ModifyOrderRequest(BaseModel):
+    order_id: str
+    new_price: Optional[float] = None
+    new_sl: Optional[float] = None
+    new_tp: Optional[float] = None
+
+
+class ClosePositionRequest(BaseModel):
+    position_id: str
+    volume: Optional[float] = None  # null -> full close
+
+
+class Heartbeat(BaseModel):
+    server: Optional[str] = None
+    build: Optional[int] = None
+    account_id: Optional[str] = None
+    login: Optional[int] = None
+    timestamp: Optional[str] = None
