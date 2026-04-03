@@ -57,9 +57,30 @@ class PyMT5Adapter(ExecutionPort):
             return True
         try:
             path = self._terminal_exe()
-            ok = self._mt5.initialize(path=path)
-            self._initialized = bool(ok)
-            if not ok:
+
+            # Use threading with timeout to prevent indefinite blocking
+            import threading
+
+            result = [None]
+
+            def init_thread():
+                try:
+                    result[0] = self._mt5.initialize(path=path)
+                except Exception as e:
+                    logger.warning("MT5.initialize exception: %s", e)
+                    result[0] = False
+
+            thread = threading.Thread(target=init_thread)
+            thread.daemon = True
+            thread.start()
+            thread.join(timeout=5.0)  # 5 second timeout
+
+            if thread.is_alive():
+                logger.warning("MT5.initialize timed out after 5s")
+                return False
+
+            self._initialized = bool(result[0])
+            if not self._initialized:
                 logger.warning("MT5.initialize failed for path=%s", path)
             return self._initialized
         except Exception as e:  # pragma: no cover - env dependent
@@ -142,7 +163,9 @@ class PyMT5Adapter(ExecutionPort):
                         tp=float(getattr(p, "tp", 0.0)) or None,
                         unrealized_pnl=float(getattr(p, "profit", 0.0)),
                         strategy_id=None,
-                        opened_at=str(getattr(p, "time_msc", "")) if getattr(p, "time_msc", None) else None,
+                        opened_at=str(getattr(p, "time_msc", ""))
+                        if getattr(p, "time_msc", None)
+                        else None,
                         source="pymt5",
                     )
                 )
@@ -163,14 +186,19 @@ class PyMT5Adapter(ExecutionPort):
                 # Map order type to kind; simplify to market/limit/stop
                 t = getattr(o, "type", 2)
                 side = "buy" if t in (0, 2, 4) else "sell"
-                kind: str = "limit" if t in (2, 3) else ("stop" if t in (4, 5) else "market")
+                kind: str = (
+                    "limit" if t in (2, 3) else ("stop" if t in (4, 5) else "market")
+                )
                 results.append(
                     Order(
                         order_id=str(getattr(o, "ticket", "")),
                         symbol=str(getattr(o, "symbol", "")),
                         side=side,
                         kind=kind,  # simplified
-                        volume=float(getattr(o, "volume_current", 0.0) or getattr(o, "volume_initial", 0.0)),
+                        volume=float(
+                            getattr(o, "volume_current", 0.0)
+                            or getattr(o, "volume_initial", 0.0)
+                        ),
                         price=float(getattr(o, "price_open", 0.0)) or None,
                         sl=float(getattr(o, "sl", 0.0)) or None,
                         tp=float(getattr(o, "tp", 0.0)) or None,
@@ -198,7 +226,9 @@ class PyMT5Adapter(ExecutionPort):
                             high=float(r["high"]),
                             low=float(r["low"]),
                             close=float(r["close"]),
-                            tick_volume=int(r["tick_volume"]) if "tick_volume" in r.dtype.names else None,
+                            tick_volume=int(r["tick_volume"])
+                            if "tick_volume" in r.dtype.names
+                            else None,
                         )
                     )
             return Bars(symbol=symbol, timeframe=timeframe, data=bars, source="pymt5")

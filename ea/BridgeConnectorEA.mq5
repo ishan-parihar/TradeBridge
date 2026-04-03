@@ -152,9 +152,8 @@ string JsonBars(const string symbol, const string timeframe, const int count)
 {
    EnsureSymbolInMarketWatch(symbol);
    
-   ENUM_TIMEFRAMES tf = PERIOD_M1;
-   if(timeframe=="M5") tf=PERIOD_M5; else if(timeframe=="M15") tf=PERIOD_M15; else if(timeframe=="M30") tf=PERIOD_M30;
-   else if(timeframe=="H1") tf=PERIOD_H1; else if(timeframe=="H4") tf=PERIOD_H4; else if(timeframe=="D1") tf=PERIOD_D1;
+   ENUM_TIMEFRAMES tf = TfFromString(timeframe);
+   if(tf == PERIOD_CURRENT) tf = PERIOD_M1;  // Default to M1 if invalid
    
    MqlRates rates[];
    ArrayResize(rates, count);
@@ -539,27 +538,57 @@ void ProcessCommand(const string cmd)
       string sym; if(!ParseKV(cmd, "symbol", sym)) { Fail(rid, "bad_args"); return; }
       string payload = JsonOrderBook(sym);
       Complete(rid, payload);
-   } else if(type=="submit_order"){
+    } else if(type=="submit_order"){
       string sym; string side; string vols; string sls; string tps; string devs;
       if(!ParseKV(cmd, "symbol", sym) || !ParseKV(cmd, "side", side) || !ParseKV(cmd, "volume_lots", vols)) { Fail(rid, "bad_args"); return; }
+      
+      // Symbol validation
+      if(!EnsureSymbolInMarketWatch(sym)) { Fail(rid, "symbol_not_found"); return; }
+      
       double vol = StringToDouble(vols);
       double sl = 0.0; double tp = 0.0; int dev=20;
       if(ParseKV(cmd, "sl", sls)) sl = StringToDouble(sls);
       if(ParseKV(cmd, "tp", tps)) tp = StringToDouble(tps);
       if(ParseKV(cmd, "deviation", devs)) dev = (int)StringToInteger(devs);
+      
+      // Get current prices for SL/TP validation
+      double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+      if(ask==0 || bid==0) { Fail(rid, "invalid_prices"); return; }
+      
+      // Validate SL/TP distances (minimum 10 points)
+      double min_distance = 10.0 * point;
+      if(sl > 0) {
+         double sl_distance = MathAbs((side=="buy" ? bid - sl : sl - ask));
+         if(sl_distance < min_distance) { Fail(rid, "sl_too_close"); return; }
+      }
+      if(tp > 0) {
+         double tp_distance = MathAbs((side=="buy" ? tp - ask : bid - tp));
+         if(tp_distance < min_distance) { Fail(rid, "tp_too_close"); return; }
+      }
+      
       string side_lower = side;
       StringToLower(side_lower);
       ENUM_ORDER_TYPE ot = (side_lower=="buy" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+      
+      // Detect supported filling mode
+      int filling_mask = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+      ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_FOK;
+      if((filling_mask & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) filling = ORDER_FILLING_FOK;
+      else if((filling_mask & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) filling = ORDER_FILLING_IOC;
+      else if((filling_mask & SYMBOL_FILLING_RETURN) == SYMBOL_FILLING_RETURN) filling = ORDER_FILLING_RETURN;
+      
       MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
       req.action = TRADE_ACTION_DEAL;
       req.symbol = sym;
       req.volume = vol;
       req.type = ot;
-      req.type_filling = ORDER_FILLING_FOK;
+      req.type_filling = filling;
       req.deviation = dev;
       if(sl>0) req.sl = sl; if(tp>0) req.tp = tp;
       bool ok = OrderSend(req, res);
-      string payload = StringFormat("{\"retcode\":%d,\"order\":%I64d,\"deal\":%I64d,\"ask\":%G,\"bid\":%G}", res.retcode, res.order, res.deal, SymbolInfoDouble(sym, SYMBOL_ASK), SymbolInfoDouble(sym, SYMBOL_BID));
+      string payload = StringFormat("{\"retcode\":%d,\"order\":%I64d,\"deal\":%I64d,\"ask\":%G,\"bid\":%G,\"filling\":\"%s\"}", res.retcode, res.order, res.deal, ask, bid, EnumToString(filling));
       if(ok && res.retcode==10009 /*TRADE_RETCODE_DONE*/)
          Complete(rid, payload);
       else

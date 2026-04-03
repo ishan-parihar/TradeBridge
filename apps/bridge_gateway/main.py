@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Request
 from datetime import datetime, timezone
 from typing import Optional
 import os
+import asyncio
 
 from mt5_mcp.observability.logging import setup_logging, logger
 from mt5_mcp.schemas.models import (
@@ -19,15 +20,45 @@ from mt5_mcp.schemas.models import (
 )
 from mt5_mcp.services.execution_gateway.service import ExecutionGateway
 from mt5_mcp.settings.config import get_settings
-from mt5_mcp.services.gateway_queue import queue_singleton as Q
+from mt5_mcp.services.gateway_queue import get_queue
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Gauge
 from fastapi.responses import Response, PlainTextResponse
 
 
 setup_logging()
 app = FastAPI(title="MT5 Bridge Gateway", version="0.1.0")
-gw = ExecutionGateway()
-settings = get_settings()
+
+# Lazy initialization to prevent blocking during import
+_queue_cached = None
+_gw_cached = None
+_settings_cached = None
+
+
+def get_queue_cached():
+    global _queue_cached
+    if _queue_cached is None:
+        _queue_cached = get_queue()
+    return _queue_cached
+
+
+def get_gateway_cached():
+    global _gw_cached
+    if _gw_cached is None:
+        _gw_cached = ExecutionGateway()
+    return _gw_cached
+
+
+def get_settings_cached():
+    global _settings_cached
+    if _settings_cached is None:
+        _settings_cached = get_settings()
+    return _settings_cached
+
+
+# Use lazy getters instead of module-level instantiation
+Q = None  # Will be initialized on first use via get_queue_cached()
+gw = None  # Will be initialized on first use via get_gateway_cached()
+settings = None  # Will be initialized on first use via get_settings_cached()
 
 # In-memory heartbeat state for EA
 _last_heartbeat: dict[str, Optional[str | int]] = {
@@ -38,6 +69,7 @@ _last_heartbeat: dict[str, Optional[str | int]] = {
     "timestamp": None,
 }
 _last_heartbeat_at: Optional[datetime] = None
+_heartbeat_lock = asyncio.Lock()
 
 # Basic Prometheus gauges
 GAUGE_QUEUE_DEPTH = Gauge("bridge_queue_depth", "Current command queue depth")
@@ -68,18 +100,18 @@ def _secret_ok(request: Request, params: dict | None = None) -> bool:
 def bridge_health(request: Request) -> dict[str, str]:
     if not _secret_ok(request):
         raise HTTPException(status_code=401, detail="unauthorized")
-    return {"state": gw.health().state}
+    return {"state": get_gateway_cached().health().state}
 
 
 @app.post("/bridge/account/summary", response_model=AccountSummary)
 def bridge_account_summary() -> AccountSummary:
-    return gw.account_summary()
+    return get_gateway_cached().account_summary()
 
 
 @app.post("/bridge/market/bars", response_model=Bars)
-def bridge_bars(symbol: str, timeframe: str, count: int = 100) -> Bars:
+async def bridge_bars(symbol: str, timeframe: str, count: int = 100) -> Bars:
     """Fetch bars via EA bridge with fallback to pymt5"""
-    import time
+    import asyncio
     import json
 
     # Check if EA is connected
@@ -112,20 +144,20 @@ def bridge_bars(symbol: str, timeframe: str, count: int = 100) -> Bars:
                         source="bridge",
                     )
                 break
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
 
     # Fallback to pymt5
-    return gw.get_bars(symbol, timeframe, count)
+    return get_gateway_cached().get_bars(symbol, timeframe, count)
 
 
 @app.post("/bridge/positions/open", response_model=list[Position])
 def bridge_positions_open() -> list[Position]:
-    return gw.adapter.get_positions()
+    return get_gateway_cached().adapter.get_positions()
 
 
 @app.post("/bridge/orders/pending", response_model=list[Order])
 def bridge_orders_pending() -> list[Order]:
-    return gw.adapter.get_orders()
+    return get_gateway_cached().adapter.get_orders()
 
 
 @app.post("/bridge/orders/submit", response_model=ExecutionResult)
@@ -190,16 +222,17 @@ async def bridge_terminal_heartbeat(request: Request) -> dict[str, str]:
         data.get("timestamp") if isinstance(data.get("timestamp"), (str,)) else None
     )
 
-    _last_heartbeat = {
-        "server": server,
-        "build": build,
-        "account_id": account_id,
-        "login": login,
-        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
-    }
-    if not _secret_ok(request, _last_heartbeat):
-        raise HTTPException(status_code=401, detail="unauthorized")
-    _last_heartbeat_at = datetime.now(timezone.utc)
+    async with _heartbeat_lock:
+        _last_heartbeat = {
+            "server": server,
+            "build": build,
+            "account_id": account_id,
+            "login": login,
+            "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+        }
+        if not _secret_ok(request, _last_heartbeat):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        _last_heartbeat_at = datetime.now(timezone.utc)
     logger.info(
         "heartbeat",
         extra={
@@ -303,9 +336,10 @@ def bridge_commands_enqueue(
         payload["price"] = price
     if kind is not None:
         payload["kind"] = kind
-    cmd_id = Q.enqueue(type, payload)
+    queue = get_queue_cached()
+    cmd_id = queue.enqueue(type, payload)
     try:
-        depth = getattr(Q, "depth", lambda: 0)()
+        depth = getattr(queue, "depth", lambda: 0)()
         GAUGE_QUEUE_DEPTH.set(depth)
     except Exception:
         pass
@@ -316,7 +350,8 @@ def bridge_commands_enqueue(
 def bridge_commands_next(request: Request) -> PlainTextResponse:
     if not _secret_ok(request):
         raise HTTPException(status_code=401, detail="unauthorized")
-    cmd = Q.next()
+    queue = get_queue_cached()
+    cmd = queue.next()
     if not cmd:
         return PlainTextResponse("NONE")
     # Return simple key=value list for easy parsing in MQL5
@@ -378,21 +413,23 @@ async def bridge_results(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=422, detail="missing request_id")
 
     # Maintain existing storage layout: result is a dict with 'payload' string
+    queue = get_queue_cached()
     if status == "ok":
         result_data = {"payload": payload or ""}
-        completed = Q.complete(request_id, result_data)
+        completed = queue.complete(request_id, result_data)
         logger.info(
             f"RESULTS: request_id={request_id} completed={completed} payload_len={len(str(payload)) if payload else 0}"
         )
     else:
-        failed = Q.fail(request_id, str(error or "unknown"))
+        failed = queue.fail(request_id, str(error or "unknown"))
         logger.info(f"RESULTS: request_id={request_id} failed={failed} error={error}")
     return {"status": "ok"}
 
 
 @app.get("/bridge/results/{request_id}")
 def bridge_results_get(request_id: str) -> dict[str, object]:
-    cmd = Q.get(request_id)
+    queue = get_queue_cached()
+    cmd = queue.get(request_id)
     if not cmd:
         raise HTTPException(status_code=404, detail="not found")
     return {
@@ -405,7 +442,8 @@ def bridge_results_get(request_id: str) -> dict[str, object]:
 @app.get("/metrics")
 def metrics() -> Response:
     try:
-        depth = getattr(Q, "depth", lambda: 0)()
+        queue = get_queue_cached()
+        depth = getattr(queue, "depth", lambda: 0)()
         GAUGE_QUEUE_DEPTH.set(depth)
     except Exception:
         pass

@@ -3,7 +3,11 @@ from __future__ import annotations
 import os
 import json
 import asyncio
+import subprocess
+import time
+import socket
 from typing import Any
+from pathlib import Path
 
 import httpx
 from mcp import types
@@ -12,6 +16,105 @@ import mcp.server.stdio
 
 
 BASE_URL = os.environ.get("MCP_HTTP_URL", "http://127.0.0.1:8010")
+GATEWAY_URL = os.environ.get("MT5_GATEWAY_URL", "http://127.0.0.1:8020")
+
+
+def _is_port_in_use(port: int) -> bool:
+    """Check if a port is already in use."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _get_project_root() -> Path:
+    """Get the project root directory."""
+    return Path(__file__).parent.parent
+
+
+def _start_server(name: str, port: int, script: str) -> subprocess.Popen | None:
+    """Start a backend server if not already running."""
+    if _is_port_in_use(port):
+        return None
+
+    project_root = _get_project_root()
+    script_path = project_root / script
+
+    if not script_path.exists():
+        print(
+            f"Warning: {script} not found at {script_path}",
+            file=__import__("sys").stderr,
+        )
+        return None
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root / "src")
+
+    try:
+        proc = subprocess.Popen(
+            ["python", str(script_path)],
+            cwd=str(project_root),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print(f"Started {name} (PID: {proc.pid})", file=__import__("sys").stderr)
+        return proc
+    except Exception as e:
+        print(f"Failed to start {name}: {e}", file=__import__("sys").stderr)
+        return None
+
+
+async def ensure_servers_running_async() -> None:
+    """Ensure backend servers are running (non-blocking async version)."""
+    started = []
+
+    # Start Gateway first (port 8020)
+    if not _is_port_in_use(8020):
+        proc = _start_server("Bridge Gateway", 8020, "apps/bridge_gateway/main.py")
+        if proc:
+            started.append(("Gateway", 8020))
+            await asyncio.sleep(0.5)  # Non-blocking wait
+
+    # Start MCP Server (port 8010)
+    if not _is_port_in_use(8010):
+        proc = _start_server("MCP Server", 8010, "apps/mcp_server/main.py")
+        if proc:
+            started.append(("MCP Server", 8010))
+            await asyncio.sleep(0.5)  # Non-blocking wait
+
+    # Verify servers are responding (async with timeout)
+    for name, port in started:
+        for _ in range(10):  # Max 5 second wait
+            if _is_port_in_use(port):
+                break
+            await asyncio.sleep(0.5)
+        if not _is_port_in_use(port):
+            print(
+                f"Warning: {name} on port {port} not responding",
+                file=__import__("sys").stderr,
+            )
+
+    if started:
+        print(
+            f"Backend servers started: {', '.join(f'{n} ({p})' for n, p in started)}",
+            file=__import__("sys").stderr,
+        )
+    else:
+        print("Backend servers already running", file=__import__("sys").stderr)
+
+
+def ensure_servers_running() -> None:
+    """Ensure backend servers are running (sync wrapper for backwards compat)."""
+    # Run async version in a new event loop if needed
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # In async context, should use ensure_servers_running_async instead
+            return
+        loop.run_until_complete(ensure_servers_running_async())
+    except RuntimeError:
+        # No event loop, create one
+        asyncio.run(ensure_servers_running_async())
 
 
 async def _post_json(path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +154,19 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "symbol": {"type": "string"},
                 "timeframe": {"type": "string"},
                 "indicator": {"type": "string"},
+                "period": {"type": ["number", "null"]},
+                "fast": {"type": ["number", "null"]},
+                "slow": {"type": ["number", "null"]},
+                "signal": {"type": ["number", "null"]},
+                "deviation": {"type": ["number", "null"]},
+                "shift": {"type": ["number", "null"]},
+                "k_period": {"type": ["number", "null"]},
+                "d_period": {"type": ["number", "null"]},
+                "slowing": {"type": ["number", "null"]},
+                "tenkan": {"type": ["number", "null"]},
+                "kijun": {"type": ["number", "null"]},
+                "senkou": {"type": ["number", "null"]},
+                "window": {"type": ["number", "null"]},
             },
             "required": ["symbol", "timeframe", "indicator"],
         },
@@ -123,7 +239,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "volume_lots": {"type": "number"},
                 "sl": {"type": ["number", "null"]},
                 "tp": {"type": ["number", "null"]},
-                "deviation_points": {"type": "number"},
+                "deviation": {"type": "number"},
             },
             "required": ["symbol", "side", "kind", "price", "volume_lots"],
         },
@@ -224,7 +340,7 @@ async def list_tools() -> list[types.Tool]:
             types.Tool(
                 name=name,
                 description=spec.get("description", name),
-                input_schema=spec.get("schema", {"type": "object"}),
+                inputSchema=spec.get("schema", {"type": "object"}),
             )
         )
     return tools
@@ -283,8 +399,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
 
 
 async def run() -> None:
-    async with mcp.server.stdio.stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
+    import sys
+    import traceback
+
+    try:
+        # Ensure backend servers are running before initializing (async, non-blocking)
+        await ensure_servers_running_async()
+
+        async with mcp.server.stdio.stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+    except Exception as e:
+        print(f"MCP Server initialization failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -181,7 +181,8 @@ def _select_queue():
     try:
         import redis
 
-        r = redis.Redis.from_url(url, decode_responses=True)
+        # Add socket_timeout to prevent long hangs (fixes 2s+ delay when Redis unavailable)
+        r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=0.5)
         r.ping()
         rq = RedisQueue(url)
         return rq
@@ -189,4 +190,15 @@ def _select_queue():
         return InMemoryQueue()
 
 
-queue_singleton = _select_queue()
+_queue_singleton = None
+
+
+def get_queue():
+    global _queue_singleton
+    if _queue_singleton is None:
+        _queue_singleton = _select_queue()
+    return _queue_singleton
+
+
+# Keep old name for backwards compatibility but use lazy init
+queue_singleton = get_queue()
