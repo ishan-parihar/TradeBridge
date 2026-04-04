@@ -287,6 +287,14 @@ def resource_bridge_terminal_status() -> TerminalStatus:
 
 
 # Bridge-backed tools (EA polling model)
+# TCP Bridge: low-latency push communication (port 8025)
+# HTTP Bridge: legacy polling fallback (port 8020)
+
+import os as _os
+
+_TCP_BRIDGE_ENABLED = _os.getenv("MT5_TCP_BRIDGE_ENABLED", "true").lower() == "true"
+
+
 def _parse_payload(payload) -> dict:
     """Parse EA payload, handling both string and dict formats."""
     import json
@@ -302,11 +310,7 @@ def _parse_payload(payload) -> dict:
 
 
 def _await_result(req_id: str, timeout_s: float = 20.0, poll_s: float = 0.1) -> dict:
-    """Wait for bridge command result.
-
-    Poll interval reduced from 0.5s to 0.1s for 5x faster response detection.
-    Uses persistent HTTP client (no TCP handshake per poll).
-    """
+    """Wait for bridge command result."""
     import time as _t
 
     gw_url = get_settings_cached().gateway_url
@@ -322,21 +326,91 @@ def _await_result(req_id: str, timeout_s: float = 20.0, poll_s: float = 0.1) -> 
     return {"status": "timeout", "error": "timeout"}
 
 
+def _tcp_send_and_await(
+    type: str, payload: dict[str, Any], timeout_s: float = 20.0
+) -> dict[str, Any]:
+    """Send command via TCP bridge and await result.
+
+    Falls back to HTTP if TCP bridge is unavailable.
+    """
+    if not _TCP_BRIDGE_ENABLED:
+        return None
+
+    try:
+        from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
+        import asyncio
+
+        tcp_client = TCPBridgeClient()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(tcp_client.connect())
+            result = loop.run_until_complete(
+                tcp_client.send_command(type, payload, timeout=timeout_s)
+            )
+            inner = result.get("payload", result)
+            return {"status": "completed", "result": {"payload": inner}}
+        except Exception:
+            return None
+        finally:
+            loop.run_until_complete(tcp_client.close())
+            loop.close()
+    except Exception:
+        return None
+
+
 def _batch_enqueue_and_await(
     commands: list[dict[str, Any]], timeout_s: float = 20.0
 ) -> list[dict]:
-    """Enqueue multiple bridge commands and await all results.
+    """Enqueue multiple bridge commands and await all results."""
+    tcp_ok = False
+    if _TCP_BRIDGE_ENABLED:
+        try:
+            from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
+            import asyncio
 
-    All commands are enqueued in a single HTTP POST batch, then polled
-    together. This reduces N sequential round-trips to 1 enqueue + 1 poll cycle.
+            tcp_client = TCPBridgeClient()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(tcp_client.connect())
 
-    Args:
-        commands: List of dicts with 'type' and payload keys.
-        timeout_s: Max wait time for all results.
+                async def _run_all():
+                    results = [None] * len(commands)
+                    tasks = []
+                    for i, cmd in enumerate(commands):
+                        task = asyncio.create_task(
+                            tcp_client.send_command(
+                                type=cmd["type"],
+                                payload={k: v for k, v in cmd.items() if k != "type"},
+                                timeout=timeout_s,
+                            )
+                        )
+                        tasks.append((i, task))
+                    for i, task in tasks:
+                        try:
+                            result = await asyncio.wait_for(task, timeout=timeout_s)
+                            inner = result.get("payload", result)
+                            results[i] = {
+                                "status": "completed",
+                                "result": {"payload": inner},
+                            }
+                        except asyncio.TimeoutError:
+                            results[i] = {"status": "timeout", "error": "timeout"}
+                        except Exception as e:
+                            results[i] = {"status": "error", "error": str(e)}
+                    return results
 
-    Returns:
-        List of result dicts in the same order as input commands.
-    """
+                results = loop.run_until_complete(_run_all())
+                tcp_ok = True
+                return results
+            finally:
+                loop.run_until_complete(tcp_client.close())
+                loop.close()
+        except Exception:
+            pass
+
+    if tcp_ok:
+        return []
+
     import time as _t
 
     gw_url = get_settings_cached().gateway_url
@@ -471,9 +545,27 @@ def _error_payload(error: object) -> object:
 @app.post("/tools/get_bars", response_model=Bars)
 def tool_get_bars(req: BarsRequest) -> Bars:
     symbol_normalized = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "get_bars",
+        {"symbol": symbol_normalized, "timeframe": req.timeframe, "count": req.count},
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            import json
+
+            data = json.loads(payload)
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {"data": []}
+        if "symbol" in data:
+            data["symbol"] = denormalize_symbol(data["symbol"])
+        return Bars(**data)
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
-    # enqueue
     r = client.post(
         f"{gw_url}/bridge/commands/enqueue",
         params={
@@ -491,7 +583,6 @@ def tool_get_bars(req: BarsRequest) -> Bars:
             symbol=req.symbol, timeframe=req.timeframe, data=[], source="bridge"
         )
     payload = res.get("result", {}).get("payload", {})
-    # Handle both string and dict payloads
     if isinstance(payload, str):
         try:
             import json
@@ -503,8 +594,6 @@ def tool_get_bars(req: BarsRequest) -> Bars:
         data = payload
     else:
         data = {"data": []}
-    # Expect payload: {"symbol":"...","timeframe":"...","data":[{"time":...,"open":...}]}
-    # Denormalize symbol in response for user-facing display
     if "symbol" in data:
         data["symbol"] = denormalize_symbol(data["symbol"])
     return Bars(**data)
@@ -530,6 +619,57 @@ _INDICATOR_DEFAULTS: dict[str, dict[str, int]] = {
 @app.post("/tools/get_indicator")
 def tool_get_indicator(req: IndicatorRequest) -> dict:
     symbol_normalized = normalize_symbol(req.symbol)
+    gw_url = get_settings_cached().gateway_url
+    params = {
+        "type": "get_indicator",
+        "symbol": symbol_normalized,
+        "timeframe": req.timeframe,
+        "indicator": req.indicator,
+    }
+
+    # Inject sensible defaults for advanced indicators so AI agent never gets bad_args
+    indicator_lower = req.indicator.lower() if req.indicator else ""
+    defaults = _INDICATOR_DEFAULTS.get(indicator_lower, {})
+    for key, default_val in defaults.items():
+        current = getattr(req, key, None)
+        if current is None:
+            setattr(req, key, default_val)
+
+    # Only include optional params when provided
+    for key, val in (
+        ("period", req.period),
+        ("fast", req.fast),
+        ("slow", req.slow),
+        ("signal", req.signal),
+        ("deviation", req.deviation),
+        ("shift", req.shift),
+        ("k_period", req.k_period),
+        ("d_period", req.d_period),
+        ("slowing", req.slowing),
+        ("tenkan", req.tenkan),
+        ("kijun", req.kijun),
+        ("senkou", req.senkou),
+        ("window", req.window),
+    ):
+        if val is not None:
+            params[key] = val
+
+    # TCP-first: try direct TCP command, fall back to HTTP polling
+    tcp_result = _tcp_send_and_await("get_indicator", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            import json
+
+            data = json.loads(payload)
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {}
+        if "symbol" in data:
+            data["symbol"] = denormalize_symbol(data["symbol"])
+        return data
+
     gw_url = get_settings_cached().gateway_url
     params = {
         "type": "get_indicator",
@@ -594,6 +734,26 @@ def tool_get_indicator(req: IndicatorRequest) -> dict:
 @app.post("/tools/get_chart_screenshot", response_model=ChartScreenshotResult)
 def tool_get_chart_screenshot(req: ChartScreenshotRequest) -> ChartScreenshotResult:
     symbol_normalized = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "get_chart_screenshot",
+        {
+            "symbol": symbol_normalized,
+            "timeframe": req.timeframe,
+            "width": req.width,
+            "height": req.height,
+        },
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        if isinstance(payload, str):
+            data = _parse_payload(payload)
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {"image_base64": ""}
+        return ChartScreenshotResult(**data)
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -620,6 +780,26 @@ def tool_get_chart_screenshot(req: ChartScreenshotRequest) -> ChartScreenshotRes
 @app.post("/tools/get_ticks", response_model=dict)
 def tool_get_ticks(req: TicksRequest) -> dict:
     symbol_normalized = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "get_ticks",
+        {"symbol": symbol_normalized, "count": req.count},
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        if isinstance(payload, str):
+            try:
+                data = _parse_payload(payload)
+            except Exception:
+                data = {}
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {}
+        if "symbol" in data:
+            data["symbol"] = denormalize_symbol(data["symbol"])
+        return data
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -649,6 +829,26 @@ def tool_get_ticks(req: TicksRequest) -> dict:
 @app.post("/tools/get_order_book", response_model=dict)
 def tool_get_order_book(req: OrderBookRequest) -> dict:
     symbol_normalized = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "get_order_book",
+        {"symbol": symbol_normalized},
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        if isinstance(payload, str):
+            try:
+                data = _parse_payload(payload)
+            except Exception:
+                data = {}
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {}
+        if "symbol" in data:
+            data["symbol"] = denormalize_symbol(data["symbol"])
+        return data
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -678,6 +878,23 @@ def post_tool_get_symbol_info(req: SymbolInfoRequest) -> dict:
 
 def tool_get_symbol_info(symbol: str) -> dict:
     symbol_normalized = normalize_symbol(symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "get_symbol_info",
+        {"symbol": symbol_normalized},
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        if isinstance(payload, str):
+            data = _parse_payload(payload)
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {}
+        if "symbol" in data:
+            data["symbol"] = denormalize_symbol(data["symbol"])
+        return data
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -711,6 +928,16 @@ def tool_get_deals_history(
     }
     if symbol:
         params["symbol"] = normalize_symbol(symbol)
+
+    tcp_result = _tcp_send_and_await("get_deals_history", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        data = _parse_payload(payload)
+        for deal in data.get("deals", []):
+            if "symbol" in deal:
+                deal["symbol"] = denormalize_symbol(deal["symbol"])
+        return data
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -740,6 +967,11 @@ def tool_modify_order(req: ModOrderReq) -> dict:
         params["new_sl"] = req.new_sl
     if req.new_tp is not None:
         params["new_tp"] = req.new_tp
+
+    tcp_result = _tcp_send_and_await("modify_order", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -759,6 +991,11 @@ def tool_close_all_positions(req: CloseAllPositionsRequest) -> dict:
     params: dict[str, object] = {"type": "close_all_positions", "side": req.side}
     if req.symbol is not None and req.symbol != "":
         params["symbol"] = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await("close_all_positions", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -778,6 +1015,11 @@ def tool_cancel_all_orders(req: CancelAllOrdersRequest) -> dict:
     params: dict[str, object] = {"type": "cancel_all_orders", "side": req.side}
     if req.symbol is not None and req.symbol != "":
         params["symbol"] = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await("cancel_all_orders", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -805,6 +1047,43 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
         raise HTTPException(status_code=403, detail=decision.reason or "denied")
     # Normalize symbol for EA
     symbol_normalized = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "submit_order",
+        {
+            "symbol": symbol_normalized,
+            "side": req.side,
+            "volume_lots": req.volume_lots,
+            "sl": req.sl or 0,
+            "tp": req.tp or 0,
+            "deviation": req.deviation_points or 20,
+        },
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        try:
+            data = _parse_payload(payload)
+        except Exception:
+            data = {}
+        retcode = data.get("retcode")
+        retcode_mapped = _map_trade_retcode(retcode)
+        success_retcodes = {10009, 10008}
+        try:
+            retcode_int = int(retcode) if retcode else None
+        except:
+            retcode_int = None
+        if retcode_int not in success_retcodes:
+            return _build_trade_error_result(req.intent_id, data)
+        return ExecutionResult(
+            intent_id=req.intent_id,
+            status="submitted",
+            adapter="EASocketAdapter",
+            broker_order_id=str(data.get("order", "")) if data else None,
+            retcode=retcode_mapped,
+            message=f"Order submitted successfully (retcode={retcode_int})",
+            raw=data,
+        )
+
     # Enqueue order submit and await result
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
@@ -858,6 +1137,20 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
 
 @app.get("/tools/get_account_summary", response_model=dict)
 def tool_get_account_summary() -> dict:
+    tcp_result = _tcp_send_and_await("get_account", {})
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                data = _parse_payload(payload)
+            except Exception:
+                data = {}
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {}
+        return data
+
     # via EA bridge command
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
@@ -884,6 +1177,15 @@ def tool_get_account_summary() -> dict:
 
 @app.get("/tools/get_positions", response_model=dict)
 def tool_get_positions() -> dict:
+    tcp_result = _tcp_send_and_await("get_positions", {})
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        try:
+            data = _parse_payload(payload)
+        except Exception:
+            data = {}
+        return data
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -903,6 +1205,15 @@ def tool_get_positions() -> dict:
 
 @app.get("/tools/get_orders", response_model=dict)
 def tool_get_orders() -> dict:
+    tcp_result = _tcp_send_and_await("get_orders", {})
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        try:
+            data = _parse_payload(payload)
+        except Exception:
+            data = {}
+        return data
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -922,6 +1233,13 @@ def tool_get_orders() -> dict:
 
 @app.post("/tools/modify_position_sl_tp", response_model=dict)
 def tool_modify_position_sl_tp(req: ModifyPositionSLTPRequest) -> dict:
+    tcp_result = _tcp_send_and_await(
+        "modify_position_sl_tp",
+        {"position_id": req.position_id, "sl": req.sl or 0, "tp": req.tp or 0},
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -943,6 +1261,13 @@ def tool_modify_position_sl_tp(req: ModifyPositionSLTPRequest) -> dict:
 
 @app.post("/tools/close_position", response_model=dict)
 def tool_close_position(req: ClosePosReq) -> dict:
+    tcp_result = _tcp_send_and_await(
+        "close_position",
+        {"position_id": req.position_id, "volume": req.volume or 0},
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -971,6 +1296,23 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
     if not decision.allowed:
         raise HTTPException(status_code=403, detail=decision.reason or "denied")
     symbol_normalized = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "submit_pending_order",
+        {
+            "symbol": symbol_normalized,
+            "side": req.side,
+            "kind": req.kind,
+            "price": req.price,
+            "volume_lots": req.volume_lots,
+            "sl": req.sl or 0,
+            "tp": req.tp or 0,
+            "deviation": req.deviation,
+        },
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(
@@ -997,6 +1339,13 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
 
 @app.post("/tools/cancel_order", response_model=dict)
 def tool_cancel_order(req: CancelOrderRequest) -> dict:
+    tcp_result = _tcp_send_and_await(
+        "cancel_order",
+        {"order_id": req.order_id},
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
     r = client.post(

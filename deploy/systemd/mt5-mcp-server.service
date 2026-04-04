@@ -1,0 +1,36 @@
+[Unit]
+Description=MT5-MCP Server
+Documentation=file:///home/ishanp/Documents/GitHub/MT5-mcp/deploy/README.md
+After=network.target mt5-tcp-bridge.service mt5-http-gateway.service
+Wants=mt5-tcp-bridge.service mt5-http-gateway.service network-online.target
+
+[Service]
+Type=simple
+User=mt5-bridge
+Group=mt5-bridge
+WorkingDirectory=/opt/mt5-mcp
+
+Environment=MT5_GATEWAY_URL=http://127.0.0.1:8020
+Environment=MT5_TCP_BRIDGE_ENABLED=true
+Environment=MT5_TCP_BRIDGE_PORT=8025
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/mt5-mcp/.venv/bin/uvicorn apps.mcp_server.main:app --host 127.0.0.1 --port 8010
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mt5-mcp-server
+
+ReadWritePaths=/opt/mt5-mcp
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

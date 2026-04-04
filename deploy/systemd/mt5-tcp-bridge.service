@@ -1,0 +1,35 @@
+[Unit]
+Description=MT5-MCP TCP Bridge Server
+Documentation=file:///home/ishanp/Documents/GitHub/MT5-mcp/deploy/README.md
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mt5-bridge
+Group=mt5-bridge
+WorkingDirectory=/opt/mt5-mcp
+
+Environment=MT5_TCP_BRIDGE_PORT=8025
+Environment=MT5_TCP_BRIDGE_HOST=127.0.0.1
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/mt5-mcp/.venv/bin/python -m apps.tcp_bridge.main
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mt5-tcp-bridge
+
+ReadWritePaths=/opt/mt5-mcp
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

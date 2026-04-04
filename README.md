@@ -4,20 +4,31 @@ A production-ready bridge between MetaTrader 5 and Model Context Protocol (MCP),
 
 ## Architecture
 
+### TCP Bridge (Low-Latency, Recommended)
+
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────┐
-│  MCP Server │────▶│   Bridge     │────▶│   MQL5 EA   │────▶│  MT5     │
-│  (Port 8010)│     │   Gateway    │     │  (Wine)     │     │ Terminal │
-│             │◀────│  (Port 8020) │◀────│             │◀────│          │
-└─────────────┘     └──────────────┘     └─────────────┘     └──────────┘
+┌─────────────┐     ┌──────────────────┐     ┌─────────────┐     ┌──────────┐
+│  MCP Server │────▶│  TCP Bridge      │────▶│   MQL5 EA   │────▶│  MT5     │
+│  (Port 8010)│     │  (Port 8025)     │     │  (Wine)     │     │ Terminal │
+│             │◀────│  (asyncio TCP)   │◀────│  (sockets)  │◀────│          │
+└─────────────┘     └──────────────────┘     └─────────────┘     └──────────┘
      ▲                                                                                    │
      │                                                                                    │
      └──────────────────── AI Agents / CLI ──────────────────────────────────────────────┘
 ```
 
+**Latency**: ~15-25ms end-to-end (vs ~600ms with HTTP polling)
+
+**Protocol**: Length-prefixed JSON frames over raw TCP sockets (MQL5 `SocketCreate()`/`SocketConnect()`).
+
+### HTTP Bridge (Legacy Fallback)
+
+The original HTTP polling model remains functional. Set `EnableTCPBridge=false` in EA parameters or `MT5_TCP_BRIDGE_ENABLED=false` to use it.
+
 **Key Design Decisions:**
 - **Linux-Compatible**: Uses MQL5 EA bridge instead of Python MT5 module (which doesn't work on Linux)
-- **Polling Model**: EA polls gateway for commands, posts results back (no reverse connections needed)
+- **TCP Push Model** (default): EA maintains persistent TCP connection to bridge server — commands pushed instantly, no polling
+- **HTTP Fallback**: Automatic fallback to HTTP polling if TCP unavailable
 - **In-Memory Queue**: Falls back to in-memory if Redis unavailable
 - **Demo-First Policy**: Execution tools gated for demo accounts in R&D
 
@@ -51,10 +62,13 @@ export MT5_REDIS_URL="redis://localhost:6379/0"  # Optional
 ### Start Services
 
 ```bash
-# Terminal 1: Bridge Gateway
+# Terminal 1: TCP Bridge Server (recommended, port 8025)
+poetry run python -m apps.tcp_bridge.main
+
+# Terminal 2: Bridge Gateway (HTTP fallback, port 8020)
 poetry run uvicorn apps.bridge_gateway.main:app --host 127.0.0.1 --port 8020
 
-# Terminal 2: MCP Server
+# Terminal 3: MCP Server (port 8010)
 poetry run uvicorn apps.mcp_server.main:app --host 127.0.0.1 --port 8010
 ```
 
@@ -62,12 +76,20 @@ poetry run uvicorn apps.mcp_server.main:app --host 127.0.0.1 --port 8010
 
 1. **Compile EA**: Open `ea/BridgeConnectorEA.mq5` in MetaEditor, press F7
 2. **Attach to Chart**: Drag EA onto any chart (e.g., XAUUSDm M1)
-3. **Enable WebRequest**: 
+3. **Configure TCP Bridge** (recommended):
+   - In EA inputs, ensure `EnableTCPBridge = true` (default)
+   - `TCPBridgeHost = 127.0.0.1`
+   - `TCPBridgePort = 8025`
+4. **Enable WebRequest**: 
    - Tools → Options → Expert Advisors
    - ✓ Allow WebRequest for listed URL
-   - Add: `http://127.0.0.1:8020`
-4. **Verify Connection**:
+   - Add: `http://127.0.0.1:8020` (for HTTP fallback)
+5. **Verify Connection**:
    ```bash
+   # TCP Bridge status
+   curl -s http://127.0.0.1:8025/status 2>/dev/null || echo "TCP Bridge not running"
+   
+   # HTTP Gateway status (fallback)
    curl -s http://127.0.0.1:8020/bridge/terminal/status | jq .
    # Expected: {"connected": true, "login": 123456, ...}
    ```

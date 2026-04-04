@@ -1,0 +1,146 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: mt5-redis
+    ports:
+      - "${MT5_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mt5-mcp-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+        reservations:
+          memory: 64M
+          cpus: "0.10"
+
+  tcp-bridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        TARGET: tcp-bridge
+    container_name: mt5-tcp-bridge
+    environment:
+      - MT5_TCP_BRIDGE_PORT=8025
+      - MT5_TCP_BRIDGE_HOST=0.0.0.0
+      - MT5_REDIS_URL=redis://redis:6379/0
+      - MT5_GATEWAY_URL=http://http-gateway:8020
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "${MT5_TCP_BRIDGE_PORT:-8025}:8025"
+    networks:
+      - mt5-mcp-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 8025)); s.close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+        reservations:
+          memory: 128M
+          cpus: "0.25"
+
+  http-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        TARGET: http-gateway
+    container_name: mt5-http-gateway
+    environment:
+      - MT5_GATEWAY_URL=http://0.0.0.0:8020
+      - MT5_REDIS_URL=redis://redis:6379/0
+      - MT5_TCP_BRIDGE_ENABLED=true
+      - MT5_TCP_BRIDGE_PORT=8025
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "${MT5_GATEWAY_PORT:-8020}:8020"
+    networks:
+      - mt5-mcp-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/bridge/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+        reservations:
+          memory: 128M
+          cpus: "0.25"
+
+  mcp-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        TARGET: mcp-server
+    container_name: mt5-mcp-server
+    environment:
+      - MT5_GATEWAY_URL=http://http-gateway:8020
+      - MT5_REDIS_URL=redis://redis:6379/0
+      - MT5_TCP_BRIDGE_ENABLED=true
+      - MT5_TCP_BRIDGE_PORT=8025
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "${MT5_MCP_SERVER_PORT:-8010}:8010"
+    networks:
+      - mt5-mcp-net
+    depends_on:
+      http-gateway:
+        condition: service_healthy
+      tcp-bridge:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+        reservations:
+          memory: 128M
+          cpus: "0.25"
+
+networks:
+  mt5-mcp-net:
+    driver: bridge
+    name: mt5-mcp-net
+
+volumes:
+  redis-data:
+    name: mt5-redis-data

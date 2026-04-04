@@ -3,7 +3,7 @@
 //|                             MT5 ↔ MCP EA bridge (heartbeat)       |
 //+------------------------------------------------------------------+
 #property copyright "MT5-mcp"
-#property version   "2.32"
+#property version   "2.51"
 
 // Trading includes
 #include <Trade\Trade.mqh>
@@ -11,13 +11,25 @@
 // Inputs
 input string GatewayBaseURL = "http://127.0.0.1:8020";
 input string GatewayURL = "http://127.0.0.1:8020/bridge/terminal/heartbeat"; // deprecated, use GatewayBaseURL
-input int    HeartbeatSeconds = 1;        // Heartbeat interval (min 1s for EventSetTimer)
-input int    CommandPollIntervalMs = 100; // Milliseconds between command polls (Option A: faster polling)
-input int    MaxCommandsPerTick = 20;     // Max commands to process per timer tick (Option B: batch processing)
+input int    HeartbeatSeconds = 1;        // Heartbeat interval (seconds between heartbeats)
+input int    CommandPollIntervalMs = 100; // Milliseconds between command polls (HTTP fallback)
+input int    MaxCommandsPerTick = 20;     // Max commands to process per timer tick
+input int    TcpPollMs = 1;               // TCP command polling interval in ms (lower = faster, min 1)
 input bool   EnableDebugLogs = false;
+
+// TCP Bridge inputs
+input string TCPBridgeHost = "127.0.0.1";
+input int    TCPBridgePort = 8025;
+input bool   EnableTCPBridge = true;  // Set false to use HTTP polling fallback
 
 // Internal state
 int g_last_status = 0;
+int g_socket = INVALID_HANDLE;
+bool g_tcp_connected = false;
+int g_tcp_send_failures = 0;      // Consecutive send failure counter
+const int MAX_TCP_SEND_FAILURES = 3; // Mark connection dead after N consecutive failures
+int g_heartbeat_counter = 0;       // Ticks since last heartbeat
+int g_heartbeat_interval = 0;      // Ticks between heartbeats (computed from TcpPollMs)
 
 void DebugLog(const string message)
 {
@@ -33,6 +45,88 @@ string JsonEscape(const string s)
    return out;
 }
 
+// Inline ErrorDescription (stdlib.mqh not always available)
+string ErrorDescriptionLocal(int error_code)
+{
+   switch(error_code)
+   {
+      case 0:     return "No error";
+      case 1:     return "No error returned, the operation was successful";
+      case 2:     return "Common error";
+      case 3:     return "Invalid parameters";
+      case 4:     return "Array index out of range";
+      case 5:     return "No memory for function call";
+      case 6:     return "Invalid function parameters count";
+      case 7:     return "Invalid function parameter value";
+      case 8:     return "Internal error";
+      case 9:     return "Not enough memory for internal MQL5-RTL";
+      case 10:    return "Invalid function call";
+      case 11:    return "Not enough memory";
+      case 4001:  return "Internal error";
+      case 4002:  return "Wrong file name";
+      case 4003:  return "Too long file name";
+      case 4004:  return "Cannot open file";
+      case 4009:  return "No file";
+      case 4014:  return "Invalid handle";
+      case 4050:  return "Invalid function parameters count";
+      case 4051:  return "Invalid function parameter value";
+      case 4052:  return "String function internal error";
+      case 4053:  return "Array index out of range";
+      case 4054:  return "No memory for an array";
+      case 4055:  return "Not enough memory for string";
+      case 4056:  return "Not enough memory";
+      case 4057:  return "Incorrect pointer";
+      case 4058:  return "Pointer cannot be dereferenced";
+      case 4062:  return "Access violation";
+      case 4064:  return "Null pointer";
+      case 4065:  return "Array of zero length";
+      case 4066:  return "Requested data not found";
+      case 4067:  return "Requested object not found";
+      case 4099:  return "End of file";
+      case 4100:  return "Some file error";
+      case 4103:  return "Object already exists";
+      case 4104:  return "Unknown object";
+      case 4105:  return "Not enough memory for object";
+      case 4106:  return "Unknown object property";
+      case 4107:  return "Object does not support property";
+      case 4108:  return "Read only property";
+      case 4109:  return "Invalid pointer";
+      case 4110:  return "Null pointer";
+      case 4111:  return "Unsupported operation";
+      case 4200:  return "Object is not found";
+      case 4201:  return "Invalid object type";
+      case 4202:  return "Unknown symbol";
+      case 4203:  return "Invalid price";
+      case 4204:  return "Invalid stops";
+      case 4205:  return "Invalid trade volume";
+      case 4206:  return "Market is closed";
+      case 4207:  return "Trade is disabled";
+      case 4208:  return "Not enough money";
+      case 4209:  return "Too many orders";
+      case 4750:  return "Connection lost";
+      case 4751:  return "Timeout";
+      case 4752:  return "Invalid request";
+      case 4753:  return "Invalid client";
+      case 4754:  return "No connection";
+      case 4755:  return "Timeout";
+      case 4756:  return "Unknown request";
+      case 4757:  return "Invalid version";
+      case 4758:  return "Unauthorized";
+      case 4759:  return "Too many requests";
+      case 4760:  return "Forbidden";
+      case 4761:  return "Unknown command";
+      case 4762:  return "Not implemented";
+      case 4763:  return "Internal error";
+      case 4764:  return "Server not found";
+      case 4765:  return "Unknown host";
+      case 4766:  return "Connection refused";
+      case 4767:  return "Connection reset";
+      case 4768:  return "Connection timeout";
+      case 4769:  return "Connection error";
+      default:    return "Unknown error #" + IntegerToString(error_code);
+   }
+}
+
 string BuildHeartbeatJson()
 {
    long login = AccountInfoInteger(ACCOUNT_LOGIN);
@@ -44,6 +138,285 @@ string BuildHeartbeatJson()
       JsonEscape(server), build, login, login, TimeToString(now, TIME_DATE|TIME_SECONDS)
    );
    return payload;
+}
+
+// Convert a flat JSON object to KV format for existing ParseKV()
+// e.g. {"type":"get_bars","request_id":"abc","count":100} → "type=get_bars&request_id=abc&count=100"
+string JsonToKV(const string json)
+{
+   string result = "";
+   int pos = 0;
+   int len = StringLen(json);
+   
+   while(pos < len)
+   {
+      // Find next key (opening quote after { or ,)
+      int key_start = StringFind(json, "\"", pos);
+      if(key_start < 0) break;
+      key_start++;
+      int key_end = StringFind(json, "\"", key_start);
+      if(key_end < 0) break;
+      string key = StringSubstr(json, key_start, key_end - key_start);
+      
+      // Find colon after key
+      int colon = StringFind(json, ":", key_end);
+      if(colon < 0) break;
+      colon++;
+      
+      // Skip whitespace
+      while(colon < len)
+      {
+         ushort c = StringGetCharacter(json, colon);
+         if(c > 32) break;
+         colon++;
+      }
+      
+      string value = "";
+      if(colon >= len) break;
+      
+      if(StringGetCharacter(json, colon) == '\"')
+      {
+         // String value - find closing quote (handle escapes)
+         int val_start = colon + 1;
+         int val_end = val_start;
+         while(val_end < len)
+         {
+            ushort c = StringGetCharacter(json, val_end);
+            if(c == '\\' && val_end + 1 < len)
+            {
+               val_end += 2;
+               continue;
+            }
+            if(c == '\"') break;
+            val_end++;
+         }
+         value = StringSubstr(json, val_start, val_end - val_start);
+         pos = val_end + 1;
+      }
+      else
+      {
+         // Numeric/boolean/null value
+         int val_start = colon;
+         int val_end = val_start;
+         while(val_end < len)
+         {
+            ushort c = StringGetCharacter(json, val_end);
+            if(c == ',' || c == '}' || c == ']' || c <= 32) break;
+            val_end++;
+         }
+         value = StringSubstr(json, val_start, val_end - val_start);
+         pos = val_end;
+      }
+      
+      if(key != "" && value != "")
+      {
+         if(result != "") result += "&";
+         result += key + "=" + value;
+      }
+   }
+   return result;
+}
+
+// Send a length-prefixed JSON frame over TCP socket
+// Format: [4 bytes big-endian uint32 length][N bytes JSON payload]
+bool SocketSendFrame(const string json)
+{
+   if(g_socket == INVALID_HANDLE || !g_tcp_connected)
+      return false;
+   
+   // Validate actual socket state via MQL5 API
+   if(!SocketIsConnected(g_socket))
+   {
+      g_tcp_connected = false;
+      return false;
+   }
+   
+   // Convert JSON string to uchar array (UTF-8)
+   uchar data[];
+   int data_len = StringToCharArray(json, data, 0, StringLen(json), CP_UTF8);
+   
+   // Build frame: 4-byte big-endian length + payload
+   uchar frame[];
+   int frame_len = 4 + data_len;
+   ArrayResize(frame, frame_len);
+   
+   // Big-endian uint32 length
+   frame[0] = (uchar)((data_len >> 24) & 0xFF);
+   frame[1] = (uchar)((data_len >> 16) & 0xFF);
+   frame[2] = (uchar)((data_len >> 8) & 0xFF);
+   frame[3] = (uchar)(data_len & 0xFF);
+   
+   // Copy payload
+   for(int i = 0; i < data_len; i++)
+      frame[4 + i] = data[i];
+   
+   ResetLastError();
+   int sent = SocketSend(g_socket, frame, frame_len);
+   
+   // Wine/MQL5 bug: SocketSend ALWAYS returns -1 (error 5273) even when data
+   // is successfully transmitted. The bridge confirms it receives all frames.
+   // Track consecutive failures: if SocketRead later confirms disconnect, we
+   // know the connection was dead. If reads succeed, sends were fine despite
+   // the error code.
+   if(sent != frame_len)
+   {
+      int err = GetLastError();
+      if(err != 5273)
+      {
+         g_tcp_send_failures++;
+         if(EnableDebugLogs)
+            Print("SocketSendFrame: non-Wine send error (sent=", sent, "/", frame_len, " err=", err, " failures=", g_tcp_send_failures, ")");
+         if(g_tcp_send_failures >= MAX_TCP_SEND_FAILURES)
+         {
+            Print("SocketSendFrame: ", MAX_TCP_SEND_FAILURES, " consecutive non-Wine send failures, marking dead");
+            g_tcp_connected = false;
+            return false;
+         }
+      }
+      // Error 5273 is the Wine bug — not counted as failure
+   }
+   else
+   {
+      // Successful send resets counter
+      g_tcp_send_failures = 0;
+   }
+   
+   return true;
+}
+
+// Receive a length-prefixed JSON frame from TCP socket
+// Returns true on success, false on no data available
+//
+// CRITICAL: MQL5 SocketRead returns error 5273 if you request more bytes than
+// are currently available in the OS socket buffer. The community-validated
+// pattern (Rene Balke, MQL5 Forum #337430, Jan 2025) is to always read exactly
+// what SocketIsReadable() reports.
+//
+// Partial payload reads are accumulated — we never discard already-read bytes.
+bool SocketReceiveFrame(string &json_out)
+{
+   // Validate socket liveness via MQL5 API, not just our software flag
+   if(g_socket == INVALID_HANDLE || !g_tcp_connected)
+      return false;
+   if(!SocketIsConnected(g_socket))
+   {
+      g_tcp_connected = false;
+      Print("SocketReceiveFrame: SocketIsConnected=false, marking dead");
+      return false;
+   }
+   
+   // Phase 1: Read the 4-byte length header
+   // Read EXACTLY what SocketIsReadable reports, capped at 4 bytes for header
+   uint available = SocketIsReadable(g_socket);
+   if(available == 0)
+      return false; // No data — normal, connection stays alive
+   
+   uchar header[];
+   ArrayResize(header, 4);
+   
+   int header_read = 0;
+   while(header_read < 4)
+   {
+      ResetLastError();
+      available = SocketIsReadable(g_socket);
+      if(available == 0)
+      {
+         // Header partially arrived — wait for remainder
+         Sleep(10);
+         available = SocketIsReadable(g_socket);
+         if(available == 0 && header_read > 0)
+         {
+            // Had partial header but no more data — corrupt frame
+            Print("SocketReceiveFrame: partial header (", header_read, "/4 bytes), connection lost");
+            g_tcp_connected = false;
+            return false;
+         }
+         else if(available == 0)
+            return false; // Nothing arrived yet — normal
+      }
+      
+      // Read exactly min(remaining header bytes, available bytes)
+      int remaining = 4 - header_read;
+      int to_read = (int)MathMin(available, (uint)remaining);
+      
+      uchar chunk[];
+      ArrayResize(chunk, to_read);
+      int read = SocketRead(g_socket, chunk, to_read, 100);
+      if(read <= 0)
+      {
+         int err = GetLastError();
+         g_tcp_connected = false;
+         Print("SocketReceiveFrame: header chunk read failed (chunk=", read, ", err=", err, ")");
+         return false;
+      }
+      
+      // Append chunk to header buffer
+      for(int i = 0; i < read; i++)
+         header[header_read + i] = chunk[i];
+      header_read += read;
+   }
+   
+   // Parse big-endian uint32 length
+   uint payload_len = ((uint)header[0] << 24) | ((uint)header[1] << 16) | ((uint)header[2] << 8) | (uint)header[3];
+   
+   if(payload_len == 0 || payload_len > 10000000)
+   {
+      Print("SocketReceiveFrame: invalid payload length ", payload_len);
+      return false;
+   }
+   
+   // Phase 2: Read the payload — accumulate bytes until we have all of them
+   // NEVER request more than SocketIsReadable() reports
+   uchar payload[];
+   ArrayResize(payload, (int)payload_len);
+   
+   int total_read = 0;
+   int read_attempts = 0;
+   const int MAX_READ_ATTEMPTS = 200; // ~2 seconds at 10ms intervals
+   
+   while(total_read < (int)payload_len)
+   {
+      ResetLastError();
+      available = SocketIsReadable(g_socket);
+      
+      if(available == 0)
+      {
+         read_attempts++;
+         if(read_attempts > MAX_READ_ATTEMPTS)
+         {
+            // Connection is alive but server stopped sending — timeout
+            Print("SocketReceiveFrame: read timeout at ", total_read, "/", payload_len);
+            return false;
+         }
+         Sleep(10);
+         continue;
+      }
+      
+      // Read exactly min(remaining payload bytes, available bytes)
+      int remaining = (int)payload_len - total_read;
+      int to_read = (int)MathMin(available, (uint)remaining);
+      
+      uchar chunk[];
+      ArrayResize(chunk, to_read);
+      int read = SocketRead(g_socket, chunk, to_read, 100);
+      if(read <= 0)
+      {
+         int err = GetLastError();
+         g_tcp_connected = false;
+         Print("SocketReceiveFrame: payload chunk read failed at ", total_read, "/", payload_len, " (read=", read, ", err=", err, ")");
+         return false;
+      }
+      
+      // Append chunk to payload buffer
+      for(int i = 0; i < read; i++)
+         payload[total_read + i] = chunk[i];
+      total_read += read;
+      read_attempts = 0; // Reset counter on successful read
+   }
+   
+   // Convert payload to string (UTF-8)
+   json_out = CharArrayToString(payload, 0, (int)payload_len, CP_UTF8);
+   return true;
 }
 
 int HttpPost(const string url, const string json, string &resp_out)
@@ -62,26 +435,152 @@ int HttpPost(const string url, const string json, string &resp_out)
 
 int OnInit()
   {
-   Print("BridgeConnectorEA initialized (heartbeat)");
-   EventSetTimer(HeartbeatSeconds);
-   return(INIT_SUCCEEDED);
+   // Attempt TCP connection if enabled
+     if(EnableTCPBridge)
+     {
+        Print("BridgeConnectorEA: Attempting TCP connection to ", TCPBridgeHost, ":", TCPBridgePort);
+        
+        ResetLastError();
+        g_socket = SocketCreate();
+        int create_err = GetLastError();
+        Print("BridgeConnectorEA: SocketCreate returned handle=", g_socket, " (INVALID_HANDLE=", INVALID_HANDLE, "), error=", create_err);
+        
+        if(g_socket != INVALID_HANDLE)
+        {
+           ResetLastError();
+           g_tcp_connected = SocketConnect(g_socket, TCPBridgeHost, TCPBridgePort, 3000);
+           int connect_err = GetLastError();
+           if(g_tcp_connected)
+           {
+              g_tcp_send_failures = 0; // Reset counter on initial connect
+              Print("BridgeConnectorEA: TCP connected to ", TCPBridgeHost, ":", TCPBridgePort);
+           }
+           else
+              Print("BridgeConnectorEA: TCP SocketConnect failed (error=", connect_err, ": ", ErrorDescriptionLocal(connect_err), "), falling back to HTTP polling");
+        }
+        else
+        {
+           Print("BridgeConnectorEA: SocketCreate failed (error=", create_err, ": ", ErrorDescriptionLocal(create_err), "), falling back to HTTP polling");
+        }
+     }
+   
+    Print("BridgeConnectorEA initialized (millisecond timer)");
+    // Use millisecond timer for low-latency command polling
+    // TcpPollMs=1 means we check for commands every 1ms (~0.5ms avg latency)
+    // Heartbeat sent every N ticks to maintain ~1s interval
+    int poll_ms = TcpPollMs;
+    if(poll_ms < 1) poll_ms = 1;
+    g_heartbeat_interval = (HeartbeatSeconds * 1000) / poll_ms;
+    if(g_heartbeat_interval < 1) g_heartbeat_interval = 1;
+    EventSetMillisecondTimer(poll_ms);
+    return(INIT_SUCCEEDED);
   }
 
 void OnDeinit(const int reason)
   {
+   if(g_socket != INVALID_HANDLE)
+   {
+      SocketClose(g_socket);
+      g_socket = INVALID_HANDLE;
+      g_tcp_connected = false;
+   }
    Print("BridgeConnectorEA deinitialized: ", reason);
    EventKillTimer();
   }
 
 void OnTimer()
 {
-   SendHeartbeat();
-   ProcessAllPendingCommands();  // Option B: process ALL pending commands per tick
+   g_heartbeat_counter++;
+   
+   // Send heartbeat at configured interval
+   if(g_heartbeat_counter >= g_heartbeat_interval)
+   {
+      g_heartbeat_counter = 0;
+      SendHeartbeat();
+   }
+   
+   // TCP connection health check (throttled to once per second)
+   if(EnableTCPBridge && g_tcp_connected && g_heartbeat_counter == 0)
+   {
+      if(!SocketIsConnected(g_socket))
+      {
+         Print("OnTimer: SocketIsConnected=false, marking dead");
+         g_tcp_connected = false;
+         if(g_socket != INVALID_HANDLE)
+         {
+            SocketClose(g_socket);
+            g_socket = INVALID_HANDLE;
+         }
+      }
+   }
+   
+   // TCP reconnection (throttled to once per second)
+   if(EnableTCPBridge && !g_tcp_connected && g_heartbeat_counter == 0)
+   {
+      if(g_socket != INVALID_HANDLE)
+      {
+         SocketClose(g_socket);
+         g_socket = INVALID_HANDLE;
+      }
+      
+      ResetLastError();
+      g_socket = SocketCreate();
+      int create_err = GetLastError();
+      
+      if(g_socket != INVALID_HANDLE)
+      {
+         ResetLastError();
+         g_tcp_connected = SocketConnect(g_socket, TCPBridgeHost, TCPBridgePort, 3000);
+         int connect_err = GetLastError();
+         if(g_tcp_connected)
+         {
+            g_tcp_send_failures = 0;
+            Print("BridgeConnectorEA: TCP reconnected to ", TCPBridgeHost, ":", TCPBridgePort);
+         }
+         else
+         {
+            if(EnableDebugLogs)
+               Print("BridgeConnectorEA: TCP reconnect failed (error=", connect_err, ")");
+            SocketClose(g_socket);
+            g_socket = INVALID_HANDLE;
+         }
+      }
+      else
+      {
+         if(EnableDebugLogs)
+            Print("BridgeConnectorEA: SocketCreate failed during reconnect (error=", create_err, ")");
+      }
+   }
+   
+   // Process commands every tick — this is the low-latency path
+   ProcessAllPendingCommands();
 }
 
 void SendHeartbeat()
 {
    string json = BuildHeartbeatJson();
+   
+   if(g_tcp_connected)
+   {
+      // Send heartbeat via TCP as a frame
+      // BuildHeartbeatJson returns: {"server":"...","build":N,"account_id":"...","login":N,"timestamp":"..."}
+      // Prepend "type":"heartbeat" to make: {"type":"heartbeat","server":"...","build":N,...}
+      string heartbeat_frame = StringFormat("{\"type\":\"heartbeat\",%s", StringSubstr(json, 1));
+      
+      if(!SocketSendFrame(heartbeat_frame))
+      {
+         Print("SendHeartbeat: TCP send failed, falling back to HTTP");
+         g_tcp_connected = false;
+      }
+      else
+      {
+         if(EnableDebugLogs)
+            Print("SendHeartbeat: sent via TCP");
+         return;
+      }
+   }
+   
+   // Fallback to HTTP
    string resp;
    int code = HttpPost(GatewayURL, json, resp);
    g_last_status = code;
@@ -90,11 +589,38 @@ void SendHeartbeat()
 }
 
 // Option B: Process ALL pending commands in one timer tick
-// Instead of one-per-tick, this loops with Sleep(CommandPollIntervalMs)
-// between polls to drain the entire queue.
+// If TCP connected, reads frames from socket. Otherwise polls HTTP.
 void ProcessAllPendingCommands()
 {
    int processed = 0;
+   
+   if(g_tcp_connected)
+   {
+      // Read all available TCP frames
+      while(processed < MaxCommandsPerTick)
+      {
+         string json_frame;
+         if(!SocketReceiveFrame(json_frame))
+         {
+            // No more data or connection lost
+            break;
+         }
+         
+         // Convert JSON frame to KV format for existing ProcessCommand
+         string kv = JsonToKV(json_frame);
+         if(kv != "" && kv != "type=heartbeat")
+         {
+            ProcessCommand(kv);
+            processed++;
+         }
+      }
+      
+      if(processed > 0 && EnableDebugLogs)
+         Print("BridgeConnectorEA: Processed ", processed, " commands via TCP in this tick");
+      return;
+   }
+   
+   // HTTP polling fallback
    int empty_polls = 0;
    const int MAX_EMPTY_POLLS = 2;  // Stop after 2 consecutive empty polls (queue is drained)
    
@@ -930,7 +1456,7 @@ string JsonCalendar(const string currency_filter, const int hours_ahead, const s
    
    if(g_event_cache_size == 0)
    {
-      return StringFormat("{\"error\":\"no_events_in_cache\",\"note\":\"CalendarCountries or CalendarEventByCountry returned 0 events. Check terminal connection.\"}");
+      return "{\"error\":\"no_events_in_cache\",\"note\":\"CalendarCountries or CalendarEventByCountry returned 0 events. Check terminal connection.\"}";
    }
    
    // Use CalendarValueHistory for BULK fetch — one call gets ALL values across ALL events
@@ -944,7 +1470,7 @@ string JsonCalendar(const string currency_filter, const int hours_ahead, const s
       return StringFormat(
          "{\"events\":[],\"event_count\":0,\"calendar_query_info\":{\"total_values_returned\":0,\"error_code\":%d,\"error_desc\":\"%s\",\"cache_events\":%d,\"time_from\":\"%s\",\"note\":\"CalendarValueHistory returned 0. This may indicate no scheduled events in the calendar database from now onward.\"}}",
          err,
-         ErrorDescription(err),
+          ErrorDescriptionLocal(err),
          g_event_cache_size,
          TimeToString(now, TIME_DATE|TIME_SECONDS)
       );
@@ -1068,8 +1594,18 @@ string JsonCalendar(const string currency_filter, const int hours_ahead, const s
 
 void Complete(const string request_id, const string payload_json)
 {
-   string url = GatewayBaseURL + "/bridge/results";
+   // payload_json is already a JSON object string, embed it directly (not as string)
    string body = StringFormat("{\"request_id\":\"%s\",\"status\":\"ok\",\"payload\":%s}", request_id, payload_json);
+   
+   if(g_tcp_connected && SocketSendFrame(body))
+   {
+      if(EnableDebugLogs)
+         Print("BridgeConnectorEA: completed request_id=", request_id, " via TCP");
+      return;
+   }
+   
+   // Fallback to HTTP
+   string url = GatewayBaseURL + "/bridge/results";
    string resp;
    int code = HttpPost(url, body, resp);
    if(code != 200)
@@ -1080,9 +1616,14 @@ void Complete(const string request_id, const string payload_json)
 
 void Fail(const string request_id, const string message)
 {
-   string url = GatewayBaseURL + "/bridge/results";
    string body = StringFormat("{\"request_id\":\"%s\",\"status\":\"error\",\"error\":\"%s\"}", request_id, JsonEscape(message));
    Print("BridgeConnectorEA: request failed request_id=", request_id, " error=", message);
+   
+   if(g_tcp_connected && SocketSendFrame(body))
+      return;
+   
+   // Fallback to HTTP
+   string url = GatewayBaseURL + "/bridge/results";
    string resp; int __code = HttpPost(url, body, resp); 
    if(__code != 200)
       Print("BridgeConnectorEA: failure callback failed request_id=", request_id, " code=", __code, " last_error=", GetLastError(), " response=", resp);
