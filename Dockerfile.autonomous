@@ -1,0 +1,32 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .
+
+RUN pip install --no-cache-dir \
+    langgraph \
+    langgraph-checkpoint-sqlite \
+    apscheduler \
+    chromadb \
+    httpx \
+    fastapi \
+    uvicorn[standard] \
+    pydantic \
+    typing-extensions \
+    structlog
+
+COPY src/ ./src/
+COPY apps/ ./apps/
+
+RUN mkdir -p /root/.mt5-mcp
+
+ENV PYTHONPATH=/app/src
+
+EXPOSE 8090
+
+CMD ["uvicorn", "apps.autonomous_agent.health:app", "--host", "0.0.0.0", "--port", "8090"]

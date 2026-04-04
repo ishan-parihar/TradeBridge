@@ -159,7 +159,6 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
     "get_bars": {"count"},
     "deals_history": {"limit", "days"},
     "performance_summary": {"limit", "days"},
-    "estimate_margin": {"volume_lots", "price_hint"},
     "get_indicator": {
         "period",
         "fast",
@@ -446,19 +445,6 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "order_kind",
                 "volume_lots",
             ],
-        },
-    },
-    "estimate_margin": {
-        "description": "Estimate order margin requirement",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "symbol": {"type": "string"},
-                "side": {"type": "string"},
-                "volume_lots": {"type": ["number", "string"]},
-                "price_hint": {"type": ["number", "string", "null"]},
-            },
-            "required": ["symbol", "side", "volume_lots"],
         },
     },
     "submit_pending_order": {
@@ -983,8 +969,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             res = await _post_json("/tools/get_chart_screenshot", args)
         elif name == "submit_market_order_via_bridge":
             res = await _post_json("/tools/submit_market_order_via_bridge", args)
-        elif name == "estimate_margin":
-            res = await _post_json("/tools/estimate_margin", args)
         elif name == "submit_pending_order":
             res = await _post_json("/tools/submit_pending_order", args)
         elif name == "modify_order":
