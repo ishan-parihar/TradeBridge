@@ -14,9 +14,7 @@ from mt5_mcp.schemas.models import (
     Position,
     ExecutionResult,
     HealthStatus,
-    MarginEstimate,
     MarginEstimateRequest,
-    SimulationResult,
     SymbolInfo,
     TerminalStatus,
     TradeIntent,
@@ -111,7 +109,6 @@ from mt5_mcp.schemas.tools import (
     AgentSystemPromptRequest,
     NewsFetchRequest,
     EconomicCalendarRequest,
-    SessionContextRequest,
 )
 
 
@@ -1528,20 +1525,12 @@ def tool_correlation_matrix(req: CorrelationMatrixRequest) -> dict:
 
 
 # Tools
-@app.post("/tools/simulate_order", response_model=SimulationResult)
-def tool_simulate_order(req: TradeIntent) -> SimulationResult:
-    return get_gateway().simulate_order(req)
 
 
 @app.post("/tools/submit_market_order", response_model=ExecutionResult)
 def tool_submit_market_order(req: TradeIntent) -> ExecutionResult:
     # In scaffold, writes are disabled
     raise HTTPException(status_code=501, detail="Execution disabled in scaffold")
-
-
-@app.post("/tools/estimate_margin", response_model=MarginEstimate)
-def tool_estimate_margin(req: MarginEstimateRequest) -> MarginEstimate:
-    return get_gateway().estimate_margin(req)
 
 
 # ============================================================
@@ -1901,86 +1890,6 @@ def tool_set_trailing_stop(req: SetTrailingStopRequest) -> TrailingStopResult:
         message=f"Trailing stop active: distance={distance_points}pts, lock_in={lock_in_points}pts",
         initial_sl=position.sl,
     )
-
-
-@app.post("/tools/trailing_stop/tick", response_model=dict)
-def tool_trailing_stop_tick() -> dict:
-    """Process all active trailing stops. Call periodically."""
-    import time as _time
-
-    results = []
-    now = _time.time()
-
-    for pid, ts in list(_trailing_stops.items()):
-        if not ts["active"]:
-            continue
-
-        if now - ts["last_check"] < ts["check_interval"]:
-            continue
-
-        ts["last_check"] = now
-
-        try:
-            # Get current position
-            positions = resource_positions_open()
-            position = next((p for p in positions if p.position_id == pid), None)
-            if position is None:
-                ts["active"] = False
-                results.append({"position_id": pid, "status": "closed"})
-                continue
-
-            # Get current market price
-            book = tool_get_order_book(OrderBookRequest(symbol=position.symbol))
-            bid, ask = _first_bid_ask(book)
-            if bid is None or ask is None:
-                continue
-
-            current_price = ask if position.side == "buy" else bid
-            distance = ts["distance_points"] * float(
-                resource_symbol_info(position.symbol).point or 0.0
-            )
-
-            if position.side == "buy":
-                new_sl = current_price - distance
-                if ts["lock_in_points"] > 0:
-                    lock_in_price = position.entry_price + ts["lock_in_points"] * float(
-                        resource_symbol_info(position.symbol).point or 0.0
-                    )
-                    new_sl = max(new_sl, lock_in_price)
-                new_sl = min(
-                    new_sl,
-                    bid - float(resource_symbol_info(position.symbol).point or 0.0),
-                )
-            else:
-                new_sl = current_price + distance
-                if ts["lock_in_points"] > 0:
-                    lock_in_price = position.entry_price - ts["lock_in_points"] * float(
-                        resource_symbol_info(position.symbol).point or 0.0
-                    )
-                    new_sl = min(new_sl, lock_in_price)
-                new_sl = max(
-                    new_sl,
-                    ask + float(resource_symbol_info(position.symbol).point or 0.0),
-                )
-
-            # Only update if SL would move favorably
-            current_sl = position.sl or 0
-            if (position.side == "buy" and new_sl > current_sl) or (
-                position.side == "sell" and (current_sl == 0 or new_sl < current_sl)
-            ):
-                tool_modify_position_sl_tp(
-                    ModifyPositionSLTPRequest(
-                        position_id=pid, sl=new_sl, tp=position.tp
-                    )
-                )
-                results.append(
-                    {"position_id": pid, "status": "updated", "new_sl": new_sl}
-                )
-
-        except Exception as e:
-            results.append({"position_id": pid, "status": "error", "error": str(e)})
-
-    return {"processed": len(results), "results": results}
 
 
 @app.post("/tools/trailing_stop/cancel", response_model=dict)
@@ -3164,31 +3073,6 @@ def tool_news_pools() -> dict:
         "pools": _get_available_pools(),
         "sources": _get_available_sources(),
     }
-
-
-@app.post("/tools/trading/session_context", response_model=dict)
-def tool_session_context(req: SessionContextRequest) -> dict:
-    """Get current forex trading session context.
-
-    Returns active sessions, overlaps, session quality scores,
-    day-of-week factors, and recommended pairs.
-    """
-    ctx = _get_session_context()
-    result = ctx.to_dict()
-
-    # Add pair-specific context if requested
-    if req.symbol:
-        result["pair_context"] = _get_session_for_pair(req.symbol)
-
-    if req.include_all_pairs:
-        from mt5_mcp.services.session_service import PAIR_SESSION_PREFERENCE
-
-        pair_contexts = {}
-        for symbol in PAIR_SESSION_PREFERENCE:
-            pair_contexts[symbol] = _get_session_for_pair(symbol)
-        result["all_pairs"] = pair_contexts
-
-    return result
 
 
 @app.post("/tools/trading/economic_calendar", response_model=dict)
