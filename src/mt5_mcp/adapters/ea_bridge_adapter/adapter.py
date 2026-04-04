@@ -13,6 +13,7 @@ from mt5_mcp.schemas.models import (
     AccountSummary,
     Bars,
     Bar,
+    Deal,
     ExecutionResult,
     HealthStatus,
     MarginEstimate,
@@ -20,11 +21,13 @@ from mt5_mcp.schemas.models import (
     Order,
     Position,
     SimulationResult,
+    SymbolInfo,
     TerminalStatus,
     TradeIntent,
 )
 from mt5_mcp.settings.config import get_settings
 from mt5_mcp.observability.logging import logger
+from mt5_mcp.adapters.common.symbol_utils import normalize_symbol, denormalize_symbol
 
 
 class EABridgeAdapter(ExecutionPort):
@@ -32,6 +35,9 @@ class EABridgeAdapter(ExecutionPort):
 
     This adapter sends commands to the EA through the bridge gateway,
     which are then executed by the BridgeConnectorEA in MT5.
+
+    Performance: Uses a persistent httpx.Client with Keep-Alive connections
+    to eliminate TCP handshake overhead on every request.
     """
 
     def __init__(self, gateway_url: str | None = None) -> None:
@@ -41,16 +47,31 @@ class EABridgeAdapter(ExecutionPort):
         )
         self._last_heartbeat: dict[str, Any] = {}
         self._last_heartbeat_time: float = 0.0
+        # Persistent HTTP client with Keep-Alive (connection pooling)
+        self._client = httpx.Client(
+            base_url=self.gateway_url,
+            timeout=10.0,
+            http2=False,
+            limits=httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=20,
+                keepalive_expiry=30.0,
+            ),
+        )
+
+    def close(self) -> None:
+        """Close the persistent HTTP client."""
+        if self._client:
+            self._client.close()
 
     def _check_ea_connected(self) -> bool:
         """Check if EA is connected by checking bridge terminal status."""
         try:
-            with httpx.Client(timeout=5.0) as client:
-                r = client.get(f"{self.gateway_url}/bridge/terminal/status")
-                if r.status_code == 200:
-                    data = r.json()
-                    connected = data.get("connected", False)
-                    return bool(connected)
+            r = self._client.get("/bridge/terminal/status")
+            if r.status_code == 200:
+                data = r.json()
+                connected = data.get("connected", False)
+                return bool(connected)
         except Exception as e:
             logger.warning(f"EA connection check failed: {e}")
         return False
@@ -58,34 +79,36 @@ class EABridgeAdapter(ExecutionPort):
     def _enqueue_command(self, cmd_type: str, payload: dict[str, Any]) -> str:
         """Enqueue a command and return the request ID."""
         try:
-            with httpx.Client(timeout=10.0) as client:
-                params = {"type": cmd_type, **payload}
-                r = client.post(
-                    f"{self.gateway_url}/bridge/commands/enqueue",
-                    params=params,
-                )
-                r.raise_for_status()
-                return r.json()["id"]
+            params = {"type": cmd_type, **payload}
+            r = self._client.post(
+                "/bridge/commands/enqueue",
+                params=params,
+            )
+            r.raise_for_status()
+            return r.json()["id"]
         except Exception as e:
             logger.error(f"Failed to enqueue command {cmd_type}: {e}")
             raise
 
     def _await_result(
-        self, request_id: str, timeout_s: float = 10.0, poll_s: float = 0.5
+        self, request_id: str, timeout_s: float = 10.0, poll_s: float = 0.1
     ) -> dict[str, Any]:
-        """Wait for command result."""
+        """Wait for command result.
+
+        Poll interval reduced from 0.5s to 0.1s for 5x faster response detection.
+        Uses persistent HTTP client (no TCP handshake per poll).
+        """
         import time as _t
 
         end = _t.time() + timeout_s
         while _t.time() < end:
             try:
-                with httpx.Client(timeout=5.0) as client:
-                    r = client.get(f"{self.gateway_url}/bridge/results/{request_id}")
-                    if r.status_code == 200:
-                        data = r.json()
-                        status = data.get("status")
-                        if status in ("completed", "error"):
-                            return data
+                r = self._client.get(f"/bridge/results/{request_id}")
+                if r.status_code == 200:
+                    data = r.json()
+                    status = data.get("status")
+                    if status in ("completed", "error"):
+                        return data
             except Exception as e:
                 logger.warning(f"Polling error: {e}")
             _t.sleep(poll_s)
@@ -109,11 +132,10 @@ class EABridgeAdapter(ExecutionPort):
 
     def terminal_status(self) -> TerminalStatus:
         try:
-            with httpx.Client(timeout=5.0) as client:
-                r = client.get(f"{self.gateway_url}/bridge/terminal/status")
-                if r.status_code == 200:
-                    data = r.json()
-                    return TerminalStatus(**data)
+            r = self._client.get("/bridge/terminal/status")
+            if r.status_code == 200:
+                data = r.json()
+                return TerminalStatus(**data)
         except Exception as e:
             logger.warning(f"Terminal status failed: {e}")
         return TerminalStatus(connected=False, message="Bridge status unavailable")
@@ -160,7 +182,23 @@ class EABridgeAdapter(ExecutionPort):
                 free_margin=float(data.get("free_margin", 0.0))
                 if data.get("free_margin") is not None
                 else None,
+                margin_level=float(data.get("margin_level", 0.0))
+                if data.get("margin_level") is not None
+                else None,
+                leverage=int(data.get("leverage", 0))
+                if data.get("leverage") is not None
+                else None,
+                profit=float(data.get("profit", 0.0))
+                if data.get("profit") is not None
+                else None,
+                margin_call_level=float(data.get("margin_call_level", 0.0))
+                if data.get("margin_call_level") is not None
+                else None,
+                margin_stop_out_level=float(data.get("margin_stop_out_level", 0.0))
+                if data.get("margin_stop_out_level") is not None
+                else None,
                 currency=data.get("currency"),
+                server=data.get("server"),
                 environment=self.settings.environment or "demo",
             )
         except json.JSONDecodeError as e:
@@ -257,66 +295,105 @@ class EABridgeAdapter(ExecutionPort):
             logger.error(f"Get orders failed: {e}")
             return []
 
-    def get_bars(self, symbol: str, timeframe: str, count: int) -> Bars:
-        """Fetch bars via EA bridge command."""
+    def get_symbol_info(self, symbol: str) -> SymbolInfo | None:
         try:
+            symbol_norm = normalize_symbol(symbol)
             result = self._send_command(
-                "get_bars",
-                {"symbol": symbol, "timeframe": timeframe, "count": count},
-                timeout_s=15.0,
+                "get_symbol_info", {"symbol": symbol_norm}, timeout_s=10.0
             )
-
             if result.get("status") != "completed":
-                return Bars(
-                    symbol=symbol, timeframe=timeframe, data=[], source="ea_bridge"
-                )
+                return None
 
             payload = result.get("result", {}).get("payload")
-            if not payload:
-                return Bars(
-                    symbol=symbol, timeframe=timeframe, data=[], source="ea_bridge"
-                )
-
             if isinstance(payload, str):
                 data = json.loads(payload)
             elif isinstance(payload, dict):
                 data = payload
             else:
-                return Bars(
-                    symbol=symbol, timeframe=timeframe, data=[], source="ea_bridge"
-                )
+                return None
 
-            bars_data = data.get("data", [])
-            bars: list[Bar] = []
+            if "error" in data:
+                return None
 
-            for b in bars_data:
-                bars.append(
-                    Bar(
-                        time=int(b.get("time", 0)),
-                        open=float(b.get("open", 0.0)),
-                        high=float(b.get("high", 0.0)),
-                        low=float(b.get("low", 0.0)),
-                        close=float(b.get("close", 0.0)),
-                        tick_volume=int(b.get("tick_volume", 0))
-                        if b.get("tick_volume")
-                        else None,
-                    )
-                )
-
-            return Bars(
-                symbol=data.get("symbol", symbol),
-                timeframe=data.get("timeframe", timeframe),
-                data=bars,
-                source="ea_bridge",
-            )
+            info = SymbolInfo(**data)
+            if info.symbol:
+                info.symbol = denormalize_symbol(info.symbol)
+            return info
         except Exception as e:
-            logger.error(f"Get bars failed: {e}")
-            return Bars(symbol=symbol, timeframe=timeframe, data=[], source="ea_bridge")
+            logger.error(f"Get symbol info failed: {e}")
+            return None
+
+    def get_deals_history(
+        self, limit: int = 100, symbol: str | None = None, days: int = 30
+    ) -> list[Deal]:
+        try:
+            payload: dict[str, Any] = {"limit": limit, "days": days}
+            if symbol:
+                payload["symbol"] = normalize_symbol(symbol)
+            result = self._send_command("get_deals_history", payload, timeout_s=15.0)
+            if result.get("status") != "completed":
+                return []
+
+            raw_payload = result.get("result", {}).get("payload")
+            if isinstance(raw_payload, str):
+                data = json.loads(raw_payload)
+            elif isinstance(raw_payload, dict):
+                data = raw_payload
+            else:
+                return []
+
+            deals: list[Deal] = []
+            for deal_data in data.get("deals", []):
+                if "symbol" in deal_data:
+                    deal_data["symbol"] = denormalize_symbol(deal_data["symbol"])
+                deals.append(Deal(**deal_data))
+            return deals
+        except Exception as e:
+            logger.error(f"Get deals history failed: {e}")
+            return []
 
     def estimate_margin(self, req: MarginEstimateRequest) -> MarginEstimate:
-        return MarginEstimate(
-            required_margin=0.0, comment="Not implemented in EA bridge", raw={}
-        )
+        try:
+            symbol_norm = normalize_symbol(req.symbol)
+            payload: dict[str, Any] = {
+                "symbol": symbol_norm,
+                "side": req.side,
+                "volume_lots": req.volume_lots,
+            }
+            if req.price_hint is not None:
+                payload["price"] = req.price_hint
+
+            result = self._send_command("estimate_margin", payload, timeout_s=10.0)
+            if result.get("status") != "completed":
+                return MarginEstimate(
+                    required_margin=0.0,
+                    comment=result.get("error", "estimate_margin_failed"),
+                    raw={},
+                )
+
+            raw_payload = result.get("result", {}).get("payload")
+            if isinstance(raw_payload, str):
+                data = json.loads(raw_payload)
+            elif isinstance(raw_payload, dict):
+                data = raw_payload
+            else:
+                data = {}
+
+            if data.get("comment") == "symbol_not_found":
+                return MarginEstimate(
+                    required_margin=0.0,
+                    comment="symbol_not_found",
+                    raw=data,
+                )
+
+            return MarginEstimate(
+                required_margin=float(data.get("required_margin", 0.0) or 0.0),
+                leverage=int(data.get("leverage", 0)) if data.get("leverage") else None,
+                comment=data.get("comment"),
+                raw=data,
+            )
+        except Exception as e:
+            return MarginEstimate(required_margin=0.0, comment=str(e), raw={})
 
     def simulate_order(self, req: TradeIntent) -> SimulationResult:
         return SimulationResult(intent_id=req.intent_id, status="simulated")
@@ -398,6 +475,129 @@ class EABridgeAdapter(ExecutionPort):
                 status="error",
                 message=str(e),
             )
+
+    def get_bars(self, symbol: str, timeframe: str, count: int = 100) -> Bars:
+        """Fetch OHLCV bars via EA bridge command.
+
+        The EA already supports get_bars through JsonBars(). This method
+        wires the command through the adapter so ExecutionGateway can use it.
+        """
+        try:
+            symbol_norm = normalize_symbol(symbol)
+            result = self._send_command(
+                "get_bars",
+                {"symbol": symbol_norm, "timeframe": timeframe, "count": count},
+                timeout_s=15.0,
+            )
+
+            if result.get("status") != "completed":
+                logger.warning(f"Get bars failed: {result.get('error', 'unknown')}")
+                return Bars(symbol=symbol, timeframe=timeframe, data=[])
+
+            raw_payload = result.get("result", {}).get("payload")
+            if isinstance(raw_payload, str):
+                data = json.loads(raw_payload)
+            elif isinstance(raw_payload, dict):
+                data = raw_payload
+            else:
+                return Bars(symbol=symbol, timeframe=timeframe, data=[])
+
+            # EA returns {"symbol": "...", "timeframe": "...", "data": [...]}
+            bars_data = data.get("data", [])
+            bars = [Bar(**b) for b in bars_data]
+
+            resp_symbol = data.get("symbol", symbol)
+            if resp_symbol:
+                resp_symbol = denormalize_symbol(resp_symbol)
+
+            return Bars(
+                symbol=resp_symbol,
+                timeframe=timeframe,
+                data=bars,
+                source="ea_bridge",
+            )
+        except Exception as e:
+            logger.error(f"Get bars failed: {e}")
+            return Bars(symbol=symbol, timeframe=timeframe, data=[])
+
+    def get_indicator(
+        self,
+        symbol: str,
+        timeframe: str,
+        indicator: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Fetch indicator values via EA bridge command.
+
+        The EA supports advanced indicator requests through JsonIndicatorAdvanced()
+        which parses all parameters from the command string.
+        """
+        try:
+            symbol_norm = normalize_symbol(symbol)
+            payload: dict[str, Any] = {
+                "symbol": symbol_norm,
+                "timeframe": timeframe,
+                "indicator": indicator,
+            }
+            # Forward all optional parameters to the EA
+            for key, val in kwargs.items():
+                if val is not None:
+                    payload[key] = val
+
+            result = self._send_command("get_indicator", payload, timeout_s=15.0)
+
+            if result.get("status") != "completed":
+                return {"status": "error", "message": result.get("error", "timeout")}
+
+            raw_payload = result.get("result", {}).get("payload")
+            if isinstance(raw_payload, str):
+                data = json.loads(raw_payload)
+            elif isinstance(raw_payload, dict):
+                data = raw_payload
+            else:
+                data = {}
+
+            # Denormalize symbol in response
+            if "symbol" in data:
+                data["symbol"] = denormalize_symbol(data["symbol"])
+
+            return data
+        except Exception as e:
+            logger.error(f"Get indicator failed: {e}")
+            return {"status": "error", "message": str(e)}
+
+    def get_ticks(self, symbol: str, count: int = 200) -> dict[str, Any]:
+        """Fetch recent tick data via EA bridge command.
+
+        The EA supports this through JsonTicks().
+        """
+        try:
+            symbol_norm = normalize_symbol(symbol)
+            result = self._send_command(
+                "get_ticks",
+                {"symbol": symbol_norm, "count": count},
+                timeout_s=15.0,
+            )
+
+            if result.get("status") != "completed":
+                return {"status": "error", "message": result.get("error", "timeout")}
+
+            raw_payload = result.get("result", {}).get("payload")
+            if isinstance(raw_payload, str):
+                data = json.loads(raw_payload)
+            elif isinstance(raw_payload, dict):
+                data = raw_payload
+            else:
+                data = {}
+
+            # Denormalize symbol in response
+            if "symbol" in data:
+                data["symbol"] = denormalize_symbol(data["symbol"])
+
+            return data
+        except Exception as e:
+            logger.error(f"Get ticks failed: {e}")
+            return {"status": "error", "message": str(e)}
 
     def close_position(self, req: ClosePositionRequest) -> ExecutionResult:
         """Close position via EA bridge command."""

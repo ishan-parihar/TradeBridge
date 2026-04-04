@@ -31,8 +31,71 @@ class AccountSummary(BaseModel):
     equity: Optional[float] = None
     margin: Optional[float] = None
     free_margin: Optional[float] = None
+    margin_level: Optional[float] = None
+    leverage: Optional[int] = None
+    profit: Optional[float] = None
+    margin_call_level: Optional[float] = None
+    margin_stop_out_level: Optional[float] = None
     currency: Optional[str] = None
+    server: Optional[str] = None
     environment: Literal["paper", "demo", "live"] = "demo"
+
+
+class SymbolInfo(BaseModel):
+    symbol: str
+    description: Optional[str] = None
+    digits: Optional[int] = None
+    point: Optional[float] = None
+    tick_size: Optional[float] = None
+    tick_value: Optional[float] = None
+    contract_size: Optional[float] = None
+    volume_min: Optional[float] = None
+    volume_max: Optional[float] = None
+    volume_step: Optional[float] = None
+    stops_level_points: Optional[int] = None
+    freeze_level_points: Optional[int] = None
+    spread_points: Optional[int] = None
+    spread_float: Optional[bool] = None
+    trade_mode: Optional[str] = None
+    calc_mode: Optional[str] = None
+    currency_base: Optional[str] = None
+    currency_profit: Optional[str] = None
+    currency_margin: Optional[str] = None
+    swap_long: Optional[float] = None
+    swap_short: Optional[float] = None
+
+
+class Deal(BaseModel):
+    deal_id: str
+    order_id: Optional[str] = None
+    position_id: Optional[str] = None
+    symbol: str
+    side: Optional[str] = None
+    entry: Optional[str] = None
+    volume: float = 0.0
+    price: float = 0.0
+    profit: float = 0.0
+    commission: float = 0.0
+    swap: float = 0.0
+    fee: float = 0.0
+    time: str
+    comment: Optional[str] = None
+    reason: Optional[str] = None
+    magic: Optional[int] = None
+
+
+class PerformanceSummary(BaseModel):
+    closed_trades: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    win_rate: float = 0.0
+    gross_profit: float = 0.0
+    gross_loss: float = 0.0
+    net_profit: float = 0.0
+    average_win: float = 0.0
+    average_loss: float = 0.0
+    profit_factor: Optional[float] = None
+    expectancy: float = 0.0
 
 
 class Position(BaseModel):

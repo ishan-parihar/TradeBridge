@@ -6,6 +6,7 @@ from mt5_mcp.schemas.models import (
     AccountSummary,
     Bars,
     ClosePositionRequest,
+    Deal,
     ExecutionResult,
     HealthStatus,
     MarginEstimate,
@@ -13,6 +14,7 @@ from mt5_mcp.schemas.models import (
     ModifyOrderRequest,
     Order,
     Position,
+    SymbolInfo,
     SimulationResult,
     TerminalStatus,
     TradeIntent,
@@ -30,7 +32,19 @@ class ExecutionPort(Protocol):
 
     def get_orders(self) -> list[Order]: ...
 
+    def get_symbol_info(self, symbol: str) -> SymbolInfo | None: ...
+
+    def get_deals_history(
+        self, limit: int = 100, symbol: str | None = None, days: int = 30
+    ) -> list[Deal]: ...
+
     def get_bars(self, symbol: str, timeframe: str, count: int) -> Bars: ...
+
+    def get_indicator(
+        self, symbol: str, timeframe: str, indicator: str, **kwargs: object
+    ) -> dict[str, object]: ...
+
+    def get_ticks(self, symbol: str, count: int = 200) -> dict[str, object]: ...
 
     def estimate_margin(self, req: MarginEstimateRequest) -> MarginEstimate: ...
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from mt5_mcp.adapters.common.ports import (
@@ -11,6 +12,7 @@ from mt5_mcp.schemas.models import (
     AccountSummary,
     Bars,
     Bar,
+    Deal,
     ExecutionResult,
     HealthStatus,
     MarginEstimate,
@@ -18,6 +20,7 @@ from mt5_mcp.schemas.models import (
     Order,
     Position,
     SimulationResult,
+    SymbolInfo,
     TerminalStatus,
     TradeIntent,
 )
@@ -135,7 +138,23 @@ class PyMT5Adapter(ExecutionPort):
                 equity=float(getattr(ai, "equity", 0.0)),
                 margin=float(getattr(ai, "margin", 0.0)),
                 free_margin=float(getattr(ai, "margin_free", 0.0)),
+                margin_level=float(getattr(ai, "margin_level", 0.0))
+                if getattr(ai, "margin_level", None) is not None
+                else None,
+                leverage=int(getattr(ai, "leverage", 0))
+                if getattr(ai, "leverage", None) is not None
+                else None,
+                profit=float(getattr(ai, "profit", 0.0))
+                if getattr(ai, "profit", None) is not None
+                else None,
+                margin_call_level=float(getattr(ai, "margin_so_call", 0.0))
+                if getattr(ai, "margin_so_call", None) is not None
+                else None,
+                margin_stop_out_level=float(getattr(ai, "margin_so_so", 0.0))
+                if getattr(ai, "margin_so_so", None) is not None
+                else None,
                 currency=getattr(ai, "currency", None),
+                server=getattr(ai, "server", None),
                 environment=self.settings.environment or "demo",
             )
         except Exception:
@@ -209,6 +228,114 @@ class PyMT5Adapter(ExecutionPort):
         except Exception:
             return []
 
+    def get_symbol_info(self, symbol: str) -> SymbolInfo | None:
+        if self._mt5 is None or not self._ensure_initialized():
+            return None
+        try:
+            info = self._mt5.symbol_info(symbol)
+            if info is None:
+                return None
+            return SymbolInfo(
+                symbol=symbol,
+                description=getattr(info, "description", None),
+                digits=int(getattr(info, "digits", 0))
+                if getattr(info, "digits", None) is not None
+                else None,
+                point=float(getattr(info, "point", 0.0))
+                if getattr(info, "point", None) is not None
+                else None,
+                tick_size=float(getattr(info, "trade_tick_size", 0.0))
+                if getattr(info, "trade_tick_size", None) is not None
+                else None,
+                tick_value=float(getattr(info, "trade_tick_value", 0.0))
+                if getattr(info, "trade_tick_value", None) is not None
+                else None,
+                contract_size=float(getattr(info, "trade_contract_size", 0.0))
+                if getattr(info, "trade_contract_size", None) is not None
+                else None,
+                volume_min=float(getattr(info, "volume_min", 0.0))
+                if getattr(info, "volume_min", None) is not None
+                else None,
+                volume_max=float(getattr(info, "volume_max", 0.0))
+                if getattr(info, "volume_max", None) is not None
+                else None,
+                volume_step=float(getattr(info, "volume_step", 0.0))
+                if getattr(info, "volume_step", None) is not None
+                else None,
+                stops_level_points=int(getattr(info, "trade_stops_level", 0))
+                if getattr(info, "trade_stops_level", None) is not None
+                else None,
+                freeze_level_points=int(getattr(info, "trade_freeze_level", 0))
+                if getattr(info, "trade_freeze_level", None) is not None
+                else None,
+                spread_points=int(getattr(info, "spread", 0))
+                if getattr(info, "spread", None) is not None
+                else None,
+                spread_float=bool(getattr(info, "spread_float", False)),
+                trade_mode=str(getattr(info, "trade_mode", "")) or None,
+                calc_mode=str(getattr(info, "trade_calc_mode", "")) or None,
+                currency_base=getattr(info, "currency_base", None),
+                currency_profit=getattr(info, "currency_profit", None),
+                currency_margin=getattr(info, "currency_margin", None),
+                swap_long=float(getattr(info, "swap_long", 0.0))
+                if getattr(info, "swap_long", None) is not None
+                else None,
+                swap_short=float(getattr(info, "swap_short", 0.0))
+                if getattr(info, "swap_short", None) is not None
+                else None,
+            )
+        except Exception:
+            return None
+
+    def get_deals_history(
+        self, limit: int = 100, symbol: str | None = None, days: int = 30
+    ) -> list[Deal]:
+        if self._mt5 is None or not self._ensure_initialized():
+            return []
+        try:
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=max(days, 1))
+            if symbol:
+                rows = self._mt5.history_deals_get(start, end, group=symbol)
+            else:
+                rows = self._mt5.history_deals_get(start, end)
+            if not rows:
+                return []
+
+            deals: list[Deal] = []
+            for row in list(rows)[-max(limit, 1) :]:
+                deal_type = getattr(row, "type", None)
+                if deal_type not in (0, 1):
+                    continue
+                entry_map = {0: "in", 1: "out", 2: "inout", 3: "out_by"}
+                deals.append(
+                    Deal(
+                        deal_id=str(getattr(row, "ticket", "")),
+                        order_id=str(getattr(row, "order", "")) or None,
+                        position_id=str(getattr(row, "position_id", "")) or None,
+                        symbol=str(getattr(row, "symbol", "")),
+                        side="buy" if deal_type == 0 else "sell",
+                        entry=entry_map.get(getattr(row, "entry", None)),
+                        volume=float(getattr(row, "volume", 0.0)),
+                        price=float(getattr(row, "price", 0.0)),
+                        profit=float(getattr(row, "profit", 0.0)),
+                        commission=float(getattr(row, "commission", 0.0)),
+                        swap=float(getattr(row, "swap", 0.0)),
+                        fee=float(getattr(row, "fee", 0.0)),
+                        time=str(
+                            getattr(row, "time_msc", "") or getattr(row, "time", "")
+                        ),
+                        comment=str(getattr(row, "comment", "")) or None,
+                        reason=str(getattr(row, "reason", "")) or None,
+                        magic=int(getattr(row, "magic", 0))
+                        if getattr(row, "magic", None) is not None
+                        else None,
+                    )
+                )
+            return deals
+        except Exception:
+            return []
+
     def get_bars(self, symbol: str, timeframe: str, count: int) -> Bars:
         if self._mt5 is None or not self._ensure_initialized():
             return Bars(symbol=symbol, timeframe=timeframe, data=[], source="pymt5")
@@ -236,7 +363,41 @@ class PyMT5Adapter(ExecutionPort):
             return Bars(symbol=symbol, timeframe=timeframe, data=[], source="pymt5")
 
     def estimate_margin(self, req: MarginEstimateRequest) -> MarginEstimate:
-        return MarginEstimate(required_margin=0.0, comment="scaffold", raw={})
+        if self._mt5 is None or not self._ensure_initialized():
+            return MarginEstimate(required_margin=0.0, comment="scaffold", raw={})
+        try:
+            order_type = (
+                self._mt5.ORDER_TYPE_BUY
+                if req.side == "buy"
+                else self._mt5.ORDER_TYPE_SELL
+            )
+            price = req.price_hint
+            if price is None:
+                tick = self._mt5.symbol_info_tick(req.symbol)
+                price = (
+                    getattr(tick, "ask", None)
+                    if req.side == "buy"
+                    else getattr(tick, "bid", None)
+                )
+            if price is None:
+                return MarginEstimate(
+                    required_margin=0.0, comment="price_unavailable", raw={}
+                )
+
+            required_margin = self._mt5.order_calc_margin(
+                order_type, req.symbol, req.volume_lots, price
+            )
+            account = self._mt5.account_info()
+            return MarginEstimate(
+                required_margin=float(required_margin or 0.0),
+                leverage=int(getattr(account, "leverage", 0))
+                if account and getattr(account, "leverage", None) is not None
+                else None,
+                comment="ok",
+                raw={"price": price},
+            )
+        except Exception as e:
+            return MarginEstimate(required_margin=0.0, comment=str(e), raw={})
 
     def simulate_order(self, req: TradeIntent) -> SimulationResult:
         return SimulationResult(intent_id=req.intent_id, status="simulated")

@@ -63,6 +63,14 @@ class ExecutionGateway:
     def get_bars(self, symbol: str, timeframe: str, count: int) -> Bars:
         return self.adapter.get_bars(symbol, timeframe, count)
 
+    def get_indicator(
+        self, symbol: str, timeframe: str, indicator: str, **kwargs: object
+    ) -> dict:
+        return self.adapter.get_indicator(symbol, timeframe, indicator, **kwargs)
+
+    def get_ticks(self, symbol: str, count: int = 200) -> dict:
+        return self.adapter.get_ticks(symbol, count)
+
     def estimate_margin(self, req: MarginEstimateRequest) -> MarginEstimate:
         return self.adapter.estimate_margin(req)
 

@@ -76,6 +76,41 @@ GAUGE_QUEUE_DEPTH = Gauge("bridge_queue_depth", "Current command queue depth")
 GAUGE_HEARTBEAT_FRESH = Gauge("bridge_heartbeat_fresh", "1 if heartbeat fresh, else 0")
 
 
+def _extract_quoted_field(raw_text: str, field_name: str) -> str | None:
+    marker = f'"{field_name}":"'
+    start = raw_text.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = raw_text.find('"', start)
+    if end < 0:
+        return None
+    return raw_text[start:end]
+
+
+def _recover_malformed_result_body(raw_text: str) -> dict[str, object]:
+    """Recover request_id/status/error from EA error callbacks with unescaped JSON."""
+    request_id = _extract_quoted_field(raw_text, "request_id")
+    if not request_id:
+        return {}
+
+    data: dict[str, object] = {
+        "request_id": request_id,
+        "status": _extract_quoted_field(raw_text, "status") or "ok",
+    }
+
+    error_marker = '"error":"'
+    error_start = raw_text.find(error_marker)
+    if error_start >= 0:
+        error_start += len(error_marker)
+        error_end = raw_text.rfind('"}')
+        if error_end < error_start:
+            error_end = len(raw_text)
+        data["error"] = raw_text[error_start:error_end]
+
+    return data
+
+
 def _secret_ok(request: Request, params: dict | None = None) -> bool:
     """Optional shared-secret enforcement.
 
@@ -277,6 +312,9 @@ def bridge_commands_enqueue(
     count: int | None = None,
     indicator: str | None = None,
     period: int | None = None,
+    fast: int | None = None,
+    slow: int | None = None,
+    signal: int | None = None,
     width: int | None = None,
     height: int | None = None,
     side: str | None = None,
@@ -285,6 +323,14 @@ def bridge_commands_enqueue(
     sl: float | None = None,
     tp: float | None = None,
     deviation: int | None = None,
+    shift: int | None = None,
+    k_period: int | None = None,
+    d_period: int | None = None,
+    slowing: int | None = None,
+    tenkan: int | None = None,
+    kijun: int | None = None,
+    senkou: int | None = None,
+    window: int | None = None,
     position_id: str | None = None,
     order_id: str | None = None,
     new_price: float | None = None,
@@ -292,6 +338,8 @@ def bridge_commands_enqueue(
     new_tp: float | None = None,
     price: float | None = None,
     kind: str | None = None,
+    limit: int | None = None,
+    days: int | None = None,
 ) -> dict[str, str]:
     if not _secret_ok(request):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -306,6 +354,12 @@ def bridge_commands_enqueue(
         payload["indicator"] = indicator
     if period is not None:
         payload["period"] = period
+    if fast is not None:
+        payload["fast"] = fast
+    if slow is not None:
+        payload["slow"] = slow
+    if signal is not None:
+        payload["signal"] = signal
     if width is not None:
         payload["width"] = width
     if height is not None:
@@ -322,6 +376,22 @@ def bridge_commands_enqueue(
         payload["tp"] = tp
     if deviation is not None:
         payload["deviation"] = deviation
+    if shift is not None:
+        payload["shift"] = shift
+    if k_period is not None:
+        payload["k_period"] = k_period
+    if d_period is not None:
+        payload["d_period"] = d_period
+    if slowing is not None:
+        payload["slowing"] = slowing
+    if tenkan is not None:
+        payload["tenkan"] = tenkan
+    if kijun is not None:
+        payload["kijun"] = kijun
+    if senkou is not None:
+        payload["senkou"] = senkou
+    if window is not None:
+        payload["window"] = window
     if position_id is not None:
         payload["position_id"] = position_id
     if order_id is not None:
@@ -336,6 +406,10 @@ def bridge_commands_enqueue(
         payload["price"] = price
     if kind is not None:
         payload["kind"] = kind
+    if limit is not None:
+        payload["limit"] = limit
+    if days is not None:
+        payload["days"] = days
     queue = get_queue_cached()
     cmd_id = queue.enqueue(type, payload)
     try:
@@ -369,19 +443,26 @@ async def bridge_results(request: Request) -> dict[str, str]:
     """
     # Debug: log raw body
     raw_body = await request.body()
+    raw_text = raw_body.split(b"\x00")[0].decode("utf-8", errors="ignore").strip()
     logger.info(f"RESULTS_RAW: body_bytes={raw_body[:300] if raw_body else 'EMPTY'}")
     logger.info(f"RESULTS_RAW: content_type={request.headers.get('content-type')}")
 
     # Parse JSON
     data: dict[str, object] = {}
+    import json
+
     try:
-        body_json = await request.json()
+        body_json = json.loads(raw_text) if raw_text else {}
         logger.info(f"RESULTS_JSON: parsed={body_json}")
         if isinstance(body_json, dict):
             data = body_json
     except Exception as e:
         logger.info(f"RESULTS_JSON: parse_error={e}")
         data = {}
+    if not data and raw_text:
+        data = _recover_malformed_result_body(raw_text)
+        if data:
+            logger.info(f"RESULTS_RECOVERED: {data}")
     # Fallback: form
     if not data:
         try:
