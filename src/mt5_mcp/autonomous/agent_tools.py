@@ -16,7 +16,7 @@ def make_mcp_tools(client: Any) -> list:
 
     @tool
     async def market_regime(symbol: str, timeframe: str = "H1") -> str:
-        """Detect market regime: trending_up, trending_down, ranging, or compressing. Use BEFORE any trade decision."""
+        """Detect market regime: trending_up, trending_down, ranging, or compressing."""
         result = await client.market_regime(symbol, timeframe)
         return json.dumps(result, default=str)
 
@@ -28,7 +28,7 @@ def make_mcp_tools(client: Any) -> list:
 
     @tool
     async def get_bars(symbol: str, timeframe: str = "H1", count: int = 100) -> str:
-        """Fetch OHLCV candles. Use M15 for entry timing, H1 for direction, H4/D1 for bias."""
+        """Fetch OHLCV candles for a symbol and timeframe."""
         result = await client.get_bars(symbol, timeframe, count)
         return json.dumps(result, default=str)
 
@@ -67,7 +67,7 @@ def make_mcp_tools(client: Any) -> list:
         sl_distance_points: float | None = None,
         tp_distance_points: float | None = None,
     ) -> str:
-        """Advisory coaching: checks SL/ATR ratio, risk:reward, trend alignment. Use BEFORE executing a trade."""
+        """Advisory coaching: checks SL/ATR ratio, risk:reward, trend alignment."""
         result = await client.trading_coach(
             symbol,
             side,
@@ -94,7 +94,7 @@ def make_mcp_tools(client: Any) -> list:
 
     @tool
     async def news_fetch(limit: int = 10, keywords: list[str] | None = None) -> str:
-        """Fetch latest financial news. Check for high-impact events before trading."""
+        """Fetch latest financial news headlines with optional keyword filtering."""
         result = await client.news_fetch(
             pools=["FINANCIAL_MARKETS"],
             limit=limit,
@@ -122,7 +122,7 @@ def make_mcp_tools(client: Any) -> list:
         sl: float | None = None,
         tp: float | None = None,
     ) -> str:
-        """Submit a market order. DEMO ONLY. ALWAYS validate with trading_coach first."""
+        """Submit a market order. DEMO ONLY."""
         import uuid
 
         result = await client.submit_market_order(
@@ -165,7 +165,7 @@ def make_mcp_tools(client: Any) -> list:
         sl: float | None = None,
         tp: float | None = None,
     ) -> str:
-        """Log a trading decision. ALWAYS call after making a decision (even HOLD)."""
+        """Log a trading decision."""
         result = await client.trading_log_decision(
             symbol=symbol,
             side=side,
@@ -189,7 +189,7 @@ def make_mcp_tools(client: Any) -> list:
         tp: float | None = None,
         deviation: int = 20,
     ) -> str:
-        """Submit a pending (limit/stop) order. kind is one of: buy_limit, sell_limit, buy_stop, sell_stop. Use when price hasn't reached your entry yet."""
+        """Submit a pending (limit/stop) order. kind is one of: buy_limit, sell_limit, buy_stop, sell_stop."""
         result = await client.submit_pending_order(
             symbol=symbol,
             side=side,
@@ -204,7 +204,7 @@ def make_mcp_tools(client: Any) -> list:
 
     @tool
     async def orders_pending() -> str:
-        """List all pending orders. Check before placing new pending orders to avoid duplicates."""
+        """List all pending orders."""
         result = await client.orders_pending()
         return json.dumps(result, default=str)
 
@@ -241,7 +241,7 @@ def make_mcp_tools(client: Any) -> list:
         sl: float | None = None,
         tp: float | None = None,
     ) -> str:
-        """Adjust SL/TP on an open position. Use to trail stops or take partial profits."""
+        """Modify SL/TP on an open position."""
         result = await client.modify_position_sl_tp(position_id, sl=sl, tp=tp)
         return json.dumps(result, default=str)
 
@@ -263,7 +263,7 @@ def make_mcp_tools(client: Any) -> list:
         tp: float | None = None,
         order_kind: str = "market",
     ) -> str:
-        """Validate a trade setup against broker constraints (min volume, max volume, stop levels). Run BEFORE submitting orders."""
+        """Validate a trade setup against broker constraints (min volume, max volume, stop levels)."""
         result = await client.validate_trade_setup(
             symbol=symbol,
             side=side,
@@ -304,7 +304,7 @@ def make_mcp_tools(client: Any) -> list:
         tp_atr_multiplier: float = 3.0,
         rationale: str | None = None,
     ) -> str:
-        """Place paired BUY STOP + SELL STOP bracket orders for breakout capture. SL/TP computed from ATR. Use in ranging-to-breakout markets."""
+        """Place paired BUY STOP + SELL STOP bracket orders for breakout capture. SL/TP computed from ATR."""
         result = await client.place_bracket_order(
             symbol=symbol,
             buy_trigger=buy_trigger,
@@ -367,7 +367,7 @@ def make_mcp_tools(client: Any) -> list:
 
     @tool
     async def symbol_info(symbol: str) -> str:
-        """Get symbol metadata: point value, min/max volume, stop levels. Use before sizing."""
+        """Get symbol metadata: point value, min/max volume, stop levels."""
         result = await client.symbol_info(symbol)
         return json.dumps(result, default=str)
 
@@ -387,7 +387,7 @@ def make_mcp_tools(client: Any) -> list:
         slow: int = 26,
         signal: int = 9,
     ) -> str:
-        """Get indicator across multiple timeframes at once. Use for confluence analysis. timeframes: e.g. ['M15','H1','H4','D1']."""
+        """Get indicator across multiple timeframes at once. timeframes: e.g. ['M15','H1','H4','D1']."""
         result = await client.multi_timeframe_indicators(
             symbol,
             indicator,
@@ -405,7 +405,7 @@ def make_mcp_tools(client: Any) -> list:
         timeframe: str = "H1",
         lookback: int = 100,
     ) -> str:
-        """Cross-symbol return correlation matrix. Check BEFORE entering to avoid correlated exposure (e.g., long EURUSD + long GBPUSD = double USD risk)."""
+        """Cross-symbol return correlation matrix. Identifies correlated exposure (e.g., long EURUSD + long GBPUSD = double USD risk)."""
         result = await client.correlation_matrix(
             symbols=symbols,
             timeframe=timeframe,
@@ -419,7 +419,7 @@ def make_mcp_tools(client: Any) -> list:
         timeframe: str = "H1",
         lookback: int = 100,
     ) -> str:
-        """Detect support and resistance levels from recent price action. Use for SL/TP placement and breakout triggers."""
+        """Detect support and resistance levels from recent price action."""
         result = await client.support_resistance(
             symbol=symbol,
             timeframe=timeframe,
@@ -435,7 +435,7 @@ def make_mcp_tools(client: Any) -> list:
 
     @tool
     async def trading_decision_support(symbol: str, side: str) -> str:
-        """One-call decision support: regime + ATR + RSI + EMA20 + EMA50 + coaching in single batched round-trip (~400ms vs 3-5s sequential). Use instead of calling market_regime + trading_context + get_indicator + trading_coach separately."""
+        """One-call decision support: regime + ATR + RSI + EMA20 + EMA50 + coaching in single batched round-trip (~400ms vs 3-5s sequential)."""
         result = await client.trading_decision_support(symbol, side)
         return json.dumps(result, default=str)
 
@@ -485,7 +485,7 @@ def make_heartbeat_tools(heartbeat_engine) -> list:
 
     @tool
     async def get_recent_events(event_type: str | None = None, limit: int = 10) -> str:
-        """Get recent market events (price alerts, volatility spikes, news). Use to check what happened while idle."""
+        """Get recent market events (price alerts, volatility spikes, news)."""
         bus = heartbeat_engine.event_bus
         if event_type:
             from mt5_mcp.autonomous.market_event_bus import EventType
@@ -513,7 +513,7 @@ def make_heartbeat_tools(heartbeat_engine) -> list:
         severity: str = "medium",
         cooldown_seconds: int = 300,
     ) -> str:
-        """Set a price alert to wake the agent when price crosses a threshold. Conditions: above, below, crosses_up, crosses_down."""
+        """Set a price alert. Conditions: above, below, crosses_up, crosses_down."""
         monitor = heartbeat_engine.price_monitor
         if not monitor:
             return "Price monitor not initialized."
@@ -575,7 +575,7 @@ def make_heartbeat_tools(heartbeat_engine) -> list:
 
     @tool
     async def get_upcoming_news(hours_ahead: float = 4.0) -> str:
-        """Get upcoming high-impact news events. Use to avoid trading before major announcements."""
+        """Get upcoming high-impact news events."""
         monitor = heartbeat_engine.news_monitor
         if not monitor:
             return "News monitor not initialized."
@@ -594,7 +594,7 @@ def make_heartbeat_tools(heartbeat_engine) -> list:
 
     @tool
     async def get_heartbeat_context() -> str:
-        """Get full proactivity context: active sessions, recent events, upcoming news, volatility, price alerts. Use instead of calling individual tools."""
+        """Get full proactivity context: active sessions, recent events, upcoming news, volatility, price alerts."""
         ctx = heartbeat_engine.get_context()
         parts = []
         if ctx.get("active_sessions"):
