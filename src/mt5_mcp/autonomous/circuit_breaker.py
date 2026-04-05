@@ -1,9 +1,8 @@
-"""Circuit breakers for the autonomous trading agent."""
-
 from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +10,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 STATE_FILE = Path.home() / ".mt5-mcp" / "circuit_breaker.json"
+JOURNAL_PATH = Path.home() / ".mt5-mcp" / "trading_journal.db"
+
+MAX_ABSOLUTE_DAILY_LOSS_PERCENT = 0.20
 
 
 @dataclass
@@ -27,8 +29,6 @@ class CircuitBreakerState:
 
 class CircuitBreaker:
     MAX_CONSECUTIVE_LOSSES = 3
-    MAX_DAILY_LOSS_PERCENT = 0.05
-    MAX_DAILY_TRADES = 10
     MAX_OPEN_POSITIONS = 3
     MAX_BRIDGE_FAILURES = 3
 
@@ -37,15 +37,64 @@ class CircuitBreaker:
         self.equity = equity
         self.load()
 
+    def _infer_max_risk_per_trade(self) -> float:
+        """Infer max risk % from recent trade sizes in the journal.
+
+        Reads the last 20 trade decisions, extracts confidence_level as a
+        proxy for risk intent, and returns the 90th percentile. Defaults
+        to 0.10 (10%) if no data is available.
+        """
+        try:
+            if not JOURNAL_PATH.exists():
+                return 0.10
+            conn = sqlite3.connect(str(JOURNAL_PATH))
+            cursor = conn.execute(
+                "SELECT confidence_level FROM trade_decisions "
+                "WHERE confidence_level IS NOT NULL AND confidence_level > 0 "
+                "ORDER BY timestamp DESC LIMIT 20"
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            if not rows:
+                return 0.10
+            confidences = [float(r[0]) for r in rows]
+            confidences.sort(reverse=True)
+            idx = max(0, int(len(confidences) * 0.1) - 1)
+            p90 = confidences[idx]
+            if p90 >= 0.8:
+                return 0.10
+            elif p90 >= 0.5:
+                return 0.05
+            return 0.02
+        except Exception:
+            return 0.10
+
+    def _adaptive_daily_loss_limit(self) -> float:
+        """Compute daily loss limit as 2x max single-trade risk, capped at 20%.
+
+        This scales with Jesse's sizing strategy:
+        - Risking 10%/trade → 20% daily limit (2 max-risk losses)
+        - Risking 5%/trade  → 10% daily limit (2 max-risk losses)
+        - Risking 2%/trade  → 5%  daily limit (2.5 max-risk losses)
+        """
+        max_risk = self._infer_max_risk_per_trade()
+        adaptive = max_risk * 2
+        return min(adaptive, MAX_ABSOLUTE_DAILY_LOSS_PERCENT)
+
     def check_all(self) -> tuple[bool, str | None]:
         s = self.state
         if s.consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
             return False, f"Cool-off: {s.consecutive_losses} consecutive losses"
-        max_loss = self.equity * self.MAX_DAILY_LOSS_PERCENT
+
+        daily_loss_limit = self._adaptive_daily_loss_limit()
+        max_loss = self.equity * daily_loss_limit
         if s.daily_loss >= max_loss:
-            return False, f"Daily loss limit: ${s.daily_loss:.2f} / ${max_loss:.2f}"
-        if s.daily_trades >= self.MAX_DAILY_TRADES:
-            return False, f"Max daily trades: {self.MAX_DAILY_TRADES}"
+            return (
+                False,
+                f"Daily loss limit: ${s.daily_loss:.2f} / ${max_loss:.2f} "
+                f"({daily_loss_limit:.0%} of equity)",
+            )
+
         if s.open_positions >= self.MAX_OPEN_POSITIONS:
             return False, f"Max open positions: {self.MAX_OPEN_POSITIONS}"
         if s.bridge_failures >= self.MAX_BRIDGE_FAILURES:
@@ -90,7 +139,7 @@ class CircuitBreaker:
             }
             STATE_FILE.write_text(json.dumps(data, indent=2))
         except Exception as e:
-            logger.warning(f"Failed to save circuit breaker state: {e}")
+            logger.warning("Failed to save circuit breaker state: %s", e)
 
     def load(self):
         """Load circuit breaker state from JSON file. Auto-resets daily."""
@@ -116,4 +165,4 @@ class CircuitBreaker:
                 self.state.consecutive_losses = 0
                 self.state.last_reset = datetime.now(timezone.utc).isoformat()
         except Exception as e:
-            logger.warning(f"Failed to load circuit breaker state: {e}")
+            logger.warning("Failed to load circuit breaker state: %s", e)
