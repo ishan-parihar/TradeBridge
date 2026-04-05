@@ -202,6 +202,7 @@ class AgentScheduler:
         from mt5_mcp.autonomous.consolidation import consolidate
         from mt5_mcp.autonomous.decay import apply_decay
         from mt5_mcp.autonomous.semantic_memory import SemanticMemory
+        from apps.autonomous_agent.health import update_health
 
         logger.info("Memory consolidation triggered")
         try:
@@ -215,6 +216,7 @@ class AgentScheduler:
             decay_result = apply_decay(memory)
             if decay_result.get("pruned", 0) > 0:
                 logger.info("Decay pruned %d stale patterns", decay_result["pruned"])
+            update_health(memory_count=memory.count())
         except Exception as exc:
             logger.error("Decay failed: %s", exc, exc_info=True)
 

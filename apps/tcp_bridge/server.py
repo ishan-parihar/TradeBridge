@@ -48,7 +48,7 @@ class TCPBridgeServer:
 
     def __init__(
         self,
-        host: str = "127.0.0.1",
+        host: str = "0.0.0.0",
         ea_port: int = 8025,
         mcp_port: int = 8026,
     ):

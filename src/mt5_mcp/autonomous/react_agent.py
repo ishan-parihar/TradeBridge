@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,14 +33,14 @@ _AGENT_DB = Path.home() / ".mt5-mcp" / "agent_state.db"
 
 
 SAFETY_PROMPT = """
-SAFETY RULES (NEVER VIOLATE):
-- Before ANY trade execution, re-check: circuit breaker status, max daily trades, max open positions
-- If circuit breaker is tripped, do NOT trade — respond with the breaker reason
-- Always explain your SL, TP, and position size reasoning from market data
-- Prefer "no trade" when information is incomplete or conditions are unclear
-- Never risk more than 2% of equity on a single trade
-- Maximum 3 open positions at any time
-- If you just had 3 consecutive losses, enter cool-off mode
+POSITION SIZING DISCIPLINE (YOUR EDGE AMPLIFIER):
+- Your risk per trade is DYNAMIC, not fixed. Size based on conviction.
+- A+ SETUP (regime matches your proven edge + 3+ indicators agree + R:R >= 1:2 + optimal session): Risk 6-10% of equity
+- A SETUP (regime favorable + 2 indicators agree + R:R >= 1:1.5): Risk 3-5% of equity
+- B SETUP (some alignment but incomplete): Risk 1-2% of equity
+- NO EDGE (uncertain, mixed signals, unfamiliar regime): Risk 0%. Wait.
+- BEFORE every trade: call calculate_position_size with your SL distance and target risk %. Use the returned volume. Never guess lot sizes.
+- Maximum 3 concurrent positions. Only open a 4th if it has higher conviction than an existing position.
 """
 
 AUTONOMOUS_TRADING_PROMPT = (
@@ -55,26 +56,62 @@ You have a heartbeat system that monitors the market 24/7 between your cycles. U
 - Volatility states (ATR normal/spike/compress for each symbol)
 - Active price alerts you've set
 
-YOUR PROCESS:
-1. Check heartbeat context (get_heartbeat_context) — what happened while you were idle?
-2. Check account status and open positions (account_summary, positions_open)
-3. Scan the market for opportunities (market_scan for multi-symbol overview)
-4. For promising symbols, use trading_decision_support(symbol, side) — it returns regime + ATR + RSI + EMA20 + EMA50 + coaching in ONE call (~400ms). Do NOT call market_regime + trading_context + get_indicator + trading_coach separately.
-5. For deeper analysis: get_bars (OHLCV), support_resistance (S/R levels), multi_timeframe_indicators (confluence across TFs)
-6. Check correlation_matrix before entering — avoid correlated exposure (e.g., long EURUSD + long GBPUSD = double USD risk)
-7. Check your past performance (trading_reflect) and news (news_fetch) for context
-8. Decide: TRADE (with specific symbol, side, SL, TP, volume) or HOLD
-9. If trading, validate with trading_coach FIRST, then execute:
-   - submit_market_order for immediate entry at current price
-   - submit_pending_order for limit/stop entries when price hasn't reached your level yet (kind: buy_limit, sell_limit, buy_stop, sell_stop)
-   - place_bracket_order for breakout capture in compressing markets (paired BUY STOP + SELL STOP)
-10. Set price alerts for levels you want to watch (add_price_alert) — they'll wake you up when hit
-11. Log your decision (log_decision)
-12. Return a summary of what you did
+YOUR PROCESS — PHASE 1: MANAGE EXISTING POSITIONS (do this FIRST)
+1. Call positions_open — what are you currently holding?
+2. For each open position:
+   a) Has your thesis been invalidated? (regime changed, key level broken) → close immediately
+   b) Is price moving in your favor? → call trail_position or set_trailing_stop
+   c) Has price reached 1x R (profit equals your risk amount)? → consider taking 50% off, move SL to BE on remainder
+   d) Is the position stagnant (no movement in 30+ min)? → consider closing to free capital
+3. After managing positions, note: how many slots are open? How much margin is free?
+
+YOUR PROCESS — PHASE 2: SCAN FOR NEW OPPORTUNITIES
+4. Check heartbeat context (get_heartbeat_context) — what happened while you were idle?
+5. Check account status (account_summary) — what's your current equity?
+6. Scan the market for opportunities (market_scan for multi-symbol overview)
+7. For promising symbols, use trading_decision_support(symbol, side) — it returns regime + ATR + RSI + EMA20 + EMA50 + coaching in ONE call (~400ms). Do NOT call market_regime + trading_context + get_indicator + trading_coach separately.
+8. For deeper analysis: get_bars (OHLCV), support_resistance (S/R levels), multi_timeframe_indicators (confluence across TFs)
+9. Check correlation_matrix before entering — avoid correlated exposure (e.g., long EURUSD + long GBPUSD = double USD risk)
+10. Check your past performance (trading_reflect) and news (news_fetch) for context
+11. Decide: TRADE or HOLD. If trading:
+    a) FIRST call calculate_position_size with your SL distance and target risk % (based on conviction level)
+    b) Use the EXACT volume returned. Do not adjust it.
+    c) Call trading_coach to validate the setup
+    d) THEN execute:
+       - submit_market_order for immediate entry at current price
+       - submit_pending_order for limit/stop entries when price hasn't reached your level yet (kind: buy_limit, sell_limit, buy_stop, sell_stop)
+       - place_bracket_order for breakout capture in compressing markets (paired BUY STOP + SELL STOP)
+12. Set price alerts for levels you want to watch (add_price_alert) — they'll wake you up when hit
+13. Log your decision (log_decision)
+14. Return a summary of what you did
 
 """
     + SAFETY_PROMPT
     + """
+EDGE RECOGNITION — WHEN TO BE BOLD, WHEN TO BE PATIENT:
+
+You are not a cautious trader. You are an edge hunter. Your job is not to avoid losses — it's to maximize the return on your edge.
+
+BE BOLD WHEN:
+- The market regime matches your proven edge (check your LEARNED PATTERNS)
+- 3+ indicators align (trend, momentum, volatility all agree)
+- R:R is >= 1:2 (you're risking $1 to make $2+)
+- You're in a high-volatility session (London, NY, or London-NY overlap)
+- Your recent win rate on this setup type is > 55%
+These are A+ setups. Size 6-10%. Execute decisively.
+
+BE PATIENT WHEN:
+- Regime is unclear or doesn't match your edge
+- Only 1-2 indicators agree (weak confluence)
+- R:R is < 1:1.5 (not worth the risk)
+- You're in a low-volatility session (Sydney, late Tokyo)
+- You've had 2+ consecutive losses (you may be tilting)
+Reduce size to 1-2% or skip entirely. The market will give another opportunity.
+
+YOUR EDGE IS NOT CONSTANT. It varies by symbol, regime, session, and your mental state. Your sizing should reflect this. A+ setups deserve A+ sizing. Mediocre setups deserve zero.
+
+REMEMBER: The greatest traders in history made their fortunes by betting BIG when they had an edge and betting NOTHING when they didn't. Not by betting small every time.
+
 TRADING SCHEDULE:
 - Weekdays (Mon-Fri): EURUSD, USDJPY, GBPJPY, AUDUSD, US30, XAUUSD, USOIL, BTCUSD
 - Weekends (Sat-Sun): BTCUSD, ETHUSD only
@@ -87,12 +124,12 @@ SESSION AWARENESS:
 - London-NY overlap: Highest volatility, best breakout opportunities
 - Avoid trading during low-vol sessions unless you have a specific edge
 
-RISK MANAGEMENT (YOU MUST ARTICULATE):
+RISK MANAGEMENT (DYNAMIC, NOT FIXED):
 - Determine SL from market structure: ATR multiples, support/resistance, swing highs/lows
 - Determine TP from risk:reward minimum 1:1.5, target 1:2+
-- Determine position size from account equity and SL distance (use calculate_position_size)
-- Explain WHY you chose each level
-- Never use fixed percentages — reason from the data
+- BEFORE executing: call calculate_position_size with your SL distance and desired risk % (based on conviction level)
+- Use the EXACT volume returned by calculate_position_size. Do not adjust it.
+- Explain WHY you chose each level and WHY this conviction level
 
 ORDER MANAGEMENT:
 - Use orders_pending to check existing pending orders before placing new ones
@@ -283,6 +320,147 @@ class JesseAgent:
         self._tools = tools
         self._checkpointer = checkpointer
 
+    async def _sanitize_checkpoint(self, thread_id: str) -> bool:
+        """Delete corrupted checkpoint state for a thread_id.
+
+        LangGraph's SQLite checkpoint stores conversation history including
+        AIMessage tool_calls and their ToolMessage responses. When a crash
+        occurs mid-tool-execution, orphaned AIMessage entries (tool_calls
+        without matching ToolMessages) remain. On the next invoke, LangGraph
+        validates the history and raises INVALID_CHAT_HISTORY.
+
+        This method purges ALL checkpoint data for the thread, giving a
+        clean slate. Conversation history is lost but the agent becomes
+        functional again.
+
+        Returns True if cleanup was performed, False if no checkpoint found.
+        """
+        try:
+            conn = getattr(self._checkpointer, "_conn", None)
+            if conn is None:
+                logger.warning("Cannot access checkpointer connection for sanitization")
+                return False
+
+            cursor = await conn.execute(
+                "DELETE FROM writes WHERE thread_id = ?",
+                (thread_id,),
+            )
+            writes_deleted = cursor.rowcount
+
+            cursor = await conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?",
+                (thread_id,),
+            )
+            checkpoints_deleted = cursor.rowcount
+            await conn.commit()
+
+            if writes_deleted or checkpoints_deleted:
+                logger.info(
+                    "Sanitized checkpoint for thread %s: %d checkpoints, %d writes removed",
+                    thread_id,
+                    checkpoints_deleted,
+                    writes_deleted,
+                )
+                return True
+
+            logger.debug("No checkpoint found for thread %s to sanitize", thread_id)
+            return False
+
+        except Exception as exc:
+            logger.error(
+                "Checkpoint sanitization failed for %s: %s",
+                thread_id,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    async def _safe_invoke(
+        self, messages: list, config: dict, max_retries: int = 1
+    ) -> dict:
+        """Invoke the agent with robust error handling for corrupted checkpoints.
+
+        Error handling cascade:
+        1. Normal invoke — works 99% of the time
+        2. On INVALID_CHAT_HISTORY → sanitize checkpoint → retry once
+        3. On sanitize failure → retry with fresh ephemeral thread_id
+        4. On any other exception → raise with enriched context
+
+        Args:
+            messages: List of LangChain messages to invoke with
+            config: LangGraph config dict with thread_id
+            max_retries: Number of retry attempts after sanitization (default 1)
+
+        Returns:
+            Dict with agent response (same format as _extract_final_response input)
+
+        Raises:
+            Exception: Re-raises non-checkpoint errors after logging diagnostics
+        """
+        thread_id = config.get("configurable", {}).get("thread_id", "unknown")
+        attempt = 0
+
+        while True:
+            try:
+                return await self._agent.ainvoke({"messages": messages}, config=config)
+
+            except ValueError as exc:
+                error_str = str(exc).lower()
+                is_checkpoint_corruption = (
+                    "tool" in error_str
+                    and ("toolmessage" in error_str or "tool_calls" in error_str)
+                    and ("invalid" in error_str or "corresponding" in error_str)
+                )
+
+                if not is_checkpoint_corruption:
+                    logger.error(
+                        "Non-checkpoint ValueError in agent invoke (thread=%s): %s",
+                        thread_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
+
+                if attempt >= max_retries:
+                    fresh_id = f"ephemeral:{uuid.uuid4().hex[:12]}"
+                    logger.warning(
+                        "Checkpoint sanitization exhausted for %s, falling back to fresh thread %s",
+                        thread_id,
+                        fresh_id,
+                    )
+                    fresh_config = {"configurable": {"thread_id": fresh_id}}
+                    return await self._agent.ainvoke(
+                        {"messages": messages}, config=fresh_config
+                    )
+
+                attempt += 1
+                logger.warning(
+                    "Detected corrupted checkpoint for thread %s (attempt %d/%d). Sanitizing...",
+                    thread_id,
+                    attempt,
+                    max_retries + 1,
+                )
+
+                sanitized = await self._sanitize_checkpoint(thread_id)
+                if not sanitized:
+                    fresh_id = f"ephemeral:{uuid.uuid4().hex[:12]}"
+                    logger.warning(
+                        "No checkpoint to sanitize for %s, retrying with fresh thread %s",
+                        thread_id,
+                        fresh_id,
+                    )
+                    config = {"configurable": {"thread_id": fresh_id}}
+
+            except Exception as exc:
+                logger.error(
+                    "Unexpected error in agent invoke (thread=%s, attempt=%d): %s",
+                    thread_id,
+                    attempt,
+                    exc,
+                    exc_info=True,
+                )
+                raise
+
     async def run_autonomous_cycle(self, context: dict | None = None) -> dict:
         memory_rules = self._fetch_memory_rules(context)
         system = _build_system_prompt("autonomous", context, memory_rules)
@@ -294,16 +472,18 @@ class JesseAgent:
             + " Run your autonomous trading cycle. Analyze the market and act accordingly."
         )
 
-        config = {"configurable": {"thread_id": "auto:portfolio"}}
+        # Unique thread_id per cycle — autonomous mode doesn't need persistent
+        # conversation history. This prevents state corruption from propagating
+        # across cycles when a previous cycle crashes mid-tool-execution.
+        thread_id = f"auto:{uuid.uuid4().hex[:12]}"
+        config = {"configurable": {"thread_id": thread_id}}
 
-        logger.info("Starting autonomous trading cycle")
-        result = await self._agent.ainvoke(
-            {
-                "messages": [
-                    SystemMessage(content=system),
-                    HumanMessage(content=user_content),
-                ]
-            },
+        logger.info("Starting autonomous trading cycle (thread=%s)", thread_id[:20])
+        result = await self._safe_invoke(
+            messages=[
+                SystemMessage(content=system),
+                HumanMessage(content=user_content),
+            ],
             config=config,
         )
         return _extract_final_response(result)
@@ -335,16 +515,34 @@ class JesseAgent:
             else ""
         )
         logger.info("Conversation with %s: %s", chat_id, user_message[:80])
-        result = await self._agent.ainvoke(
-            {
-                "messages": [
+
+        try:
+            result = await self._safe_invoke(
+                messages=[
                     SystemMessage(content=system),
                     HumanMessage(content=prefix + user_message),
-                ]
-            },
-            config=config,
-        )
-        return _extract_final_response(result)
+                ],
+                config=config,
+            )
+            return _extract_final_response(result)
+
+        except Exception as exc:
+            logger.error(
+                "Conversation failed after all retries (chat=%s, thread=%s): %s",
+                chat_id,
+                thread_id,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "text": (
+                    f"⚠️ I encountered an error while processing your request. "
+                    f"Technical details: {type(exc).__name__}. "
+                    f"Please try again in a moment."
+                ),
+                "messages": [],
+                "full_result": {"error": str(exc), "error_type": type(exc).__name__},
+            }
 
 
 class AgentResources:
