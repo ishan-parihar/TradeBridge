@@ -224,7 +224,9 @@ MT5-mcp/
 ├── apps/
 │   ├── mcp_server/          # MCP server (port 8010)
 │   │   └── main.py
-│   └── bridge_gateway/      # Bridge gateway (port 8020)
+│   ├── bridge_gateway/      # Bridge gateway (port 8020)
+│   │   └── main.py
+│   └── tcp_bridge/          # TCP bridge (port 8025)
 │       └── main.py
 ├── ea/
 │   └── BridgeConnectorEA.mq5  # MQL5 EA for MT5
@@ -232,8 +234,12 @@ MT5-mcp/
 │   └── mt5_mcp/
 │       ├── schemas/         # Pydantic models
 │       ├── services/        # Business logic
+│       ├── adapters/        # MT5 adapter layer
+│       ├── policy/          # Trade policy enforcement
+│       ├── observability/   # Logging & metrics
 │       └── settings/        # Configuration
 ├── tests/                   # Test suite
+├── deploy/                  # Docker & systemd deployment
 ├── pyproject.toml           # Poetry dependencies
 └── README.md
 ```
@@ -322,158 +328,9 @@ poetry run python -c "from mt5_mcp.schemas.models import Bars; print('OK')"
 
 ---
 
-## Jesse — Autonomous Trading Agent
+## Related Projects
 
-Named after **Jesse Livermore**, the greatest tape reader in history who made $100M+ (≈$1.5B today) purely from price action.
-
-Jesse is a 24/7 autonomous AI trading agent built on LangChain ReAct with persistent memory, circuit breakers, and Telegram control.
-
-### Architecture
-
-```
-┌──────────────┐     ┌─────────────┐     ┌──────────────┐     ┌──────────┐
-│  Telegram    │────▶│  Jesse      │────▶│  MT5-MCP     │────▶│  MT5 EA  │
-│  Bot         │◀────│  Agent      │◀────│  Server :8010│◀────│  (Wine)  │
-│  (commands)  │     │  (ReAct)    │     │  (35 tools)  │     │          │
-└──────────────┘     └─────────────┘     └──────────────┘     └──────────┘
-                          │
-                     ┌────▼─────┐
-                     │  Memory  │
-                     │ ChromaDB │
-                     │  + SQLite│
-                     └──────────┘
-```
-
-### Trading Schedule
-
-| Days | Symbols | Session |
-|---|---|---|
-| **Mon–Fri** | EURUSD, USDJPY, GBPJPY, AUDUSD, US30, XAUUSD, USOIL, BTCUSD | London/NY overlap active |
-| **Sat–Sun** | BTCUSD, ETHUSD | Crypto 24/7 |
-
-### Self-Management
-
-| Condition | Check Interval |
-|---|---|
-| 3+ consecutive losses | 2 hours (cool-off) |
-| 2 consecutive losses | 30 min |
-| Position open | 5 min (tight monitoring) |
-| Good setups forming | 15 min |
-| Quiet market | 60 min |
-| Weekend | 2 hours |
-
-### Circuit Breakers
-
-- **3 consecutive losses** → 2-hour cool-off
-- **Daily loss >5%** → stop trading for 24h
-- **Max 10 trades/day** → stop
-- **Max 3 open positions** → stop
-- **3 bridge failures** → stop
-
-### Memory Architecture
-
-| Layer | Technology | Purpose |
-|---|---|---|
-| **Episodic** | SQLite journal | Trade history, PnL, decisions |
-| **Semantic** | ChromaDB vector store | Learned patterns (e.g., "Avoid BTCUSD in ranging — 20% win rate") |
-| **Procedural** | Pattern extraction | Regime/symbol/emotion rules with decay |
-
-Jesse learns from every trade. After 10+ trades, it consolidates patterns like:
-- *"Avoid EURUSD in ranging regime — win rate 25% over 12 trades"*
-- *"Favor XAUUSD in trending_up — win rate 68% over 15 trades"*
-- *"When confidence <0.4, win rate drops to 30%. Wait for higher conviction."*
-
-### Telegram Commands
-
-| Command | Description |
-|---|---|
-| `/start` | Agent info |
-| `/status` | Agent + circuit breaker status |
-| `/sleep` | Pause trading cycles |
-| `/wake` | Resume trading cycles |
-| `/chart [SYMBOLS...]` | Send chart screenshots (base64 PNG) |
-| `/positions` | List open positions with PnL |
-| `/pnl` | 7-day performance summary |
-| `/scan [SYMBOLS...]` | Quick market scan (price, ATR, regime) |
-| `/close` | Close all positions |
-| `/help` | Command reference |
-
-### Quick Start
-
-```bash
-# 1. Ensure MT5-MCP services are running (ports 8010, 8020, 8025)
-
-# 2. Start Jesse
-export TELEGRAM_BOT_TOKEN="your_bot_token"
-export TELEGRAM_CHAT_ID="your_chat_id"
-.venv/bin/python -m apps.autonomous_agent.main
-
-# Or use the one-click installer
-sudo bash deploy/systemd/install-autonomous.sh
-sudo systemctl start jesse-agent
-sudo journalctl -u jesse-agent -f
-```
-
-### Health Check
-
-```bash
-curl http://127.0.0.1:8090/health
-# {"status":"healthy","phase":"SCAN","open_positions":0,"daily_pnl":0.0,...}
-```
-
-### Data Directory
-
-All state stored in `~/.mt5-mcp/`:
-
-| File | Purpose |
-|---|---|
-| `chroma/` | Semantic memory (ChromaDB persistent store) |
-| `agent_wake_plan.json` | Next wake schedule and reason |
-| `trading_journal.db` | Trade decision log |
-
-### Configuration
-
-Environment variables:
-
-| Variable | Required | Default |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Yes | — |
-| `TELEGRAM_CHAT_ID` | Yes | — |
-| `MT5_MCP_URL` | No | `http://127.0.0.1:8010` |
-| `PYTHONUNBUFFERED` | No | `1` |
-
-### Project Structure
-
-```
-MT5-mcp/
-├── apps/
-│   ├── autonomous_agent/       # Jesse entry point
-│   │   ├── main.py             # Agent bootstrap + signal handling
-│   │   └── health.py           # FastAPI health endpoint (:8090)
-│   ├── mcp_server/             # MCP server (:8010)
-│   ├── tcp_bridge/             # TCP bridge (:8025)
-│   └── bridge_gateway/         # HTTP gateway (:8020)
-├── src/mt5_mcp/autonomous/     # Jesse core
-│   ├── mcp_client.py           # MCP server tool wrappers
-│   ├── react_agent.py          # ReAct autonomous agent (LangChain)
-│   ├── agent_tools.py          # LangChain tool definitions
-│   ├── scheduler.py            # APScheduler + weekday/weekend switching
-│   ├── heartbeat_engine.py     # Event-driven adaptive heartbeat
-│   ├── circuit_breaker.py      # 5 circuit breakers (persistent)
-│   ├── semantic_memory.py      # ChromaDB vector store
-│   ├── consolidation.py        # Pattern extraction from trades
-│   ├── decay.py                # Ebbinghaus decay + pruning
-│   ├── telegram_bot.py         # Bidirectional Telegram bot
-│   ├── market_event_bus.py     # Pub/sub event bus
-│   ├── price_alert_monitor.py  # Threshold-based price alerts
-│   ├── volatility_monitor.py   # ATR-based volatility detection
-│   ├── news_event_monitor.py   # Economic calendar monitoring
-│   └── session_manager.py      # Trading session detection
-├── deploy/systemd/             # Production deployment
-│   ├── mt5-autonomous-agent.service  # Jesse systemd unit
-│   └── install-autonomous.sh         # One-click installer
-└── ARCHITECTURE.md             # Full architecture spec
-```
+- **[Jesse](https://github.com/ishanp321/jesse)** — Autonomous AI Trading Agent (LangChain ReAct) that consumes MT5-MCP as its trading backend.
 
 ## License
 

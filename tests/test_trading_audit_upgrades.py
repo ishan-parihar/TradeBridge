@@ -172,10 +172,12 @@ class TestTradingPolicy:
                 )
             )
 
-        # Manually trigger day reset by changing session date
+        # Manually trigger day reset by setting session_date to a past UTC date
         from datetime import date, timedelta
+        from datetime import datetime, timezone as tz
 
-        self.policy._session_date = date.today() - timedelta(days=1)
+        yesterday_utc = datetime.now(tz.utc).date() - timedelta(days=7)
+        self.policy._session_date = yesterday_utc
         self.policy._reset_if_new_day()
 
         # Should be allowed again

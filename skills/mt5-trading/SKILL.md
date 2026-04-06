@@ -1,705 +1,646 @@
 ---
 name: mt5-trading
-description: >
-  Complete trading workflow for MetaTrader 5 via mt5-mcp. Use this skill whenever
-  you need to analyze markets, execute trades, manage positions, or reflect on
-  trading performance using the MT5-MCP tools. Triggers when the user mentions
-  trading, taking a trade, market analysis, position management, or wants to use
-  mt5-mcp for any trading-related activity. Also triggers for: "analyze BTC",
-  "should I buy ETH", "check my positions", "set a stop loss", "what's the market
-  doing", "log this trade", "how am I trading", market scanning, regime detection,
-  bracket orders, trailing stops, or any request involving the MT5 trading terminal.
-  This is the PRIMARY skill for AI agents operating as traders — it covers the
-  entire lifecycle from market scan to post-trade reflection. Always use this skill
-  before making any trading decision; it prevents common AI trading mistakes like
-  overtrading, ignoring regime, skipping position sizing, and failing to journal.
+description: Use when analyzing markets or operating MetaTrader 5 through mt5-mcp, especially for market scans, order entry, position management, journaling, trade review, or any request to act as a disciplined trading agent on a demo/live/shared MT5 account.
 ---
 
-# MT5 Trading — Complete AI Agent Workflow
+# MT5 Trading — Deterministic Agent Playbook
 
-This skill transforms an AI agent into a disciplined, systematic trader using the MT5-MCP infrastructure. It covers everything: market scanning, regime detection, pre-trade analysis, execution, position management, exit, and post-trade reflection.
+This skill is the operating manual for AI agents trading through MT5-MCP.
 
-## Why This Matters
+Its core lesson from real trading is simple:
 
-AI agents make predictable trading mistakes:
-- **Impulse entries** — seeing a pattern and jumping in without full analysis
-- **No position sizing** — guessing lot sizes instead of calculating risk
-- **Ignoring regime** — using trending strategies in ranging markets
-- **No journaling** — losing money without understanding why
-- **Overtrading** — taking low-conviction trades out of boredom
+**Your biggest risk is not bad chart reading. It is acting in an unreliable, shared, partially observable environment without reconciling state first.**
 
-This workflow prevents all of them. Every step exists because real accounts have failed without it.
+Future agents must trade like deterministic operators, not optimistic chatbots.
 
 ---
 
-## Phase 0: Session Startup
+## Legacy From Today's Trading
 
-**Before doing anything, orient yourself to the current state.**
+Today's session produced two kinds of truth:
 
-### Step 1: Check Bridge & Account
+### What worked
+- Regime-aware analysis improved entry quality.
+- ATR-based stops and targets were directionally correct.
+- Trailing profitable trades locked gains.
+- BTC breakout capture worked when the thesis and structure matched.
+- Logging lessons on exits created reusable intelligence.
 
-```
-1. bridge_status() — Is the EA connected to MT5?
-2. account_summary() — Balance, equity, margin, free margin
-3. positions_open() — Any open positions?
-4. orders_pending() — Any pending orders?
-```
+### What failed
+- Shared-account activity polluted account-wide P&L and attribution.
+- Duplicate or repeated order placement happened when existing orders were not reconciled first.
+- Bridge and tool outputs were sometimes contradictory:
+  - `bridge_status` looked disconnected while some actions still worked
+  - `positions_open()` returned empty while margin/profit suggested exposure
+  - `orders_pending()` changed before fills/exits were fully obvious
+  - `resources/market/wait_for_price` and `resources/positions/monitor` often errored or lagged
+- Modifying orders without re-reading state could lead to missing or altered SL/TP assumptions.
+- Minimum lot size and spread made some trades mathematically unfit for a small account, but trades were still forced.
+- Journaling was incomplete enough that performance learning could have been misleading.
 
-If the bridge is disconnected, stop. Nothing works without it.
-
-### Step 2: Review Past Performance
-
-```
-trading_insights(lookback_days=7)
-```
-
-This tells you:
-- Your recent win rate
-- Average P&L per trade
-- Common mistakes
-- AI-actionable guidance ("When anxious, win rate is 20% — reduce size")
-
-**If win rate is below 40%, reduce risk and focus only on highest-conviction setups.**
-
-### Step 3: Check for Scheduled Events
-
-```
-trading/economic_calendar(hours_ahead=4, min_impact="HIGH")
-```
-
-If high-impact events are coming in the next 2 hours, **do not enter new positions**. Wait for the event to pass.
+This skill exists to preserve the gains and eliminate those failures.
 
 ---
 
-## Phase 1: Market Scan & Opportunity Discovery
+## Core Operating Law
 
-**Find where the opportunity is. Don't force trades on instruments with no edge.**
+**Before every side effect: observe → reconcile → act → verify → journal.**
 
-### Step 1: Multi-Symbol Scan
-
-```
-market_scan(
-  symbols=["BTCUSD", "ETHUSD", "BTCXAU"],
-  timeframe="H1",
-  atr_period=14
-)
-```
-
-This returns for each symbol:
-- Current bid/ask price
-- ATR (volatility)
-- Market regime (trending_up, trending_down, ranging, compressing)
-- Strategy recommendation
-
-### Step 2: Symbol Deep Dive
-
-For any symbol showing a clear regime, get detailed analysis:
-
-```
-trading/decision_support(
-  symbol="BTCUSD",
-  side="sell",       # or "buy" — match the regime direction
-  sl_distance_points=250,   # adjust based on ATR
-  tp_distance_points=500
-)
-```
-
-This one call replaces 6+ sequential calls and returns:
-- ATR value
-- RSI level
-- EMA 20 and 50 (trend alignment)
-- Regime with confidence
-- Coaching recommendation
-- Session context (is it London? NY? Weekend?)
-- Economic calendar events
-
-**Key insight from R&D**: The `trading/decision_support` tool uses batched bridge commands — it fetches everything in a single ~200-400ms round-trip instead of 3-5 seconds of sequential calls.
-
-### Step 3: Regime Confirmation
-
-```
-market_regime(
-  symbol="BTCUSD",
-  timeframe="H1",
-  lookback=50,
-  atr_period=14
-)
-```
-
-Returns:
-- Regime type with confidence (0.0-1.0)
-- Recent high/low
-- Price position in range (%)
-- Strategy hints (entry style, stop strategy, what to avoid)
-
-**Regime rules**:
-- `trending_up` → look for BUY entries on pullbacks
-- `trending_down` → look for SELL entries on rallies
-- `ranging` → trade both directions at support/resistance, or stay out
-- `compressing` → prepare for breakout; use bracket orders
-
-### Step 4: Volatility Profile
-
-```
-volatility_profile(
-  symbol="BTCUSD",
-  timeframe="H1",
-  lookback=20,
-  atr_period=14
-)
-```
-
-Returns ATR value, average bar range, ATR as % of price.
-
-**Use ATR for**:
-- Stop loss placement: SL = 1.5-2.0 × ATR from entry
-- Take profit placement: TP = 2.0-3.0 × ATR from entry
-- Position sizing: wider stops → smaller positions
+If you skip any step, you are no longer trading systematically.
 
 ---
 
-## Phase 2: Pre-Trade Checklist
+## When to Use
 
-**Never enter a trade without passing every checkpoint.**
+Use this skill when you need to:
+- scan markets with mt5-mcp tools
+- decide whether to buy, sell, wait, or cancel
+- submit market, limit, stop, or bracket-style orders
+- manage open positions with stops, targets, or trailing logic
+- reconcile conflicting MT5 state
+- review trading performance or improve future trading behavior
 
-### Checklist (ALL must pass):
-
-1. **Regime alignment**: Your trade direction matches the detected regime
-   - Don't sell in trending_up. Don't buy in trending_down.
-   - Exception: ranging markets allow both directions at extremes.
-
-2. **Risk:Reward ≥ 2:1**: Your TP distance should be at least 2× your SL distance
-   - The coaching tool calculates this. Require `rr_ratio >= 2.0`.
-
-3. **Stop loss is ATR-appropriate**: SL should be 1.5-2.5× ATR
-   - Too tight: you'll get stopped out by noise
-   - Too wide: your position size will be too small, or risk too large
-
-4. **No high-impact news within 2 hours**: Check economic calendar
-
-5. **Not overtrading**: Max 3 trades per symbol per day (from regime hints)
-
-6. **Session quality**: Is the market active?
-   - Weekend trading: very low volume (~13% of daily), wide spreads, avoid
-   - Asian session: moderate for crypto, thin for forex
-   - London/NY overlap: highest volume and volatility
-
-7. **RSI confirmation**:
-   - For BUY: RSI < 70 (not overbought), ideally < 50
-   - For SELL: RSI > 30 (not oversold), ideally > 50
-   - RSI ~50 with strong trend = momentum still has room
-
-8. **EMA alignment**:
-   - For BUY: price > EMA_20 > EMA_50 (bullish stack)
-   - For SELL: price < EMA_20 < EMA_50 (bearish stack)
-   - Mixed alignment = wait for clarity
-
-9. **Confidence level ≥ 7/10**: Your own assessment of the setup
-
-10. **Previous losses checked**: If you've had 3+ consecutive losses, reduce size by 50% or stop trading for the session
+Do **not** use this skill for:
+- pure coding tasks unrelated to MT5 trading operations
+- narrative market commentary without trading intent
+- discretionary gambling without risk sizing or journaling
 
 ---
 
-## Phase 3: Position Sizing
+## Phase 0: Session Claim and Ownership
 
-**This is where most AI agents fail. Calculate, don't guess.**
+Before analyzing a market, claim your session.
 
-```
-calculate_position_size(
-  symbol="BTCUSD",
-  entry_price=66937.0,
-  stop_loss_price=67200.0,
-  risk_percent=1.0,     # Risk 1% of account per trade
-  equity=202.77         # Current account equity
-)
-```
+### Create session identity
+Maintain these values for the entire session:
+- `session_id`
+- `strategy_id`
+- deterministic trade intent labels per symbol and direction
 
-This returns the correct lot size that risks exactly your specified percentage.
+### Maintain a local session ledger
+Track, in your own notes/logs, every trade you intended to create:
 
-**Risk percent guidelines**:
-- Normal trading: 1-2% of equity
-- After 2+ consecutive losses: 0.5%
-- After 4+ consecutive losses: 0.25% or stop trading
-- High-confidence A+ setups only: up to 3%
+| Field | Why it matters |
+|---|---|
+| `session_id` | separates this run from prior runs |
+| `strategy_id` | groups trades by strategy |
+| `intent_id` | required for market-order idempotency |
+| `symbol / side / kind` | needed for reconciliation |
+| `planned entry / sl / tp / volume` | needed to detect duplicates |
+| `decision_id` | links entry and exit journaling |
+| `owned order_id / position_id` | authoritative ownership once known |
 
-**CRITICAL**: Always validate before executing:
+### Shared-account rule
+Assume the account may contain foreign activity.
 
-```
-validate_trade_setup(
-  symbol="BTCUSD",
-  side="sell",
-  order_kind="market",
-  volume_lots=0.01,      # From calculate_position_size
-  entry_price=66937.0,
-  sl=67200.0,
-  tp=66400.0
-)
-```
+Treat any order, position, or realized P&L as **foreign** until you can attribute it to your session ledger by one or more of:
+- exact `order_id` or `position_id` you created
+- matching `intent_id` / `strategy_id`
+- exact symbol + side + kind + price + volume + timestamp window
+- explicit journal entry created by you
 
-This checks:
-- Minimum/maximum volume constraints
-- Stops level (broker minimum distance for SL/TP)
-- Margin requirements
-- Price logic (SL/TP on correct side)
+**Never learn from unlabeled P&L as if it were yours.**
 
 ---
 
-## Phase 4: Execution
+## Phase 1: Connectivity and State Triage
 
-**Execute with discipline. Log everything.**
+Do this at the start of every cycle:
 
-### Option A: Market Order (immediate entry)
-
-```
-submit_market_order_via_bridge(
-  intent_id="unique-session-id",
-  strategy_id="your-strategy-name",
-  account_id="from-account-summary",
-  symbol="BTCUSD",
-  side="sell",
-  order_kind="market",
-  volume_lots=0.01,
-  sl=67200.0,
-  tp=66400.0,
-  deviation_points=20
-)
+```text
+1. bridge_status()
+2. account_summary()
+3. orders_pending()
+4. positions_open()
+5. deals_history(days=1, limit=20)
 ```
 
-### Option B: Bracket Order (breakout capture)
+### Healthy mode
+You may trade normally only when all are true:
+- account fields are populated
+- market data tools return coherent values
+- pending orders and positions reconcile with account margin/profit
+- post-action verification is behaving normally
 
-Use when regime is `compressing` or before high-volatility events:
+### Degraded mode
+You are in degraded mode when any of these happen:
+- `bridge_status().connected` is false but some reads still work
+- `positions_open()` is empty while `account_summary().margin > 0` or floating `profit != 0`
+- a tool returns empty arrays or nulls unexpectedly
+- `wait_for_price` or `positions_monitor` errors repeatedly
+- order or position state changes are delayed or contradictory
 
-```
-place_bracket_order(
-  symbol="BTCUSD",
-  buy_trigger=67400.0,    # Above recent high
-  sell_trigger=66500.0,   # Below recent low
-  volume_lots=0.01,
-  sl_atr_multiplier=1.5,
-  tp_atr_multiplier=2.5,
-  strategy_id="bracket_breakout",
-  rationale="Compressing regime, breakout expected"
-)
-```
+In degraded mode:
+- keep reconciling
+- reduce action frequency
+- prefer read-only analysis or low-frequency management
+- do **not** stack new orders on uncertainty
+- verify every write with multiple state reads
 
-This places both BUY STOP and SELL STOP. When one fills, the other auto-cancels.
+### Blind mode
+You are blind when you cannot trust current state.
 
-### Option C: Pending Order (limit entry)
+Examples:
+- account summary null/empty
+- market data stale or contradictory
+- you cannot determine whether you have exposure
 
-```
-submit_pending_order(
-  symbol="BTCUSD",
-  side="sell",
-  kind="limit",
-  price=67100.0,
-  volume_lots=0.01,
-  sl=67400.0,
-  tp=66400.0
-)
-```
+In blind mode:
+- do **not** enter new trades
+- do **not** assume you are flat
+- use account, deals, and pending orders to reconstruct what happened
+- log `decision_to_wait` with the reason
 
-### IMMEDIATELY Log the Decision
+### Important correction to stale guidance
+Old rule: “If the bridge is disconnected, stop. Nothing works without it.”
 
-```
-trading_log_decision(
-  symbol="BTCUSD",
-  side="sell",
-  action="entry",
-  entry_price=66937.0,
-  sl=67200.0,
-  tp=66400.0,
-  volume_lots=0.01,
-  regime="trending_down",
-  atr_value=127.38,
-  rsi_value=52.6,
-  indicators_considered=["EMA_20", "EMA_50", "RSI_14", "ATR_14", "Market_Regime"],
-  confidence_level=8,
-  model_justification="Full reasoning: why this trade, what setup, what confluence",
-  emotional_self_report="Calm/Anxious/Excited/Cautious/etc",
-  alternatives_considered="What other trades did you consider and why reject them",
-  session_id="unique-session-id"
-)
-```
-
-**Every trade MUST be logged.** This is the foundation of the learning loop. Without logging, you're gambling.
+New rule:
+- `bridge_status()` is a **health hint**, not sole truth.
+- Treat actual account/order/deal reconciliation as the authoritative signal.
 
 ---
 
-## Phase 5: Position Management
+## Phase 2: Authoritative State Reconciliation
 
-**Once in a trade, manage it actively but don't micromanage.**
+Use this precedence order when tool outputs disagree:
 
-### Set a Trailing Stop
-
-```
-set_trailing_stop(
-  position_id="from-open-positions",
-  distance_atr_multiplier=1.5,     # Trail at 1.5× ATR behind price
-  check_interval_seconds=30,       # Check every 30 seconds
-  lock_in_profit_after_atr=1.0     # Lock in profit after 1× ATR move
-)
-```
-
-### Monitor Position
-
-Use long-polling to get alerts without constant polling:
-
-```
-resources/positions/monitor(
-  position_id="from-open-positions",
-  alert_at_pnl=[5.0, 10.0, -3.0, -5.0],    # Alert at these P&L levels
-  alert_at_price=[67000.0, 66500.0],         # Alert at these prices
-  timeout_seconds=600
-)
-```
-
-### Manual SL/TP Adjustment
-
-```
-modify_position_sl_tp(
-  position_id="from-open-positions",
-  sl=67100.0,   # Move to breakeven or trail
-  tp=66200.0    # Adjust target if regime changes
-)
-```
-
-### When to Adjust:
-- **Move SL to breakeven**: When price has moved 1× ATR in your favor
-- **Trail SL**: As price continues in your favor, keep trailing
-- **Adjust TP**: If regime changes or major news approaches
-- **NEVER widen a stop loss**: This is the #1 amateur mistake
-
----
-
-## Phase 6: Exit
-
-**Exits are more important than entries. A good exit turns a bad entry into a break-even trade.**
-
-### Natural Exit (TP or SL hit)
-The position closes automatically. Log the outcome:
-
-```
-trading_log_decision(
-  symbol="BTCUSD",
-  side="sell",
-  action="exit",
-  exit_price=66400.0,
-  pnl=5.37,
-  outcome="win",   # or "loss"
-  lesson_learned="What you learned from this trade",
-  quality_rating=7,     # 1-10: how well you followed the process
-  mistake_category="",  # "impulse_entry", "no_stop_loss", "overtrading", etc.
-  decision_id="from-entry-log"
-)
-```
-
-### Manual Exit
-
-```
-close_position(
-  position_id="from-open-positions",
-  volume=0.01   # omit for full close
-)
-```
-
-### Emergency Exit (all positions)
-
-```
-close_all_positions()
-```
-
-Use only for:
-- Bridge disconnect
-- Unexpected massive news
-- Account risk limit reached
-- End of trading day
-
----
-
-## Phase 7: Post-Trade Reflection
-
-**This is where the AI agent learns. Without reflection, the same mistakes repeat forever.**
-
-### Review Recent Decisions
-
-```
-trading_reflect(
-  limit=10,
-  outcome="loss"    # or omit for all decisions
-)
-```
-
-Ask yourself:
-- What regime was I in when I won vs lost?
-- What was my emotional state for losing trades?
-- Are there patterns in my mistakes?
-
-### Update Decision with Outcome
-
-When a trade closes, find the original log entry and update it:
-
-```
-trading_log_decision(
-  symbol="BTCUSD",
-  side="sell",
-  action="exit",
-  exit_price=66400.0,
-  pnl=5.37,
-  outcome="win",
-  lesson_learned="Trending_down regime + bearish EMA alignment = high probability. Patience on entry improved RR.",
-  quality_rating=8,
-  decision_id="dec_from_entry"
-)
-```
-
-### Weekly Review
-
-```
-trading_insights(lookback_days=7)
-```
-
-This auto-generates:
-- Win rate by emotional state
-- Win rate by regime
-- Common mistakes
-- Actionable guidance
-
-**If the guidance says "reduce trade frequency" — listen.**
-
----
-
-## Crypto-Specific Guidelines (BTCUSD, ETHUSD, BTCXAU)
-
-**Crypto on MT5 is NOT forex.** The behavioral profiles are fundamentally different. Ignoring these differences is a primary reason AI agents lose money on crypto.
-
-### Symbol Behavioral Profiles
-
-| Dimension | BTCUSD | ETHUSD | BTCXAU |
-|---|---|---|---|
-| **Current Price** | ~$66,937 | ~$2,054 | ~14.31 |
-| **Spread (points)** | ~1,400 ($14) | ~140 ($1.40) | ~533 |
-| **H1 ATR** | ~127 points ($127) | ~5.8 points ($5.80) | ~0.03 |
-| **ATR % of Price** | 0.19% | 0.28% | 0.21% |
-| **Min Volume** | 0.01 lots | 0.1 lots | 0.01 lots |
-| **Max Volume** | 200 lots | 2,000 lots | 20 lots |
-| **Swap Long** | -$1,289.3 | -$39.5 | -$275.8 |
-| **Swap Short** | $0.0 | $0.0 | -$196.1 |
-
-### CRITICAL: Spread/ATR Ratio
-
-This is the single most important metric for crypto viability:
-
-```
-Spread/ATR Ratio = Spread Points / ATR Value
-```
-
-| Symbol | Spread | ATR | Ratio | Verdict |
-|--------|--------|-----|-------|---------|
-| BTCUSD | 1,400 | 127 | **11.0%** | ⚠️ High — spread consumes 11% of expected move |
-| ETHUSD | 140 | 5.8 | **2.4%** | ✅ Acceptable |
-| BTCXAU | 533 | 0.03 | **N/A** | ⚠️ Avoid — extremely thin liquidity |
-
-**Rule**: If spread/ATR > 10%, the spread alone eats your edge. Reduce position size by 50% or wait for tighter spreads. BTCUSD is currently at 11% — trade with caution.
-
-### Session Patterns for Crypto
-
-Unlike forex, crypto trades 24/7 — but **liquidity is NOT uniform**:
-
-| Session | UTC Time | Volume | Spread Quality | Recommendation |
-|---|---|---|---|---|
-| **NY Session** | 13:00-21:00 | Highest | Tightest | ✅ Best for crypto entries |
-| **London/NY Overlap** | 13:00-16:00 | Peak | Tightest | ✅ Prime time |
-| **Asian Session** | 00:00-08:00 | Thin | Wider | ⚠️ Prone to false breakouts |
-| **Weekend** | Sat-Sun | ~13% of daily | Widest | ❌ Avoid entirely |
-
-**Today is Saturday** — this means 13% volume concentration, unreliable signals, wide spreads. Valid setups exist but the execution quality is poor. The disciplined move is to wait.
-
-### Adjusted Regime Thresholds for Crypto
-
-The default regime detection thresholds are calibrated for forex. For crypto, adjust mentally:
-
-| Regime | Forex Threshold | Crypto Threshold |
-|--------|----------------|------------------|
-| Ranging | Range/ATR < 0.7 | Range/ATR < 0.5 |
-| Trending | Range/ATR > 1.2 | Range/ATR > 1.5 |
-| Compressing | Compression < 0.7 | Compression < 0.6 |
-
-Crypto has higher natural volatility variance, so the signals need to be stronger to confirm a regime.
-
-### ATR-Based SL Minimums for Crypto
-
-| Symbol | Min SL (points) | Rationale |
-|--------|----------------|-----------|
-| BTCUSD | 127+ (1× ATR) | Anything tighter = noise stop-out |
-| ETHUSD | 6+ (1× ATR) | ETH has lower absolute ATR but higher % volatility |
-
-**Never use fixed-point stop losses on crypto.** Always ATR-denominated. A "tight" 100-point SL on BTCUSD is only 0.79× ATR — guaranteed to be stopped by noise.
-
----
-
-## Trading Rules (Non-Negotiable)
-
-1. **Maximum 3 trades per symbol per day** — from regime hints. More = overtrading.
-2. **Never risk more than 2% of equity on a single trade** — use `calculate_position_size`.
-3. **Always use stop losses** — every trade, no exceptions.
-4. **Never widen a stop loss** — only move it in your favor.
-5. **Risk:Reward must be ≥ 2:1** — if TP isn't at least 2× SL distance, skip the trade.
-6. **Log every decision** — entries, exits, modifications, even decisions to NOT trade.
-7. **After 3 consecutive losses, reduce risk by 50%** — after 4, stop for the session.
-8. **Don't trade on weekends** — crypto on MT5 has ~13% volume, wide spreads, unreliable signals.
-9. **Don't trade 30 min before/after high-impact news** — check economic calendar.
-10. **Regime is law** — don't fight the detected regime. Trade WITH it.
-
-## Psychological Guardrails for AI Agents
-
-Since you don't have emotions, you have other failure modes:
-
-| Human Trap | AI Equivalent | Prevention |
+| Source | Best use | Do not assume |
 |---|---|---|
-| Revenge trading | "I lost, let me double down to recover" | After losses, reduce size. Never increase. |
-| FOMO | "I see a pattern, must enter NOW" | Always run the full checklist first. |
-| Analysis paralysis | Endless analysis, never entering | Cap analysis at 5 min. If setup is A+, enter. |
-| Gambler's fallacy | "I'm due for a win" | Each trade is independent. Past doesn't predict. |
-| Overtrading | "I should be doing something" | If no A+ setup, log "decision_to_wait" and stop. |
-| Confirmation bias | Only seeing indicators that confirm | Check ALL indicators. If they disagree, wait. |
-| Spread ignorance | Entering when spread/ATR > 10% | Check spread before every entry. |
-| Session blindness | Trading on weekends or dead sessions | Check `trading/session_context` first. |
+| `account_summary()` | whether exposure exists at all | it identifies which position is yours |
+| `orders_pending()` | pending-order truth | disappearance always means cancellation succeeded |
+| `positions_open()` | open-position details when populated | empty list means flat |
+| `deals_history()` | authoritative fills and exits | missing newest deal means no fill yet |
+| `bridge_status()` | health and trade-allowed context | false means execution is impossible |
+| `resources/*` wait tools | convenience alerts | they are reliable enough to be your only watcher |
+
+### Reconciliation loop
+Before and after every write:
+
+1. Snapshot `account_summary()`
+2. Snapshot `orders_pending()`
+3. Snapshot `positions_open()`
+4. If anything is unclear, check `deals_history()`
+5. Compare the observed state to your ledger
+6. Only then decide whether an action is still needed
+
+### Contradiction rules
+
+If `positions_open()` is empty **and** account margin is nonzero:
+- assume an open position exists or just closed
+- check `deals_history()` immediately
+- do not open a new trade on the same symbol until reconciled
+
+If an order disappears from `orders_pending()`:
+- do not assume success or cancellation
+- check `deals_history()` and `account_summary()` before acting
+
+If a modify/cancel action says success:
+- re-read state before trusting it
 
 ---
 
-## Confluence Scoring System
+## Phase 3: Market Discovery
 
-Before entering, mentally score the setup (0-100):
+Only look for trades after ownership and state are reconciled.
 
-| Factor | Max Points | How to Score |
-|--------|-----------|-------------|
-| **Trend Alignment** | 25 | D1+H4 match direction (+15 each), EMA alignment (+5) |
-| **Value Area Entry** | 25 | Pullback to EMA 21 (+10), support/resistance level (+10) |
-| **Momentum Confirmation** | 20 | RSI in favorable zone (+10), MACD aligned (+5), no divergence (+5) |
-| **Volatility Context** | 15 | ATR in normal range (+10), spread/ATR < 5% (+5) |
-| **Session Timing** | 15 | NY or London overlap (+10), no major news (+5) |
+### First-pass scan
 
-| Score | Tier | Action |
-|-------|------|--------|
-| 80-100 | ULTRA | Execute with full size |
-| 60-79 | STRONG | Execute with normal size |
-| 40-59 | MODERATE | Execute with 50% size |
-| < 40 | AVOID | No trade |
+```text
+market_scan(symbols=[...], timeframe="H1")
+```
+
+Use it to shortlist symbols with:
+- clear regime
+- acceptable ATR
+- acceptable spread
+- active movement near meaningful levels
+
+### Deep dive
+Prefer batched decision tools over assembling many fragile indicator calls.
+
+Primary tools:
+- `trading_decision_support(...)`
+- `market_regime(...)`
+- `volatility_profile(...)`
+- `trading_context(...)`
+
+Secondary tools:
+- `get_indicator(...)`
+- `support_resistance(...)`
+
+### Tool reliability note
+Observed and documented behavior shows:
+- `trading_decision_support(...)` is often more robust than many sequential indicator calls
+- some indicator requests may return empty/zero or fail on some combinations
+- treat an empty indicator result as “unverified,” not as market truth
+
+---
+
+## Phase 4: Trade Viability Gate
+
+Do **not** trade because a chart looks interesting. Trade only if the setup is viable.
+
+All of these must pass:
+
+1. **State is attributable** — you know what is yours and what is not.
+2. **Regime matches the tactic**
+   - trend → pullback or continuation
+   - range → extremes only
+   - compression → breakout preparation
+3. **Risk:reward is at least 2:1**
+4. **No duplicate intent exists**
+5. **Single-trade risk is within budget**
+6. **Minimum lot size still fits the risk budget**
+7. **Spread cost is acceptable relative to ATR and planned risk**
+8. **No major scheduled event invalidates the setup**
+9. **Confidence is explicit, not implied**
+10. **You can explain why this trade is better than waiting**
+
+### Minimum-lot viability rule
+If `calculate_position_size(...)` implies the broker minimum lot would exceed your allowed risk,
+**skip the trade**.
+
+Do not “just trade the minimum” when it violates risk.
+
+### Spread viability rule
+If spread cost meaningfully destroys the trade thesis, skip.
+
+Practical red flags:
+- spread consumes a large share of the planned stop
+- spread/ATR is abnormally high
+- spread alone removes the 2:1 structure
+
+### Duplication gate
+Before placing any order, check whether a materially identical order already exists.
+
+For pending orders, compare:
+- symbol
+- side
+- order kind
+- price (or tight tolerance)
+- volume
+- SL / TP
+
+If an equivalent order already exists, do **not** place another one.
+
+### Bracket limit
+Never keep more than **one active bracket pair per symbol**.
+
+---
+
+## Phase 5: Position Sizing
+
+Use:
+
+```text
+calculate_position_size(...)
+validate_trade_setup(...)
+```
+
+### Risk budget rules
+- Normal: 1-2% of attributable session equity
+- After 2 consecutive owned losses: 0.5-1%
+- After 3 consecutive owned losses: reduce size by 50% or stop
+- After 4 consecutive owned losses: stop opening new trades
+
+### Hard rule
+If the computed size or minimum tradable size breaks your risk budget, there is no trade.
+
+### What to log before entry
+At minimum:
+- intended risk in % and account currency
+- stop distance
+- TP distance
+- spread context
+- why this size is acceptable
+
+---
+
+## Phase 6: Execution
+
+### Market orders
+Use `submit_market_order_via_bridge(...)` when timing matters.
+
+Mandatory rules:
+- supply a unique `intent_id`
+- verify the returned response
+- reconcile immediately afterward using state reads
+
+### Pending orders
+Use `submit_pending_order(...)` for pullbacks or breakout triggers.
+
+Mandatory rules:
+- verify the order exists in `orders_pending()` after submission
+- store the `order_id` in your ledger
+
+### Bracket-style execution
+For compression or breakout setups, you may use paired stop orders or `place_bracket_order(...)`.
+
+**Critical correction:** MT5 does **not** give you automatic OCO behavior here.
+
+When one leg fills:
+- manually identify the orphan leg in `orders_pending()`
+- cancel it
+- verify cancellation actually happened
+
+### After every submission
+Run this exact discipline:
+
+```text
+1. account_summary()
+2. orders_pending()
+3. positions_open()
+4. deals_history(days=1, limit=10)
+```
+
+Ask:
+- Did my order appear where expected?
+- Did a position open?
+- Did the broker reject or alter anything?
+- Does the observed state match my intent?
+
+If not, do not keep trading as if execution succeeded.
+
+---
+
+## Phase 7: Modification and Management
+
+### Tool split
+- `modify_order(...)` is for **pending** orders only
+- `modify_position_sl_tp(...)` is for **open** positions only
+
+Do not mix them.
+
+### Re-read after every modify
+Observed failure mode: modifying pending orders can lead to unexpected state assumptions.
+
+After any modify:
+- re-read `orders_pending()` or `positions_open()`
+- confirm entry, SL, TP, and volume persisted exactly as intended
+
+### Trailing profits
+When a trade moves in your favor:
+- move to breakeven only after the move is real, not just noise
+- trail only in the favorable direction
+- never widen a stop loss
+
+### If management tools disagree with account state
+- trust the reconciliation loop over any single endpoint
+- if you cannot confirm ownership or current exposure, stop adding new risk
+
+---
+
+## Phase 8: Exit and Closeout
+
+Use TP/SL, trailing exits, or manual closes.
+
+On every exit, you must determine:
+- whether this was your trade
+- whether the exit was manual, stop, target, or foreign interference
+- realized P&L for the owned trade
+
+### Mandatory post-exit update
+Update the original decision with:
+- `outcome`
+- `pnl`
+- `exit_price`
+- `lesson_learned`
+- `quality_rating`
+- `mistake_category` when applicable
+
+If you fail to do this, the trade cannot teach future agents anything.
+
+---
+
+## Phase 9: Journaling Contract
+
+Entry logging is mandatory.
+Exit logging is mandatory.
+Waiting decisions are often worth logging.
+
+### Required fields for every owned entry
+- `session_id`
+- `symbol`
+- `side`
+- `action`
+- `entry_price`
+- `sl`
+- `tp`
+- `volume_lots`
+- `regime`
+- `atr_value`
+- `rsi_value` when relevant
+- `indicators_considered`
+- `confidence_level`
+- `model_justification`
+- `emotional_self_report`
+- `alternatives_considered`
+- `risk_assessment`
+
+### Required fields for every owned exit
+- `decision_id`
+- `exit_price`
+- `pnl`
+- `outcome`
+- `lesson_learned`
+- `quality_rating`
+- `mistake_category` when applicable
+
+### Journaling quality rules
+- `indicators_considered` must never be null if you used indicators
+- `mistake_category` should be populated on preventable losses or process failures
+- `emotional_self_report` should be honest; “calm” is not mandatory
+- if a trade belongs to another system, do **not** log it as yours
+
+---
+
+## What To Pay Attention To
+
+Always pay attention to:
+- nonzero account margin with empty `positions_open()`
+- disappearing orders
+- fills or exits in `deals_history()` that were not yet reflected elsewhere
+- minimum lot size versus risk budget
+- spread cost versus planned stop and ATR
+- duplicate pending orders on the same symbol
+- whether SL/TP survived a modify action
+- whether realized P&L belongs to your session or another actor
+- repeated `Error:` responses from long-poll tools
+- consecutive owned losses and risk escalation
+
+---
+
+## What Not To Pay Attention To
+
+Do **not** let these distract or mislead you:
+- account-wide realized P&L from foreign/manual/other-agent trades
+- a single tool response when other state sources contradict it
+- stale static heuristics when live spread/ATR says the setup is invalid
+- short-term floating noise if your reconciliation and risk are sound
+- your prior narrative if current market data disproves it
+
+---
+
+## What You Must Do
+
+1. Reconcile state before every side effect.
+2. Track ownership explicitly.
+3. Use risk sizing every time.
+4. Skip trades that fail minimum-lot or spread viability.
+5. Prevent duplicate orders.
+6. Re-read state after every submit, modify, cancel, or close.
+7. Journal entries and exits completely.
+8. Treat bridge/tool contradictions as a process problem, not a minor nuisance.
+
+## What You Must Not Do
+
+1. Do not assume an empty positions list means you are flat.
+2. Do not attribute foreign P&L to your own process.
+3. Do not place the same bracket or pending order repeatedly.
+4. Do not widen stops.
+5. Do not keep trading through blind-state conditions.
+6. Do not force minimum lot sizes when they violate risk.
+7. Do not trust a successful response without post-action verification.
+8. Do not let journaling become optional.
 
 ---
 
 ## Mistake Taxonomy
 
-When logging decisions, use these categories for `mistake_category`:
+Use these categories when logging preventable failures:
 
 | Category | Definition | Prevention |
-|----------|-----------|------------|
-| `premature_exit` | Exited before TP or before 1× ATR profit | Set TP at entry, don't move it |
-| `late_entry` | Entered after move already extended | Require pullback setup |
-| `counter_trend` | Traded against detected regime | Always check regime first |
-| `overtrading` | > 3 trades/day or after 2 consecutive losses | Hard daily limit |
-| `revenge_trade` | Entered immediately after loss | 30-min cooldown rule |
-| `spread_ignored` | Entry with spread/ATR > 10% | Check spread before entry |
-| `sl_too_tight` | SL < 1× ATR | Coach validates SL minimum |
-| `no_confluence` | < 3 indicators agree | Minimum confluence score 40 |
+|---|---|---|
+| `duplicate_intent` | Same trade idea submitted more than once | reconcile pending orders before new submission |
+| `foreign_pnl_confusion` | Learned from account-wide P&L not owned by session | maintain ownership ledger |
+| `bridge_blindness` | Kept trading while state was contradictory | enter degraded/blind mode |
+| `journal_incomplete` | Entry or exit missing required fields | enforce journaling contract |
+| `min_lot_violation` | Took trade even though minimum size broke risk budget | skip trade |
+| `spread_ignored` | Spread cost invalidated setup | run viability gate |
+| `sl_too_tight` | Stop inside normal noise | anchor to ATR and structure |
+| `counter_regime` | Trade fought the detected regime | align tactic with regime |
+| `lost_sl_tp_on_modify` | Modification changed assumptions without verification | re-read state after every modify |
+| `premature_exit` | Exited before structure invalidated | predefine exit logic |
+| `overtrading` | Kept entering because market was active, not because edge existed | log `decision_to_wait` |
 
 ---
 
-## Quick Reference: Tool Categories
+## Reliability Notes for Specific Tools
 
-### Market Data
-- `get_bars` — OHLCV data
-- `get_indicator` — RSI, EMA, MACD, Bollinger, ATR, Stochastic, ADX, Ichimoku, CCI, OBV
-- `get_ticks` — Real-time tick data
-- `symbol_info` — Contract specs (tick size, min volume, spread)
+### Prefer first
+- `trading_decision_support(...)` for batched analysis
+- `market_scan(...)` for shortlist discovery
+- `deals_history(...)` for authoritative fills/exits
+- `account_summary(...)` for exposure detection
 
-### Analysis
-- `market_regime` — trending_up, trending_down, ranging, compressing
-- `market_scan` — Multi-symbol scan (price, ATR, regime)
-- `volatility_profile` — ATR and bar range analysis
-- `trading/decision_support` — One-call: regime + ATR + RSI + EMAs + coaching
-- `trading/coach` — Advisory sanity check
-- `trading/context` — Live market context with volatility assessment
+### Use carefully
+- `positions_open()` — useful when populated, not authoritative when empty
+- `wait_for_price` / `positions_monitor` — helpful when they work, but they may error or lag
+- `modify_order(...)` / `modify_position_sl_tp(...)` — verify after every call
 
-### Execution
-- `submit_market_order_via_bridge` — Market order
-- `submit_pending_order` — Limit or stop order
-- `place_bracket_order` — Paired BUY STOP + SELL STOP for breakouts
-- `calculate_position_size` — Risk-based position sizing
-- `validate_trade_setup` — Pre-flight validation
-- `estimate_margin` — Margin check
-
-### Management
-- `modify_position_sl_tp` — Adjust stops and targets
-- `set_trailing_stop` — Automated ATR-based trailing
-- `trail_position` — One-shot manual trail
-- `resources/positions/monitor` — Long-polling P&L alerts
-- `resources/market/wait_for_price` — Long-polling price alerts
-
-### Exit
-- `close_position` — Full or partial close
-- `close_all_positions` — Emergency flatten
-- `cancel_order` — Cancel pending order
-- `cancel_all_orders` — Cancel all pending
-
-### Reflection
-- `trading_log_decision` — Log every decision with reasoning
-- `trading_reflect` — Query past decisions for patterns
-- `trading_insights` — Auto-generated performance analysis
-
-### Awareness
-- `news/fetch` — Forex/crypto news
-- `trading/economic_calendar` — High-impact events
-- `trading/session_context` — Active sessions, quality scores
-- `trading/agent_prompt` — Generate full agent system prompt
+### Critical execution notes
+- `validate_trade_setup(...)` checks broker mechanics, not whether the setup is actually good
+- `place_bracket_order(...)` does not give automatic OCO behavior
+- `submit_market_order_via_bridge(...)` should be treated as submitted only after reconciliation confirms the result
 
 ---
 
-## Example: Complete Trading Session
+## Quick Reference: Daily Cycle
 
-```
-# 1. Startup
-bridge_status() → connected
-account_summary() → $202.77, 2000:1 leverage, no positions
-trading_insights(lookback_days=7) → 21% win rate, reduce frequency
+```text
+START OF CYCLE
+1. bridge_status()
+2. account_summary()
+3. orders_pending()
+4. positions_open()
+5. deals_history()
+6. Reconcile ownership and contradictions
 
-# 2. Scan
-market_scan(symbols=["BTCUSD", "ETHUSD"], timeframe="H1")
-→ BTCUSD: trending_down, ATR=127.38
-→ ETHUSD: trending_down, ATR=5.82
+ONLY IF STATE IS TRUSTWORTHY
+7. market_scan()
+8. trading_decision_support() / market_regime() / volatility_profile()
+9. Run viability gate
+10. calculate_position_size()
+11. validate_trade_setup()
+12. submit order
+13. Re-read state immediately
+14. trading_log_decision(entry)
 
-# 3. Deep dive BTCUSD
-trading/decision_support(symbol="BTCUSD", side="sell", sl_distance_points=250, tp_distance_points=500)
-→ Regime: trending_down (0.66 confidence)
-→ RSI: 52.6 (neutral, room to fall)
-→ EMA: bearish alignment (20 < 50)
-→ Coaching: "cautious_entry" — SL is 2.0× ATR, RR is 2.0:1
-→ Session: Saturday, 13% volume → WAIT
+WHILE IN TRADE
+15. Reconcile exposure repeatedly
+16. Manage stops/targets carefully
+17. Never widen stop
 
-# 4. Decision: It's Saturday. Don't trade.
-trading_log_decision(
-  symbol="BTCUSD", side="sell", action="decision_to_wait",
-  model_justification="Setup is valid (trending_down, bearish EMAs, 2:1 RR) but Saturday has 13% volume concentration. Wide spreads on weekend make entries unreliable. Wait for Monday London session.",
-  confidence_level=7,
-  emotional_self_report="Analytical. Resisting urge to trade a valid setup because timing is wrong.",
-  quality_rating=9
-)
+AT EXIT
+18. Confirm exit via deals_history/account state
+19. trading_log_decision(exit update)
+20. Extract lesson and mistake category
 ```
 
 ---
 
-## Key Lessons from R&D
+## Example: Reconcile-Then-Act Session
 
-1. **The coaching tool is excellent** — `trading/decision_support` and `trading/coach` provide SL/ATR ratio checks, risk:reward analysis, trend alignment, and session context. Trust these numbers.
+```text
+# 1. Reconcile current state
+bridge_status()
+account_summary()
+orders_pending()
+positions_open()
+deals_history(days=1, limit=20)
 
-2. **`get_indicator` may return 422 errors** — some indicator calls fail. Use `trading/decision_support` instead (it fetches indicators internally via batched commands).
+# 2. Detect contradiction
+positions_open() -> []
+account_summary().margin -> nonzero
 
-3. **`multi_timeframe_indicators` may return 422** — same issue. Get indicators on individual timeframes via `get_indicator` if needed, or rely on `trading/decision_support`.
+# 3. Enter degraded mode
+# Do not place new trades yet.
+# Check deals_history and pending orders to determine if a trade just filled or closed.
 
-4. **Weekend trading is a trap** — crypto on MT5 has tiny volume on weekends. The signals are unreliable. The spreads are wider. Wait for weekday sessions.
+# 4. Once state is attributable, scan for opportunity
+market_scan(symbols=["XAUUSD", "EURUSD", "BTCUSD"], timeframe="H1")
+trading_decision_support(symbol="BTCUSD", side="buy", sl_distance_points=500, tp_distance_points=1000)
 
-5. **Logging is non-negotiable** — the account had 19 trades with zero logged decisions. This means zero learning capability. Every trade MUST be logged with `model_justification` and `emotional_self_report`.
+# 5. Run viability gate
+calculate_position_size(...)
+validate_trade_setup(...)
 
-6. **Position sizing matters more than entry timing** — a correctly sized losing trade is survivable. An oversized losing trade destroys accounts. Always use `calculate_position_size`.
+# 6. Submit only if no duplicate order already exists
+submit_market_order_via_bridge(... intent_id="btc-breakout-2026-04-06-01" ...)
 
-7. **Regime detection works well** — the `market_regime` tool provides 0.6-0.9 confidence with strategy hints. Trade WITH the regime, not against it.
+# 7. Verify immediately
+account_summary()
+orders_pending()
+positions_open()
+deals_history(days=1, limit=10)
+
+# 8. Log entry
+trading_log_decision(...)
+
+# 9. On exit, update the same decision
+trading_log_decision(decision_id="...", action="exit", pnl=..., outcome="win", lesson_learned="...", quality_rating=4)
+```
+
+---
+
+## Non-Negotiable Rules
+
+1. **Reconcile before every action.**
+2. **Never trade unattributable account state as if it were yours.**
+3. **Never duplicate an existing intent.**
+4. **Never force a trade below viability thresholds.**
+5. **Never widen a stop loss.**
+6. **Never skip exit journaling.**
+7. **Never trust a single endpoint when multiple endpoints disagree.**
+8. **When blind, stop entering.**
+
+---
+
+## Key Lessons Preserved for Future Generations
+
+1. Good analysis is not enough. Operational discipline determines survival.
+2. Shared accounts distort learning unless ownership is explicit.
+3. In MT5-MCP, empty arrays and contradictory states must be treated as a first-class failure mode.
+4. The best trade is often the trade you skip because minimum size, spread, or uncertainty makes it invalid.
+5. Trailing winners is useful; forcing losers or duplicating orders is destructive.
+6. A future agent should inherit this mindset immediately: **be precise, attributable, idempotent, and skeptical of unverified state.**
