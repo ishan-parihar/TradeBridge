@@ -340,6 +340,13 @@ def bridge_commands_enqueue(
     kind: str | None = None,
     limit: int | None = None,
     days: int | None = None,
+    # Ownership / tracing params
+    session_id: str | None = None,
+    strategy_id: str | None = None,
+    intent_id: str | None = None,
+    idempotency_key: str | None = None,
+    magic_number: int | None = None,
+    comment: str | None = None,
 ) -> dict[str, str]:
     if not _secret_ok(request):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -410,8 +417,18 @@ def bridge_commands_enqueue(
         payload["limit"] = limit
     if days is not None:
         payload["days"] = days
+    if session_id is not None:
+        payload["session_id"] = session_id
+    if strategy_id is not None:
+        payload["strategy_id"] = strategy_id
+    if intent_id is not None:
+        payload["intent_id"] = intent_id
+    if magic_number is not None:
+        payload["magic_number"] = magic_number
+    if comment is not None:
+        payload["comment"] = comment
     queue = get_queue_cached()
-    cmd_id = queue.enqueue(type, payload)
+    cmd_id = queue.enqueue(type, payload, idempotency_key=idempotency_key)
     try:
         depth = getattr(queue, "depth", lambda: 0)()
         GAUGE_QUEUE_DEPTH.set(depth)

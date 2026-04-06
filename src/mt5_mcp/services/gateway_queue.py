@@ -27,7 +27,8 @@ class InMemoryQueue:
         self._lock = threading.Lock()
         self._cmds: dict[str, Command] = {}
         self._order: list[str] = []
-        self._idem: dict[str, str] = {}
+        self._idem: dict[str, tuple[str, float]] = {}
+        self._idempotency_ttl: float = float(get_settings().idempotency_ttl_seconds)
 
     def enqueue(
         self, type_: str, payload: dict[str, Any], idempotency_key: str | None = None
@@ -36,14 +37,18 @@ class InMemoryQueue:
             with self._lock:
                 existing = self._idem.get(idempotency_key)
                 if existing:
-                    return existing
+                    cmd_id, timestamp = existing
+                    if time.time() - timestamp < self._idempotency_ttl:
+                        return cmd_id
+                    else:
+                        del self._idem[idempotency_key]
         cmd_id = str(uuid.uuid4())
         cmd = Command(id=cmd_id, type=type_, payload=payload)
         with self._lock:
             self._cmds[cmd_id] = cmd
             self._order.append(cmd_id)
             if idempotency_key:
-                self._idem[idempotency_key] = cmd_id
+                self._idem[idempotency_key] = (cmd_id, time.time())
         return cmd_id
 
     def next(self) -> Optional[Command]:
