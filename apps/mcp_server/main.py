@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 import time
+from uuid import uuid4
 
 from mt5_mcp.observability.logging import setup_logging
 from mt5_mcp.schemas.models import (
@@ -76,6 +77,7 @@ from mt5_mcp.services.agent_prompt import (
 )
 from mt5_mcp.services.market_context import build_context
 from mt5_mcp.services.trading_coach import TradingCoach
+from mt5_mcp.services.reconciliation import ReconciliationService
 from mt5_mcp.services.session_service import (
     get_session_context as _get_session_context,
     get_session_for_pair as _get_session_for_pair,
@@ -974,6 +976,16 @@ def tool_modify_order(req: ModOrderReq) -> dict:
     if req.new_tp is not None:
         params["new_tp"] = req.new_tp
 
+    # Add ownership fields when provided
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+    if req.intent_id:
+        params["intent_id"] = req.intent_id
+    if req.idempotency_key:
+        params["idempotency_key"] = req.idempotency_key
+
     tcp_result = _tcp_send_and_await("modify_order", params)
     if tcp_result and tcp_result.get("status") == "completed":
         return tcp_result.get("result", {})
@@ -998,6 +1010,16 @@ def tool_close_all_positions(req: CloseAllPositionsRequest) -> dict:
     if req.symbol is not None and req.symbol != "":
         params["symbol"] = normalize_symbol(req.symbol)
 
+    # Add ownership fields when provided
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+    if req.intent_id:
+        params["intent_id"] = req.intent_id
+    if req.idempotency_key:
+        params["idempotency_key"] = req.idempotency_key
+
     tcp_result = _tcp_send_and_await("close_all_positions", params)
     if tcp_result and tcp_result.get("status") == "completed":
         return tcp_result.get("result", {})
@@ -1021,6 +1043,16 @@ def tool_cancel_all_orders(req: CancelAllOrdersRequest) -> dict:
     params: dict[str, object] = {"type": "cancel_all_orders", "side": req.side}
     if req.symbol is not None and req.symbol != "":
         params["symbol"] = normalize_symbol(req.symbol)
+
+    # Add ownership fields when provided
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+    if req.intent_id:
+        params["intent_id"] = req.intent_id
+    if req.idempotency_key:
+        params["idempotency_key"] = req.idempotency_key
 
     tcp_result = _tcp_send_and_await("cancel_all_orders", params)
     if tcp_result and tcp_result.get("status") == "completed":
@@ -1051,7 +1083,10 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
     )
     if not decision.allowed:
         raise HTTPException(status_code=403, detail=decision.reason or "denied")
-    # Normalize symbol for EA
+
+    if req.idempotency_key is None:
+        req.idempotency_key = str(uuid4())
+
     symbol_normalized = normalize_symbol(req.symbol)
 
     tcp_result = _tcp_send_and_await(
@@ -1063,6 +1098,10 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
             "sl": req.sl or 0,
             "tp": req.tp or 0,
             "deviation": req.deviation_points or 20,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
         },
     )
     if tcp_result and tcp_result.get("status") == "completed":
@@ -1103,6 +1142,10 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
             "sl": req.sl or 0,
             "tp": req.tp or 0,
             "deviation": req.deviation_points or 20,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
         },
     )
     r.raise_for_status()
@@ -1241,7 +1284,15 @@ def tool_get_orders() -> dict:
 def tool_modify_position_sl_tp(req: ModifyPositionSLTPRequest) -> dict:
     tcp_result = _tcp_send_and_await(
         "modify_position_sl_tp",
-        {"position_id": req.position_id, "sl": req.sl or 0, "tp": req.tp or 0},
+        {
+            "position_id": req.position_id,
+            "sl": req.sl or 0,
+            "tp": req.tp or 0,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
+        },
     )
     if tcp_result and tcp_result.get("status") == "completed":
         return tcp_result.get("result", {})
@@ -1255,6 +1306,10 @@ def tool_modify_position_sl_tp(req: ModifyPositionSLTPRequest) -> dict:
             "position_id": req.position_id,
             "sl": req.sl or 0,
             "tp": req.tp or 0,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
         },
     )
     r.raise_for_status()
@@ -1269,7 +1324,14 @@ def tool_modify_position_sl_tp(req: ModifyPositionSLTPRequest) -> dict:
 def tool_close_position(req: ClosePosReq) -> dict:
     tcp_result = _tcp_send_and_await(
         "close_position",
-        {"position_id": req.position_id, "volume": req.volume or 0},
+        {
+            "position_id": req.position_id,
+            "volume": req.volume or 0,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
+        },
     )
     if tcp_result and tcp_result.get("status") == "completed":
         return tcp_result.get("result", {})
@@ -1282,6 +1344,10 @@ def tool_close_position(req: ClosePosReq) -> dict:
             "type": "close_position",
             "position_id": req.position_id,
             "volume": req.volume or 0,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
         },
     )
     r.raise_for_status()
@@ -1314,6 +1380,10 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
             "sl": req.sl or 0,
             "tp": req.tp or 0,
             "deviation": req.deviation,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
         },
     )
     if tcp_result and tcp_result.get("status") == "completed":
@@ -1333,6 +1403,10 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
             "sl": req.sl or 0,
             "tp": req.tp or 0,
             "deviation": req.deviation,
+            "session_id": req.session_id,
+            "strategy_id": req.strategy_id,
+            "intent_id": req.intent_id,
+            "idempotency_key": req.idempotency_key,
         },
     )
     r.raise_for_status()
@@ -1345,10 +1419,19 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
 
 @app.post("/tools/cancel_order", response_model=dict)
 def tool_cancel_order(req: CancelOrderRequest) -> dict:
-    tcp_result = _tcp_send_and_await(
-        "cancel_order",
-        {"order_id": req.order_id},
-    )
+    params: dict[str, object] = {"type": "cancel_order", "order_id": req.order_id}
+
+    # Add ownership fields when provided
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+    if req.intent_id:
+        params["intent_id"] = req.intent_id
+    if req.idempotency_key:
+        params["idempotency_key"] = req.idempotency_key
+
+    tcp_result = _tcp_send_and_await("cancel_order", params)
     if tcp_result and tcp_result.get("status") == "completed":
         return tcp_result.get("result", {})
 
@@ -1356,7 +1439,7 @@ def tool_cancel_order(req: CancelOrderRequest) -> dict:
     client = get_http_client()
     r = client.post(
         f"{gw_url}/bridge/commands/enqueue",
-        params={"type": "cancel_order", "order_id": req.order_id},
+        params=params,
     )
     r.raise_for_status()
     req_id = r.json()["id"]
@@ -3249,6 +3332,64 @@ def tool_economic_calendar(req: EconomicCalendarRequest) -> dict:
             "mt5_calendar_status": f"unavailable ({mt5_error}) — using schedule-based fallback",
             "warning": "MT5 Terminal calendar data unavailable. Events are estimated from recurring schedules, not real-time terminal data.",
         }
+
+
+class ReconcileRequest(BaseModel):
+    intent_ids: list[str] = []
+
+
+def _get_reconcile_context() -> dict:
+    adapter = getattr(get_gateway(), "adapter", None)
+    positions: list[Position] = []
+    deals: list[Deal] = []
+
+    if adapter is not None:
+        try:
+            positions = adapter.get_positions() or []
+        except Exception:
+            pass
+        if hasattr(adapter, "get_deals_history"):
+            try:
+                raw = adapter.get_deals_history(limit=500, symbol=None, days=7)
+                deals = raw if isinstance(raw, list) else raw.get("deals", [])
+            except Exception:
+                pass
+
+    if not positions:
+        try:
+            raw_positions = tool_get_positions().get("positions", [])
+            positions = [Position(**p) for p in raw_positions]
+        except Exception:
+            pass
+
+    if not deals:
+        try:
+            raw_deals = tool_get_deals_history(limit=500, days=7).get("deals", [])
+            deals = [Deal(**d) for d in raw_deals]
+        except Exception:
+            pass
+
+    return {"positions": positions, "deals": deals}
+
+
+@app.post("/tools/reconcile", response_model=dict)
+def tool_reconcile(req: ReconcileRequest) -> dict:
+    settings = get_settings_cached()
+    svc = ReconciliationService(settings)
+    ctx = _get_reconcile_context()
+
+    positions = ctx["positions"]
+    deals = ctx["deals"]
+
+    positions = [p if isinstance(p, Position) else Position(**p) for p in positions]
+    deals = [d if isinstance(d, Deal) else Deal(**d) for d in deals]
+
+    reconcile_result = svc.reconcile(req.intent_ids, positions)
+    owned = svc.get_owned_positions(positions)
+    foreign_pnl = svc.calculate_foreign_pnl(owned, deals)
+
+    reconcile_result["foreign_pnl"] = foreign_pnl
+    return reconcile_result
 
 
 # ============================================================

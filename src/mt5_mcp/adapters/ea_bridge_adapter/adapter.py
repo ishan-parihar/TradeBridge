@@ -25,7 +25,11 @@ from mt5_mcp.schemas.models import (
     TerminalStatus,
     TradeIntent,
 )
-from mt5_mcp.settings.config import get_settings
+from mt5_mcp.settings.config import (
+    get_settings,
+    derive_magic_number,
+    compose_comment,
+)
 from mt5_mcp.observability.logging import logger
 from mt5_mcp.adapters.common.symbol_utils import normalize_symbol, denormalize_symbol
 
@@ -247,6 +251,10 @@ class EABridgeAdapter(ExecutionPort):
                         if p.get("opened_at")
                         else None,
                         source="ea_bridge",
+                        magic_number=p.get("magic")
+                        if p.get("magic") is not None
+                        else None,
+                        comment=p.get("comment") or None,
                     )
                 )
             return results
@@ -400,17 +408,38 @@ class EABridgeAdapter(ExecutionPort):
 
     def submit_order(self, req: TradeIntent) -> ExecutionResult:
         """Submit order via EA bridge command."""
+        strategy_id = req.strategy_id or ""
+        magic_number: int = 0
+        comment: str = ""
+        if strategy_id and strategy_id in self.settings.strategy_magic_numbers:
+            magic_number = self.settings.strategy_magic_numbers[strategy_id]
+        elif strategy_id:
+            magic_number = derive_magic_number(strategy_id)
+
+        if strategy_id and req.intent_id and req.session_id:
+            comment = compose_comment(strategy_id, req.intent_id, req.session_id)
+
         try:
+            payload: dict[str, Any] = {
+                "symbol": req.symbol,
+                "side": req.side,
+                "volume_lots": req.volume_lots,
+                "sl": req.sl or 0,
+                "tp": req.tp or 0,
+                "deviation": req.deviation_points or 20,
+                "magic_number": magic_number,
+                "comment": comment,
+            }
+            if req.strategy_id:
+                payload["strategy_id"] = req.strategy_id
+            if req.session_id:
+                payload["session_id"] = req.session_id
+            if req.intent_id:
+                payload["intent_id"] = req.intent_id
+
             result = self._send_command(
                 "submit_order",
-                {
-                    "symbol": req.symbol,
-                    "side": req.side,
-                    "volume_lots": req.volume_lots,
-                    "sl": req.sl or 0,
-                    "tp": req.tp or 0,
-                    "deviation": req.deviation_points or 20,
-                },
+                payload,
                 timeout_s=20.0,
             )
 
@@ -419,6 +448,11 @@ class EABridgeAdapter(ExecutionPort):
                     intent_id=req.intent_id,
                     status="error",
                     message=result.get("error", "timeout"),
+                    strategy_id=req.strategy_id,
+                    session_id=req.session_id,
+                    idempotency_key=req.idempotency_key,
+                    magic_number=magic_number,
+                    comment=comment,
                 )
 
             payload = result.get("result", {}).get("payload")
@@ -436,44 +470,71 @@ class EABridgeAdapter(ExecutionPort):
                 broker_order_id=str(data.get("order", "")) if data else None,
                 retcode=str(data.get("retcode")) if data else None,
                 raw=data,
+                strategy_id=req.strategy_id,
+                session_id=req.session_id,
+                idempotency_key=req.idempotency_key,
+                magic_number=magic_number,
+                comment=comment,
             )
         except Exception as e:
             return ExecutionResult(
                 intent_id=req.intent_id,
                 status="error",
                 message=str(e),
+                strategy_id=req.strategy_id,
+                session_id=req.session_id,
+                idempotency_key=req.idempotency_key,
+                magic_number=magic_number,
+                comment=comment,
             )
 
     def modify_order(self, req: ModifyOrderRequest) -> ExecutionResult:
         """Modify order via EA bridge command."""
         try:
-            payload = {"order_id": req.order_id}
+            payload: dict[str, Any] = {"order_id": req.order_id}
             if req.new_price is not None:
                 payload["new_price"] = req.new_price
             if req.new_sl is not None:
                 payload["new_sl"] = req.new_sl
             if req.new_tp is not None:
                 payload["new_tp"] = req.new_tp
+            if req.session_id:
+                payload["session_id"] = req.session_id
+            if req.strategy_id:
+                payload["strategy_id"] = req.strategy_id
+            if req.intent_id:
+                payload["intent_id"] = req.intent_id
+            if req.idempotency_key:
+                payload["idempotency_key"] = req.idempotency_key
 
             result = self._send_command("modify_order", payload, timeout_s=10.0)
 
             if result.get("status") == "completed":
                 return ExecutionResult(
-                    intent_id="",
+                    intent_id=req.intent_id or "",
                     status="accepted",
                     adapter="EABridgeAdapter",
+                    strategy_id=req.strategy_id,
+                    session_id=req.session_id,
+                    idempotency_key=req.idempotency_key,
                 )
             else:
                 return ExecutionResult(
-                    intent_id="",
+                    intent_id=req.intent_id or "",
                     status="error",
                     message=result.get("error", "unknown"),
+                    strategy_id=req.strategy_id,
+                    session_id=req.session_id,
+                    idempotency_key=req.idempotency_key,
                 )
         except Exception as e:
             return ExecutionResult(
                 intent_id="",
                 status="error",
                 message=str(e),
+                strategy_id=req.strategy_id,
+                session_id=req.session_id,
+                idempotency_key=req.idempotency_key,
             )
 
     def get_bars(self, symbol: str, timeframe: str, count: int = 100) -> Bars:
@@ -602,27 +663,44 @@ class EABridgeAdapter(ExecutionPort):
     def close_position(self, req: ClosePositionRequest) -> ExecutionResult:
         """Close position via EA bridge command."""
         try:
-            payload = {"position_id": req.position_id}
+            payload: dict[str, Any] = {"position_id": req.position_id}
             if req.volume is not None:
                 payload["volume"] = req.volume
+            if req.session_id:
+                payload["session_id"] = req.session_id
+            if req.strategy_id:
+                payload["strategy_id"] = req.strategy_id
+            if req.intent_id:
+                payload["intent_id"] = req.intent_id
+            if req.idempotency_key:
+                payload["idempotency_key"] = req.idempotency_key
 
             result = self._send_command("close_position", payload, timeout_s=20.0)
 
             if result.get("status") == "completed":
                 return ExecutionResult(
-                    intent_id="",
+                    intent_id=req.intent_id or "",
                     status="accepted",
                     adapter="EABridgeAdapter",
+                    strategy_id=req.strategy_id,
+                    session_id=req.session_id,
+                    idempotency_key=req.idempotency_key,
                 )
             else:
                 return ExecutionResult(
-                    intent_id="",
+                    intent_id=req.intent_id or "",
                     status="error",
                     message=result.get("error", "unknown"),
+                    strategy_id=req.strategy_id,
+                    session_id=req.session_id,
+                    idempotency_key=req.idempotency_key,
                 )
         except Exception as e:
             return ExecutionResult(
                 intent_id="",
                 status="error",
                 message=str(e),
+                strategy_id=req.strategy_id,
+                session_id=req.session_id,
+                idempotency_key=req.idempotency_key,
             )
