@@ -7,11 +7,16 @@ import apps.bridge_gateway.main as gateway_main
 
 class DummyQueue:
     def __init__(self) -> None:
-        self.enqueued: list[tuple[str, dict[str, object]]] = []
+        self.enqueued: list[tuple[str, dict[str, object], str | None]] = []
         self.failed: list[tuple[str, str]] = []
 
-    def enqueue(self, command_type: str, payload: dict[str, object]) -> str:
-        self.enqueued.append((command_type, payload))
+    def enqueue(
+        self,
+        command_type: str,
+        payload: dict[str, object],
+        idempotency_key: str | None = None,
+    ) -> str:
+        self.enqueued.append((command_type, payload, idempotency_key))
         return "req-1"
 
     def fail(self, request_id: str, error: str) -> bool:
@@ -63,6 +68,7 @@ def test_bridge_commands_enqueue_preserves_advanced_indicator_args(monkeypatch) 
                 "senkou": 52,
                 "window": 50,
             },
+            None,
         )
     ]
 
@@ -116,5 +122,67 @@ def test_bridge_commands_enqueue_preserves_agent_research_args(monkeypatch) -> N
                 "limit": 25,
                 "days": 7,
             },
+            None,
         )
     ]
+
+
+def test_enqueue_preserves_ownership_fields(monkeypatch) -> None:
+    queue = DummyQueue()
+    monkeypatch.setattr(gateway_main, "get_queue_cached", lambda: queue)
+
+    client = TestClient(gateway_main.app)
+    response = client.post(
+        "/bridge/commands/enqueue",
+        params={
+            "type": "submit_order",
+            "symbol": "XAUUSDm",
+            "side": "buy",
+            "volume_lots": 0.1,
+            "session_id": "sess-abc",
+            "strategy_id": "strat-123",
+            "intent_id": "intent-xyz",
+            "magic_number": 99001,
+            "comment": "scalp entry",
+        },
+    )
+
+    assert response.status_code == 200
+    assert queue.enqueued == [
+        (
+            "submit_order",
+            {
+                "symbol": "XAUUSDm",
+                "side": "buy",
+                "volume_lots": 0.1,
+                "session_id": "sess-abc",
+                "strategy_id": "strat-123",
+                "intent_id": "intent-xyz",
+                "magic_number": 99001,
+                "comment": "scalp entry",
+            },
+            None,
+        )
+    ]
+
+
+def test_enqueue_passes_idempotency_key_to_queue(monkeypatch) -> None:
+    queue = DummyQueue()
+    monkeypatch.setattr(gateway_main, "get_queue_cached", lambda: queue)
+
+    client = TestClient(gateway_main.app)
+    response = client.post(
+        "/bridge/commands/enqueue",
+        params={
+            "type": "submit_order",
+            "symbol": "EURUSD",
+            "side": "sell",
+            "volume_lots": 0.01,
+            "idempotency_key": "idem-key-42",
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(queue.enqueued) == 1
+    _, _, idem_key = queue.enqueued[0]
+    assert idem_key == "idem-key-42"

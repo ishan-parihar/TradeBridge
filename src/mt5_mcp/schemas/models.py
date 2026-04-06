@@ -4,6 +4,18 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class OwnershipMixin(BaseModel):
+    """Canonical ownership/idempotency fields for write-path request models.
+
+    All fields are Optional[str] — additive, non-breaking, progressively adoptable.
+    """
+
+    session_id: Optional[str] = None
+    strategy_id: Optional[str] = None
+    intent_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
 class HealthStatus(BaseModel):
     state: Literal[
         "healthy",
@@ -82,6 +94,9 @@ class Deal(BaseModel):
     comment: Optional[str] = None
     reason: Optional[str] = None
     magic: Optional[int] = None
+    strategy_id: Optional[str] = None
+    session_id: Optional[str] = None
+    intent_id: Optional[str] = None
 
 
 class PerformanceSummary(BaseModel):
@@ -109,8 +124,11 @@ class Position(BaseModel):
     tp: Optional[float] = None
     unrealized_pnl: Optional[float] = None
     strategy_id: Optional[str] = None
+    session_id: Optional[str] = None
     opened_at: Optional[str] = None
     source: Optional[str] = None
+    magic_number: Optional[int] = None
+    comment: Optional[str] = None
 
 
 class Order(BaseModel):
@@ -123,6 +141,11 @@ class Order(BaseModel):
     sl: Optional[float] = None
     tp: Optional[float] = None
     status: Optional[str] = None
+    strategy_id: Optional[str] = None
+    session_id: Optional[str] = None
+    intent_id: Optional[str] = None
+    magic_number: Optional[int] = None
+    comment: Optional[str] = None
 
 
 class Bar(BaseModel):
@@ -157,9 +180,7 @@ class MarginEstimate(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
-class TradeIntent(BaseModel):
-    intent_id: str
-    strategy_id: str
+class TradeIntent(OwnershipMixin):
     account_id: str
     environment: Literal["paper", "demo", "live"] = "demo"
     symbol: str
@@ -181,7 +202,6 @@ class TradeIntent(BaseModel):
             "full_auto",
         ]
     ] = "human_approval_required"
-    idempotency_key: Optional[str] = None
     requested_at: Optional[str] = None
 
 
@@ -213,17 +233,22 @@ class ExecutionResult(BaseModel):
     slippage_points: Optional[int] = None
     timestamp: Optional[str] = None
     raw: dict[str, Any] = Field(default_factory=dict)
+    strategy_id: Optional[str] = None
+    session_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    magic_number: Optional[int] = None
+    comment: Optional[str] = None
 
 
 # Minimal request models for write-path scaffolding
-class ModifyOrderRequest(BaseModel):
+class ModifyOrderRequest(OwnershipMixin):
     order_id: str
     new_price: Optional[float] = None
     new_sl: Optional[float] = None
     new_tp: Optional[float] = None
 
 
-class ClosePositionRequest(BaseModel):
+class ClosePositionRequest(OwnershipMixin):
     position_id: str
     volume: Optional[float] = None  # null -> full close
 

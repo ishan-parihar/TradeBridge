@@ -4,6 +4,13 @@ from pydantic import BaseModel
 from typing import Literal, Optional
 
 
+class OwnershipMixin(BaseModel):
+    session_id: Optional[str] = None
+    strategy_id: Optional[str] = None
+    intent_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
 class BarsRequest(BaseModel):
     symbol: str
     timeframe: str
@@ -72,18 +79,18 @@ class AccountSummaryResult(BaseModel):
     currency: str | None = None
 
 
-class ModifyPositionSLTPRequest(BaseModel):
+class ModifyPositionSLTPRequest(OwnershipMixin):
     position_id: str
     sl: float | None = None
     tp: float | None = None
 
 
-class ClosePositionRequest(BaseModel):
+class ClosePositionRequest(OwnershipMixin):
     position_id: str
     volume: float | None = None
 
 
-class SubmitPendingOrderRequest(BaseModel):
+class SubmitPendingOrderRequest(OwnershipMixin):
     symbol: str
     side: Literal["buy", "sell"]
     kind: Literal["limit", "stop"]
@@ -94,23 +101,23 @@ class SubmitPendingOrderRequest(BaseModel):
     deviation: int = 20
 
 
-class CancelOrderRequest(BaseModel):
+class CancelOrderRequest(OwnershipMixin):
     order_id: str
 
 
-class ModifyOrderRequest(BaseModel):
+class ModifyOrderRequest(OwnershipMixin):
     order_id: str
     new_price: float | None = None
     new_sl: float | None = None
     new_tp: float | None = None
 
 
-class CloseAllPositionsRequest(BaseModel):
+class CloseAllPositionsRequest(OwnershipMixin):
     symbol: str | None = None
     side: Literal["buy", "sell", "both"] = "both"
 
 
-class CancelAllOrdersRequest(BaseModel):
+class CancelAllOrdersRequest(OwnershipMixin):
     symbol: str | None = None
     side: Literal["buy", "sell", "both"] = "both"
 
@@ -208,7 +215,7 @@ class CorrelationMatrixRequest(BaseModel):
 # --- Phase 3: Bracket Orders ---
 
 
-class BracketOrderRequest(BaseModel):
+class BracketOrderRequest(OwnershipMixin):
     """Place paired BUY STOP + SELL STOP for breakout capture.
 
     When one fills, the other is auto-cancelled.
@@ -221,26 +228,17 @@ class BracketOrderRequest(BaseModel):
     volume_lots: float
     sl_atr_multiplier: float = 1.0  # SL distance as ATR multiplier
     tp_atr_multiplier: float = 2.0  # TP distance as ATR multiplier
-    strategy_id: str = "bracket"
     rationale: str | None = None
 
 
 class BracketOrderResult(BaseModel):
+    status: str
     buy_order_id: str | None = None
     sell_order_id: str | None = None
-    status: str  # "placed", "partial", "error"
-    message: str = ""
-    atr_used: float | None = None
-    computed_sl_buy: float | None = None
-    computed_tp_buy: float | None = None
-    computed_sl_sell: float | None = None
-    computed_tp_sell: float | None = None
+    message: str | None = None
 
 
-# --- Phase 3: Trailing Stop ---
-
-
-class SetTrailingStopRequest(BaseModel):
+class SetTrailingStopRequest(OwnershipMixin):
     """Start server-side trailing stop for a position."""
 
     position_id: str

@@ -16,7 +16,7 @@ from mt5_mcp.schemas.models import (
     TerminalStatus,
     TradeIntent,
 )
-from mt5_mcp.settings.config import get_settings
+from mt5_mcp.settings.config import derive_magic_number, get_settings
 from mt5_mcp.observability.logging import logger
 
 
@@ -31,6 +31,7 @@ class ExecutionGateway:
         self.adapter: ExecutionPort = adapter or self._load_adapter(
             self.settings.adapter
         )
+        self._idempotency_registry: dict[str, ExecutionResult] = {}
 
     def _load_adapter(self, name: str) -> ExecutionPort:
         # Try EA Bridge adapter first (preferred when EA is connected)
@@ -49,6 +50,13 @@ class ExecutionGateway:
             )
 
         return PyMT5Adapter()
+
+    def resolve_magic_number(self, strategy_id: str | None) -> int:
+        if strategy_id is None:
+            return 0
+        if strategy_id in self.settings.strategy_magic_numbers:
+            return self.settings.strategy_magic_numbers[strategy_id]
+        return derive_magic_number(strategy_id)
 
     # Read-path
     def health(self) -> HealthStatus:
@@ -79,4 +87,12 @@ class ExecutionGateway:
 
     # Write-path (guard elsewhere)
     def submit_order(self, req: TradeIntent) -> ExecutionResult:
-        return self.adapter.submit_order(req)
+        if req.idempotency_key and req.idempotency_key in self._idempotency_registry:
+            logger.info(f"Idempotent replay: {req.idempotency_key}")
+            return self._idempotency_registry[req.idempotency_key]
+
+        result = self.adapter.submit_order(req)
+
+        if req.idempotency_key:
+            self._idempotency_registry[req.idempotency_key] = result
+        return result

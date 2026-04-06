@@ -30,6 +30,7 @@ class TradeJournalDB:
         decision_id TEXT UNIQUE NOT NULL,
         timestamp TEXT NOT NULL,
         session_id TEXT,
+        strategy_id TEXT,
 
         symbol TEXT NOT NULL,
         side TEXT NOT NULL,
@@ -102,6 +103,7 @@ class TradeJournalDB:
         pnl: Optional[float] = None,
         duration_seconds: Optional[float] = None,
         session_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
         # Market context
         regime: Optional[str] = None,
         atr_value: Optional[float] = None,
@@ -140,7 +142,7 @@ class TradeJournalDB:
         self._conn.execute(
             """
             INSERT INTO trade_decisions (
-                decision_id, timestamp, session_id,
+                decision_id, timestamp, session_id, strategy_id,
                 symbol, side, action,
                 entry_price, exit_price, sl, tp, volume_lots, pnl, duration_seconds,
                 regime, atr_value, atr_percent_of_price, rsi_value, ema_fast, ema_slow,
@@ -150,7 +152,7 @@ class TradeJournalDB:
                 expected_duration, expected_move_points,
                 outcome, lesson_learned, would_do_differently, mistake_category, quality_rating
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?
@@ -160,6 +162,7 @@ class TradeJournalDB:
                 decision_id,
                 ts,
                 session_id,
+                strategy_id,
                 symbol,
                 side,
                 action,
@@ -236,6 +239,7 @@ class TradeJournalDB:
         emotional_self_report: Optional[str] = None,
         mistake_category: Optional[str] = None,
         session_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
         min_confidence: Optional[float] = None,
         limit: int = 50,
         order_by: str = "timestamp DESC",
@@ -268,6 +272,9 @@ class TradeJournalDB:
         if session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
+        if strategy_id:
+            conditions.append("strategy_id = ?")
+            params.append(strategy_id)
         if min_confidence is not None:
             conditions.append("confidence_level >= ?")
             params.append(min_confidence)
@@ -435,6 +442,32 @@ class TradeJournalDB:
                 else 0,
                 "avg_pnl": round(row["avg_pnl"], 2) if row["avg_pnl"] else 0,
                 "total_pnl": round(row["total_pnl"], 2) if row["total_pnl"] else 0,
+            }
+
+        # Win rate by strategy
+        rows = self._conn.execute(
+            """
+            SELECT strategy_id,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins
+            FROM trade_decisions
+            WHERE timestamp > ? AND outcome IS NOT NULL AND outcome != 'still_open'
+              AND strategy_id IS NOT NULL
+            GROUP BY strategy_id
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        if rows:
+            insights["win_rate_by_strategy"] = {
+                r["strategy_id"]: {
+                    "total": r["total"],
+                    "wins": r["wins"],
+                    "win_rate": round(r["wins"] / r["total"] * 100, 1)
+                    if r["total"] > 0
+                    else 0,
+                }
+                for r in rows
             }
 
         return insights
