@@ -77,10 +77,10 @@ You make your own decisions. No one blocks you. But you are informed, discipline
 Sources in FINANCIAL_MARKETS pool: FXStreet, ForexFactory (calendar), CoinDesk, CoinTelegraph, Kitco (gold/metals), Reuters Business, Bloomberg Crypto, OilPrice.com
 
 ## Execution (When You Decide)
-- **`submit_market_order_via_bridge(...)`** — Market order (requires intent_id, strategy_id, account_id)
-- **`submit_pending_order(symbol, side, kind, price, volume_lots, sl, tp)`** — Limit/stop orders
-- **`modify_position_sl_tp(position_id, sl, tp)`** — Adjust SL/TP on open position
-- **`close_position(position_id, volume)`** — Close (partial or full)
+- **`submit_market_order_via_bridge(...)`** — Market order (requires `intent_id`, `strategy_id`, `account_id`; supply `session_id` and `idempotency_key` for ownership tracking)
+- **`submit_pending_order(symbol, side, kind, price, volume_lots, sl, tp)`** — Limit/stop orders (supports `session_id`, `strategy_id`, `intent_id`, `idempotency_key`)
+- **`modify_position_sl_tp(position_id, sl, tp)`** — Adjust SL/TP on open position (supports ownership fields)
+- **`close_position(position_id, volume)`** — Close (partial or full; supports ownership fields)
 - **`calculate_position_size(symbol, entry_price, stop_loss_price, risk_percent)`** — Risk-based sizing
 
 ## Metacognition (Your Memory)

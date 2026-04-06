@@ -1697,17 +1697,23 @@ void ProcessCommand(const string cmd)
       if(ParseKV(cmd, "price", ps)) price_hint = StringToDouble(ps);
       Complete(rid, JsonMarginEstimate(sym, side, volume, price_hint));
     } else if(type=="submit_order"){
-      string sym; string side; string vols; string sls; string tps; string devs;
-      if(!ParseKV(cmd, "symbol", sym) || !ParseKV(cmd, "side", side) || !ParseKV(cmd, "volume_lots", vols)) { Fail(rid, "bad_args"); return; }
-      
-      // Symbol validation
-      if(!EnsureSymbolInMarketWatch(sym)) { Fail(rid, "symbol_not_found"); return; }
-      
-      double vol = StringToDouble(vols);
-      double sl = 0.0; double tp = 0.0; int dev=20;
-      if(ParseKV(cmd, "sl", sls)) sl = StringToDouble(sls);
-      if(ParseKV(cmd, "tp", tps)) tp = StringToDouble(tps);
-      if(ParseKV(cmd, "deviation", devs)) dev = (int)StringToInteger(devs);
+       string sym; string side; string vols; string sls; string tps; string devs;
+       if(!ParseKV(cmd, "symbol", sym) || !ParseKV(cmd, "side", side) || !ParseKV(cmd, "volume_lots", vols)) { Fail(rid, "bad_args"); return; }
+       
+       // Symbol validation
+       if(!EnsureSymbolInMarketWatch(sym)) { Fail(rid, "symbol_not_found"); return; }
+       
+       double vol = StringToDouble(vols);
+       double sl = 0.0; double tp = 0.0; int dev=20;
+       if(ParseKV(cmd, "sl", sls)) sl = StringToDouble(sls);
+       if(ParseKV(cmd, "tp", tps)) tp = StringToDouble(tps);
+       if(ParseKV(cmd, "deviation", devs)) dev = (int)StringToInteger(devs);
+       
+       // Ownership fields (optional, default 0 / "")
+       string mns; long magic_number = 0;
+       if(ParseKV(cmd, "magic_number", mns)) magic_number = (long)StringToInteger(mns);
+       string order_comment = "";
+       ParseKV(cmd, "comment", order_comment);
       
       // Get current prices for SL/TP validation
       double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
@@ -1736,16 +1742,25 @@ void ProcessCommand(const string cmd)
        if((filling_mask & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) filling = ORDER_FILLING_FOK;
        else if((filling_mask & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) filling = ORDER_FILLING_IOC;
       
-      MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
-      req.action = TRADE_ACTION_DEAL;
-      req.symbol = sym;
-      req.volume = vol;
-      req.type = ot;
-      req.type_filling = filling;
-      req.deviation = dev;
-      if(sl>0) req.sl = sl; if(tp>0) req.tp = tp;
-      bool ok = OrderSend(req, res);
-      string payload = StringFormat("{\"retcode\":%d,\"order\":%I64d,\"deal\":%I64d,\"ask\":%G,\"bid\":%G,\"filling\":\"%s\"}", res.retcode, res.order, res.deal, ask, bid, EnumToString(filling));
+       MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+       req.action = TRADE_ACTION_DEAL;
+       req.symbol = sym;
+       req.volume = vol;
+       req.type = ot;
+       req.type_filling = filling;
+       req.deviation = dev;
+       req.magic_number = (ulong)magic_number;
+       req.comment = order_comment;
+       if(sl>0) req.sl = sl; if(tp>0) req.tp = tp;
+       bool ok = OrderSend(req, res);
+       // MANUAL VERIFICATION CHECKLIST (submit_order ownership fields):
+       // 1. Verify req.magic_number matches the value sent from gateway
+       // 2. Verify req.comment matches the comment string from gateway
+       // 3. Confirm deal history shows correct magic_number (HistoryDealGetInteger DEAL_MAGIC)
+       // 4. Confirm deal history shows correct comment (HistoryDealGetString DEAL_COMMENT)
+       // 5. Test with magic_number=0 and comment="" (defaults should work)
+       // 6. Test with non-zero magic_number and non-empty comment
+       string payload = StringFormat("{\"retcode\":%d,\"order\":%I64d,\"deal\":%I64d,\"ask\":%G,\"bid\":%G,\"filling\":\"%s\"}", res.retcode, res.order, res.deal, ask, bid, EnumToString(filling));
       if(ok && res.retcode==10009 /*TRADE_RETCODE_DONE*/)
          Complete(rid, payload);
       else

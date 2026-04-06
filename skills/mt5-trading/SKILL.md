@@ -75,7 +75,8 @@ Before analyzing a market, claim your session.
 Maintain these values for the entire session:
 - `session_id`
 - `strategy_id`
-- deterministic trade intent labels per symbol and direction
+- `intent_id` (per trade intent)
+- `idempotency_key` (per submission, prevents duplicates)
 
 ### Maintain a local session ledger
 Track, in your own notes/logs, every trade you intended to create:
@@ -85,6 +86,7 @@ Track, in your own notes/logs, every trade you intended to create:
 | `session_id` | separates this run from prior runs |
 | `strategy_id` | groups trades by strategy |
 | `intent_id` | required for market-order idempotency |
+| `idempotency_key` | prevents duplicate submissions at the broker level |
 | `symbol / side / kind` | needed for reconciliation |
 | `planned entry / sl / tp / volume` | needed to detect duplicates |
 | `decision_id` | links entry and exit journaling |
