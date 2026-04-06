@@ -127,9 +127,9 @@ class TestServerHandlesClientReconnect:
     async def test_server_handles_client_reconnect(self):
         host = "127.0.0.1"
         port = _free_port(2)
+        mcp_port = _free_port(202)
 
-        # 1. Start TCPBridgeServer
-        server = TCPBridgeServer(host=host, port=port)
+        server = TCPBridgeServer(host=host, ea_port=port, mcp_port=mcp_port)
         server_task = asyncio.create_task(server.start())
         await asyncio.sleep(0.2)  # let server bind
 
@@ -267,9 +267,9 @@ class TestConcurrentCommands:
     async def test_concurrent_commands_preserve_request_id(self):
         host = "127.0.0.1"
         port = _free_port(4)
+        mcp_port = _free_port(204)
 
-        # 1. Start TCPBridgeServer
-        server = TCPBridgeServer(host=host, port=port)
+        server = TCPBridgeServer(host=host, ea_port=port, mcp_port=mcp_port)
         server_task = asyncio.create_task(server.start())
         await asyncio.sleep(0.2)
 

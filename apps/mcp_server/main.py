@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import httpx
 import time
 
@@ -557,6 +558,10 @@ def tool_get_bars(req: BarsRequest) -> Bars:
             data = payload
         else:
             data = {"data": []}
+        if "error" in data or "data" not in data:
+            return Bars(
+                symbol=req.symbol, timeframe=req.timeframe, data=[], source="tcp_bridge"
+            )
         if "symbol" in data:
             data["symbol"] = denormalize_symbol(data["symbol"])
         return Bars(**data)
@@ -591,6 +596,10 @@ def tool_get_bars(req: BarsRequest) -> Bars:
         data = payload
     else:
         data = {"data": []}
+    if "error" in data or "data" not in data:
+        return Bars(
+            symbol=req.symbol, timeframe=req.timeframe, data=[], source="bridge"
+        )
     if "symbol" in data:
         data["symbol"] = denormalize_symbol(data["symbol"])
     return Bars(**data)
@@ -1521,6 +1530,41 @@ def tool_correlation_matrix(req: CorrelationMatrixRequest) -> dict:
         "timeframe": req.timeframe,
         "lookback": req.lookback,
         "matrix": compute_correlation_matrix(close_series),
+    }
+
+
+class SupportResistanceRequest(BaseModel):
+    symbol: str
+    timeframe: str = "H1"
+    lookback: int = 100
+
+
+@app.post("/tools/support_resistance", response_model=dict)
+def tool_support_resistance(req: SupportResistanceRequest) -> dict:
+    bars = tool_get_bars(
+        BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.lookback)
+    )
+    if not bars.data:
+        return {
+            "symbol": req.symbol,
+            "support_levels": [],
+            "resistance_levels": [],
+        }
+
+    highs = [b.high for b in bars.data]
+    lows = [b.low for b in bars.data]
+    closes = [b.close for b in bars.data]
+
+    support = sorted(lows)[:3]
+    resistance = sorted(highs, reverse=True)[:3]
+
+    return {
+        "symbol": denormalize_symbol(req.symbol),
+        "timeframe": req.timeframe,
+        "lookback": req.lookback,
+        "support_levels": support,
+        "resistance_levels": resistance,
+        "current_price": closes[-1] if closes else None,
     }
 
 

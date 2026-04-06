@@ -39,6 +39,7 @@ def _patch_bridge_dependencies(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr(mcp_main, "normalize_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(mcp_main, "_tcp_send_and_await", lambda *a, **kw: None)
 
 
 def test_tool_get_ticks_returns_error_payload_on_timeout(monkeypatch) -> None:
@@ -133,7 +134,6 @@ def test_resource_account_summary_falls_back_to_bridge_data(monkeypatch) -> None
     assert result.balance == 205.88
 
 
-
 def test_resource_positions_open_falls_back_to_bridge_data(monkeypatch) -> None:
     monkeypatch.setattr(
         mcp_main,
@@ -161,7 +161,6 @@ def test_resource_positions_open_falls_back_to_bridge_data(monkeypatch) -> None:
     assert len(result) == 1
     assert result[0].position_id == "1"
     assert result[0].symbol == "BTCUSDm"
-
 
 
 def test_resource_orders_pending_falls_back_to_bridge_data(monkeypatch) -> None:
