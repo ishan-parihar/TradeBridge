@@ -318,6 +318,46 @@ At minimum:
 
 ---
 
+## Pre-Trade Checklist (MANDATORY)
+
+Before submitting **ANY** order (market, pending, or bracket), you MUST complete all three steps below. Skipping any step is a process failure.
+
+### 1. Validate Trade Setup
+Call `validate_trade_setup` with your planned trade parameters:
+- symbol, side (buy/sell), order_kind (market/limit/stop)
+- volume_lots, entry_price (for limit/stop, null for market), sl, tp
+
+This checks against broker constraints (stopsLevel, min_volume, max_volume, margin requirements).
+If `valid=false`, **DO NOT submit the order**. Review the `errors` array and fix violations.
+
+### 2. Calculate Position Size
+Call `calculate_position_size` with:
+- symbol, entry_price, stop_loss_price, risk_percent (1-3% of equity per trade)
+
+This computes the optimal lot size using a fixed-fractional risk model.
+**DO NOT use fixed lot sizes** (e.g., always 0.01). Always size based on SL distance and risk %.
+
+### 3. Coach Review (Strongly Recommended)
+Call `trading/coach` with your planned trade to get advisory feedback:
+- symbol, side, sl_distance_points, tp_distance_points
+- Include regime, atr_value, rsi if available
+
+Review warnings and recommendations. If `confluence_score < 3`, reconsider the trade.
+
+### Mandatory Workflow
+
+```
+analyze_market() → regime + ATR + support/resistance
+validate_trade_setup(...) → check broker constraints (MUST pass valid=true)
+calculate_position_size(...) → compute optimal lot size from risk % and SL distance
+trading/coach(...) → get advisory feedback (review warnings)
+submit_order(...) → execute with validated, sized parameters
+```
+
+⚠️ **NEVER submit an order without first calling `validate_trade_setup` and `calculate_position_size`. Fixed lot sizing (e.g., 0.01) is deprecated and risks over/under-exposure.**
+
+---
+
 ## Phase 6: Execution
 
 ### Market orders
@@ -330,6 +370,8 @@ Mandatory rules:
 
 ### Pending orders
 Use `submit_pending_order(...)` for pullbacks or breakout triggers.
+
+⚠️ **NEVER submit without first calling `validate_trade_setup(order_kind="limit"/"stop")` and `calculate_position_size(...)`.**
 
 Mandatory rules:
 - verify the order exists in `orders_pending()` after submission

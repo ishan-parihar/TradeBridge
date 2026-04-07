@@ -264,6 +264,61 @@ class TestToolsWritePathOwnership:
 
 
 # ===========================================================================
+# 3b. magic_number field on all tools.py write-path request models
+# ===========================================================================
+
+
+TOOLS_WRITE_PATH_MODELS: tuple[str, ...] = (
+    "ModifyPositionSLTPRequest",
+    "ClosePositionRequest",
+    "SubmitPendingOrderRequest",
+    "CancelOrderRequest",
+    "ModifyOrderRequest",
+    "CloseAllPositionsRequest",
+    "CancelAllOrdersRequest",
+    "BracketOrderRequest",
+    "SetTrailingStopRequest",
+)
+
+
+class TestMagicNumberOnToolsWritePath:
+    """All write-path request models in tools.py must have magic_number field."""
+
+    @pytest.mark.parametrize("model_name", TOOLS_WRITE_PATH_MODELS)
+    def test_magic_number_present_on_write_path_model(self, model_name):
+        model_cls = _resolve_model("mt5_mcp.schemas.tools", model_name)
+        assert "magic_number" in model_cls.model_fields, (
+            f"{model_name} is missing magic_number field"
+        )
+        assert model_cls.model_fields["magic_number"].is_required() is False, (
+            f"{model_name}.magic_number must be Optional, not required"
+        )
+
+    def test_magic_number_accepts_int(self):
+        """Verify magic_number can be set to an integer value."""
+        SubmitPendingOrderRequest = _resolve_model(
+            "mt5_mcp.schemas.tools", "SubmitPendingOrderRequest"
+        )
+        req = SubmitPendingOrderRequest(
+            symbol="XAUUSD",
+            side="buy",
+            kind="limit",
+            price=2650.0,
+            volume_lots=0.01,
+            magic_number=12345,
+        )
+        assert getattr(req, "magic_number") == 12345
+
+    def test_magic_number_defaults_to_none(self):
+        """Verify magic_number defaults to None when not provided."""
+        ClosePositionRequest = _resolve_model(
+            "mt5_mcp.schemas.tools", "ClosePositionRequest"
+        )
+        req = ClosePositionRequest(position_id="pos-1")
+        assert getattr(req, "magic_number") is None
+
+
+# ===========================================================================
 # 4. Read-only models should NOT be forced to have ownership fields
 # ===========================================================================
 
@@ -438,3 +493,158 @@ class TestTerminologyConsistency:
                 f"{resolved_model.__name__} uses non-canonical field name '{field_name}'; "
                 f"use 'session_id', 'idempotency_key', 'intent_id' instead"
             )
+
+
+# ===========================================================================
+# 7. PnL field unification — consistent `pnl` computed property
+# ===========================================================================
+
+
+class TestPositionPnlAlias:
+    """Position.pnl must alias unrealized_pnl via computed_field."""
+
+    def test_position_has_unrealized_pnl_field(self):
+        Position = _resolve_model("mt5_mcp.schemas.models", "Position")
+        assert "unrealized_pnl" in Position.model_fields
+
+    def test_position_pnl_returns_unrealized_pnl(self):
+        Position = _resolve_model("mt5_mcp.schemas.models", "Position")
+        pos = Position(
+            position_id="pos-1",
+            symbol="XAUUSD",
+            side="buy",
+            volume=0.1,
+            entry_price=2650.0,
+            unrealized_pnl=42.50,
+        )
+        assert pos.pnl == 42.50
+        assert pos.pnl == pos.unrealized_pnl
+
+    def test_position_pnl_is_none_when_unrealized_pnl_is_none(self):
+        Position = _resolve_model("mt5_mcp.schemas.models", "Position")
+        pos = Position(
+            position_id="pos-2",
+            symbol="XAUUSD",
+            side="sell",
+            volume=0.1,
+            entry_price=2650.0,
+            unrealized_pnl=None,
+        )
+        assert pos.pnl is None
+
+    def test_position_model_dump_includes_pnl(self):
+        Position = _resolve_model("mt5_mcp.schemas.models", "Position")
+        pos = Position(
+            position_id="pos-3",
+            symbol="XAUUSD",
+            side="buy",
+            volume=0.1,
+            entry_price=2650.0,
+            unrealized_pnl=-15.0,
+        )
+        dump = pos.model_dump()
+        assert "pnl" in dump
+        assert dump["pnl"] == -15.0
+
+    def test_position_model_dump_includes_both_pnl_and_unrealized_pnl(self):
+        Position = _resolve_model("mt5_mcp.schemas.models", "Position")
+        pos = Position(
+            position_id="pos-4",
+            symbol="XAUUSD",
+            side="buy",
+            volume=0.1,
+            entry_price=2650.0,
+            unrealized_pnl=100.0,
+        )
+        dump = pos.model_dump()
+        assert "pnl" in dump
+        assert "unrealized_pnl" in dump
+        assert dump["pnl"] == dump["unrealized_pnl"]
+
+
+class TestAccountSummaryPnlAlias:
+    """AccountSummary.pnl must alias profit via computed_field."""
+
+    def test_account_summary_has_profit_field(self):
+        AccountSummary = _resolve_model("mt5_mcp.schemas.models", "AccountSummary")
+        assert "profit" in AccountSummary.model_fields
+
+    def test_account_summary_pnl_returns_profit(self):
+        AccountSummary = _resolve_model("mt5_mcp.schemas.models", "AccountSummary")
+        acc = AccountSummary(balance=10000.0, profit=250.0)
+        assert acc.pnl == 250.0
+        assert acc.pnl == acc.profit
+
+    def test_account_summary_pnl_is_none_when_profit_is_none(self):
+        AccountSummary = _resolve_model("mt5_mcp.schemas.models", "AccountSummary")
+        acc = AccountSummary(balance=10000.0, profit=None)
+        assert acc.pnl is None
+
+    def test_account_summary_model_dump_includes_pnl(self):
+        AccountSummary = _resolve_model("mt5_mcp.schemas.models", "AccountSummary")
+        acc = AccountSummary(balance=10000.0, profit=-50.0)
+        dump = acc.model_dump()
+        assert "pnl" in dump
+        assert dump["pnl"] == -50.0
+
+    def test_account_summary_model_dump_includes_both_pnl_and_profit(self):
+        AccountSummary = _resolve_model("mt5_mcp.schemas.models", "AccountSummary")
+        acc = AccountSummary(balance=10000.0, profit=125.0)
+        dump = acc.model_dump()
+        assert "pnl" in dump
+        assert "profit" in dump
+        assert dump["pnl"] == dump["profit"]
+
+
+class TestDealPnlAlias:
+    """Deal.pnl must alias profit via computed_field."""
+
+    def test_deal_has_profit_field(self):
+        Deal = _resolve_model("mt5_mcp.schemas.models", "Deal")
+        assert "profit" in Deal.model_fields
+
+    def test_deal_pnl_returns_profit(self):
+        Deal = _resolve_model("mt5_mcp.schemas.models", "Deal")
+        deal = Deal(
+            deal_id="deal-1",
+            symbol="XAUUSD",
+            time="2024-01-01T00:00:00",
+            profit=75.0,
+        )
+        assert deal.pnl == 75.0
+        assert deal.pnl == deal.profit
+
+    def test_deal_pnl_zero_when_profit_zero(self):
+        Deal = _resolve_model("mt5_mcp.schemas.models", "Deal")
+        deal = Deal(
+            deal_id="deal-2",
+            symbol="XAUUSD",
+            time="2024-01-01T00:00:00",
+        )
+        assert deal.pnl == 0.0
+        assert deal.pnl == deal.profit
+
+    def test_deal_model_dump_includes_pnl(self):
+        Deal = _resolve_model("mt5_mcp.schemas.models", "Deal")
+        deal = Deal(
+            deal_id="deal-3",
+            symbol="XAUUSD",
+            time="2024-01-01T00:00:00",
+            profit=-30.0,
+        )
+        dump = deal.model_dump()
+        assert "pnl" in dump
+        assert dump["pnl"] == -30.0
+
+    def test_deal_model_dump_includes_both_pnl_and_profit(self):
+        Deal = _resolve_model("mt5_mcp.schemas.models", "Deal")
+        deal = Deal(
+            deal_id="deal-4",
+            symbol="XAUUSD",
+            time="2024-01-01T00:00:00",
+            profit=50.0,
+        )
+        dump = deal.model_dump()
+        assert "pnl" in dump
+        assert "profit" in dump
+        assert dump["pnl"] == dump["profit"]

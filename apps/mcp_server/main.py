@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+import json
+
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import httpx
 import time
-from uuid import uuid4
+import uuid
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import Response
 
 from mt5_mcp.observability.logging import setup_logging
 from mt5_mcp.schemas.models import (
@@ -54,12 +58,22 @@ from mt5_mcp.schemas.tools import (
     PriceAlertResult,
     PositionMonitorRequest,
     PositionMonitorResult,
+    WaitDelayRequest,
+    WaitDelayResult,
+    WaitForIndicatorRequest,
+    WaitForIndicatorResult,
     MarketRegimeRequest,
     MarketScanRequest,
     TradeDecisionLogRequest,
     TradeJournalReflectionRequest,
     TradingContextRequest,
     TradingCoachRequest,
+    SnapshotRequest,
+    OpportunityRankRequest,
+    ChartIntelligenceRequest,
+    CustomIndicatorRequest,
+    PortfolioExposureRequest,
+    PreTradeGateRequest,
 )
 from mt5_mcp.policy.engine import validate_submit_order, get_policy
 from mt5_mcp.services.agent_capabilities import (
@@ -78,6 +92,9 @@ from mt5_mcp.services.agent_prompt import (
 from mt5_mcp.services.market_context import build_context
 from mt5_mcp.services.trading_coach import TradingCoach
 from mt5_mcp.services.reconciliation import ReconciliationService
+from mt5_mcp.services.snapshot_service import SymbolSnapshotService
+from mt5_mcp.services.opportunity_rank import OpportunityRanker
+from mt5_mcp.services.portfolio_risk import PortfolioRiskService
 from mt5_mcp.services.session_service import (
     get_session_context as _get_session_context,
     get_session_for_pair as _get_session_for_pair,
@@ -106,12 +123,30 @@ from mt5_mcp.schemas.tools import (
     MarketRegimeRequest,
     TradingPolicyStatusRequest,
     TradingPolicyConfigRequest,
+    PolicyConfigResult,
+    PolicyStatusResult,
     TradeJournalQueryRequest,
     MarketScanRequest,
     TradingDecisionSupportRequest,
     AgentSystemPromptRequest,
     NewsFetchRequest,
     EconomicCalendarRequest,
+    EATrailingStartRequest,
+    EATrailingStopRequest,
+    EATrailingListResult,
+    EATrailingTickResult,
+    EABracketStartRequest,
+    EABracketStopRequest,
+    EABracketListResult,
+    EABracketTickResult,
+    SafeShutdownRequest,
+    SafeShutdownResult,
+    MLPredictRequest,
+    DataImportRequest,
+    HistoricalBarsRequest,
+    HistoricalTicksRequest,
+    HistoricalDealsRequest,
+    DataStatsRequest,
 )
 
 
@@ -126,9 +161,58 @@ from mt5_mcp.services.cache import (
 setup_logging()
 app = FastAPI(title="MT5 MCP Server", version="0.1.0")
 
+
+@app.middleware("http")
+async def correlation_middleware(
+    request: Request, call_next: RequestResponseEndpoint
+) -> Response:
+    from mt5_mcp.observability.logging import set_correlation_id, set_request_id
+
+    corr_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4())[:12])
+    req_id = str(uuid.uuid4())[:8]
+    set_correlation_id(corr_id)
+    set_request_id(req_id)
+
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = req_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
 _gw = None
 _settings = None
 _http_client = None  # Persistent HTTP client for gateway communication (Keep-Alive)
+
+# Module-level freeze state for safe_shutdown
+_shutdown_state = {"frozen": False, "frozen_at": None, "frozen_by": None}
+
+
+def is_frozen() -> bool:
+    return _shutdown_state["frozen"]
+
+
+def set_frozen(frozen: bool, by: str = None):
+    from datetime import datetime, timezone
+
+    _shutdown_state["frozen"] = frozen
+    _shutdown_state["frozen_at"] = (
+        datetime.now(timezone.utc).isoformat() if frozen else None
+    )
+    _shutdown_state["frozen_by"] = by
+
+
+def thaw():
+    set_frozen(False)
+
+
+def _check_frozen_response() -> dict | None:
+    if is_frozen():
+        return {
+            "error": "Trading is frozen",
+            "frozen_at": _shutdown_state["frozen_at"],
+            "frozen_by": _shutdown_state["frozen_by"],
+        }
+    return None
 
 
 def get_http_client() -> httpx.Client:
@@ -248,13 +332,42 @@ def resource_bars(symbol: str, timeframe: str, count: int = 100) -> Bars:
 
 @app.get("/resources/positions/open", response_model=list[Position])
 def resource_positions_open() -> list[Position]:
+    from mt5_mcp.observability.logging import logger
+
+    # Try adapter first (may have cached data)
     positions = get_gateway().adapter.get_positions()
     if positions:
         return positions
+
+    # Fallback to bridge — parse with per-item error logging
     try:
-        return [Position(**item) for item in tool_get_positions().get("positions", [])]
-    except Exception:
-        return positions
+        data = tool_get_positions()
+        pos_list = data.get("positions", [])
+        result = []
+        for item in pos_list:
+            try:
+                result.append(Position(**item))
+            except Exception as e:
+                logger.warning(
+                    f"Position parse failed: {e} — keys: {list(item.keys())}"
+                )
+        if result:
+            return result
+    except Exception as e:
+        logger.warning(f"positions_open bridge fallback failed: {e}")
+
+    # Last resort: direct TCP call
+    try:
+        tcp_result = _tcp_send_and_await("get_positions", {}, timeout_s=5.0)
+        if tcp_result and tcp_result.get("status") == "completed":
+            payload = tcp_result.get("result", {}).get("payload", "{}")
+            data = _parse_payload(payload)
+            pos_list = data.get("positions", [])
+            return [Position(**item) for item in pos_list if item]
+    except Exception as e:
+        logger.warning(f"positions_open TCP fallback failed: {e}")
+
+    return []
 
 
 @app.get("/resources/orders/pending", response_model=list[Order])
@@ -268,9 +381,97 @@ def resource_orders_pending() -> list[Order]:
         return orders
 
 
-@app.get("/health", response_model=HealthStatus)
-def health() -> HealthStatus:
-    return get_gateway().health()
+@app.get("/health")
+def health() -> dict:
+    """Enhanced health check with subsystem aggregation."""
+    import time as _health_time
+
+    status = "healthy"
+    issues = []
+
+    # Check bridge connection
+    bridge_connected = False
+    heartbeat_age = None
+    try:
+        ts = get_gateway().terminal_status()
+        bridge_connected = ts.connected if hasattr(ts, "connected") else False
+        if hasattr(ts, "last_heartbeat") and ts.last_heartbeat:
+            heartbeat_age = _health_time.time() - ts.last_heartbeat
+            if heartbeat_age > 30:
+                issues.append(f"Stale heartbeat: {heartbeat_age:.0f}s")
+    except Exception as e:
+        issues.append(f"Bridge status check failed: {e}")
+
+    # Check TCP bridge
+    tcp_connected = False
+    if _TCP_BRIDGE_ENABLED:
+        try:
+            from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
+            import asyncio
+
+            tcp_client = TCPBridgeClient()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(tcp_client.connect())
+                tcp_connected = True
+            except Exception:
+                tcp_connected = False
+            finally:
+                try:
+                    loop.run_until_complete(tcp_client.close())
+                except Exception:
+                    pass
+                loop.close()
+        except Exception as e:
+            tcp_connected = False
+            issues.append(f"TCP bridge unavailable: {e}")
+
+    # Check journal DB
+    journal_writable = False
+    try:
+        journal = get_journal_db()
+        journal._conn.execute(
+            "INSERT INTO trade_decisions (decision_id, timestamp, symbol, side, action) VALUES ('health_check', 'now', 'TEST', 'TEST', 'TEST')"
+        )
+        journal._conn.execute(
+            "DELETE FROM trade_decisions WHERE decision_id = 'health_check'"
+        )
+        journal._conn.commit()
+        journal_writable = True
+    except Exception as e:
+        issues.append(f"Journal DB not writable: {e}")
+
+    # Determine adapter
+    adapter_name = "unknown"
+    try:
+        gw = get_gateway()
+        adapter = getattr(gw, "adapter", None)
+        if adapter is not None:
+            adapter_name = type(adapter).__name__
+    except Exception:
+        pass
+
+    # Determine uptime (use process start time as proxy)
+    uptime = _health_time.monotonic()
+
+    # Set overall status
+    if len(issues) >= 2:
+        status = "degraded"
+    elif issues:
+        status = "healthy"  # Single issue, still healthy
+
+    return {
+        "status": status,
+        "bridge_connected": bridge_connected,
+        "tcp_bridge_connected": tcp_connected,
+        "journal_db_writable": journal_writable,
+        "adapter": adapter_name,
+        "uptime_seconds": round(uptime, 1),
+        "last_heartbeat_age_seconds": round(heartbeat_age, 1)
+        if heartbeat_age is not None
+        else None,
+        "issues": issues,
+    }
 
 
 @app.get("/resources/mt5/bridge/status", response_model=TerminalStatus)
@@ -521,6 +722,25 @@ def _build_trade_error_result(
         message=f"Order failed: retcode={retcode_int} ({retcode_label})",
         raw=data,
     )
+
+
+def _build_tool_error(
+    message: str,
+    *,
+    error_code: str = "UNKNOWN",
+    details: dict | None = None,
+) -> dict:
+    """Build a standardized error response for trade tools.
+
+    Args:
+        message: Human-readable error description.
+        error_code: Machine-readable code (e.g. INVALID_STOPS, NO_MONEY).
+        details: Optional contextual data for debugging.
+    """
+    result: dict = {"status": "error", "error_code": error_code, "message": message}
+    if details:
+        result["details"] = details
+    return result
 
 
 def _first_bid_ask(book: dict) -> tuple[float | None, float | None]:
@@ -967,6 +1187,10 @@ def tool_get_deals_history(
 
 @app.post("/tools/modify_order", response_model=dict)
 def tool_modify_order(req: ModOrderReq) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     params: dict[str, object] = {"type": "modify_order", "order_id": req.order_id}
     # Only include fields when provided to avoid unintended zeroing in EA
     if req.new_price is not None:
@@ -1006,6 +1230,10 @@ def tool_modify_order(req: ModOrderReq) -> dict:
 
 @app.post("/tools/close_all_positions", response_model=dict)
 def tool_close_all_positions(req: CloseAllPositionsRequest) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     params: dict[str, object] = {"type": "close_all_positions", "side": req.side}
     if req.symbol is not None and req.symbol != "":
         params["symbol"] = normalize_symbol(req.symbol)
@@ -1040,6 +1268,10 @@ def tool_close_all_positions(req: CloseAllPositionsRequest) -> dict:
 
 @app.post("/tools/cancel_all_orders", response_model=dict)
 def tool_cancel_all_orders(req: CancelAllOrdersRequest) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     params: dict[str, object] = {"type": "cancel_all_orders", "side": req.side}
     if req.symbol is not None and req.symbol != "":
         params["symbol"] = normalize_symbol(req.symbol)
@@ -1072,8 +1304,50 @@ def tool_cancel_all_orders(req: CancelAllOrdersRequest) -> dict:
     return res
 
 
+def _auto_log_trade(
+    symbol: str,
+    side: str,
+    action: str,
+    *,
+    intent_id: str | None = None,
+    session_id: str | None = None,
+    strategy_id: str | None = None,
+    entry_price: float | None = None,
+    volume_lots: float | None = None,
+    sl: float | None = None,
+    tp: float | None = None,
+    message: str | None = None,
+) -> None:
+    try:
+        journal = get_journal_db()
+        journal.log_execution_result(
+            symbol=symbol,
+            side=side,
+            action=action,
+            intent_id=intent_id,
+            session_id=session_id,
+            strategy_id=strategy_id,
+            entry_price=entry_price,
+            volume_lots=volume_lots,
+            sl=sl,
+            tp=tp,
+            message=message,
+        )
+    except Exception as e:
+        from mt5_mcp.observability.logging import logger
+
+        logger.warning(f"Auto-journal failed: {e}")
+
+
 @app.post("/tools/submit_market_order_via_bridge", response_model=ExecutionResult)
 def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
+    frozen = _check_frozen_response()
+    if frozen:
+        return _build_trade_error_result(req.intent_id or "safe_shutdown", frozen)
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     # Policy gate — enhanced with TradingPolicy engine
     from mt5_mcp.policy.engine import get_policy
 
@@ -1085,7 +1359,7 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
         raise HTTPException(status_code=403, detail=decision.reason or "denied")
 
     if req.idempotency_key is None:
-        req.idempotency_key = str(uuid4())
+        req.idempotency_key = str(uuid.uuid4())
 
     symbol_normalized = normalize_symbol(req.symbol)
 
@@ -1119,6 +1393,18 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
             retcode_int = None
         if retcode_int not in success_retcodes:
             return _build_trade_error_result(req.intent_id, data)
+        _auto_log_trade(
+            symbol=req.symbol,
+            side=req.side,
+            action="entry",
+            intent_id=req.intent_id,
+            session_id=req.session_id,
+            strategy_id=req.strategy_id,
+            volume_lots=req.volume_lots,
+            sl=req.sl,
+            tp=req.tp,
+            message=f"Market order submitted via TCP (retcode={retcode_int})",
+        )
         return ExecutionResult(
             intent_id=req.intent_id,
             status="submitted",
@@ -1172,6 +1458,19 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
 
     if retcode_int not in success_retcodes:
         return _build_trade_error_result(req.intent_id, data)
+
+    _auto_log_trade(
+        symbol=req.symbol,
+        side=req.side,
+        action="entry",
+        intent_id=req.intent_id,
+        session_id=req.session_id,
+        strategy_id=req.strategy_id,
+        volume_lots=req.volume_lots,
+        sl=req.sl,
+        tp=req.tp,
+        message=f"Market order submitted via HTTP (retcode={retcode_int})",
+    )
 
     return ExecutionResult(
         intent_id=req.intent_id,
@@ -1282,6 +1581,10 @@ def tool_get_orders() -> dict:
 
 @app.post("/tools/modify_position_sl_tp", response_model=dict)
 def tool_modify_position_sl_tp(req: ModifyPositionSLTPRequest) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     tcp_result = _tcp_send_and_await(
         "modify_position_sl_tp",
         {
@@ -1322,6 +1625,10 @@ def tool_modify_position_sl_tp(req: ModifyPositionSLTPRequest) -> dict:
 
 @app.post("/tools/close_position", response_model=dict)
 def tool_close_position(req: ClosePosReq) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     tcp_result = _tcp_send_and_await(
         "close_position",
         {
@@ -1334,7 +1641,17 @@ def tool_close_position(req: ClosePosReq) -> dict:
         },
     )
     if tcp_result and tcp_result.get("status") == "completed":
-        return tcp_result.get("result", {})
+        result = tcp_result.get("result", {})
+        _auto_log_trade(
+            symbol="",
+            side="",
+            action="close",
+            intent_id=req.intent_id,
+            session_id=req.session_id,
+            strategy_id=req.strategy_id,
+            message=f"Position {req.position_id} closed",
+        )
+        return result
 
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
@@ -1355,11 +1672,27 @@ def tool_close_position(req: ClosePosReq) -> dict:
     res = _await_result(req_id, timeout_s=20.0)
     if res.get("status") == "error":
         return {**res, "error": _error_payload(res.get("error"))}
+    _auto_log_trade(
+        symbol="",
+        side="",
+        action="close",
+        intent_id=req.intent_id,
+        session_id=req.session_id,
+        strategy_id=req.strategy_id,
+        message=f"Position {req.position_id} closed via HTTP",
+    )
     return res
 
 
 @app.post("/tools/submit_pending_order", response_model=dict)
 def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
+    frozen = _check_frozen_response()
+    if frozen:
+        return frozen
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     from mt5_mcp.policy.engine import get_policy
 
     decision = get_policy().validate_submit_order(
@@ -1387,7 +1720,32 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
         },
     )
     if tcp_result and tcp_result.get("status") == "completed":
-        return tcp_result.get("result", {})
+        result = tcp_result.get("result", {})
+        if isinstance(result, dict) and result.get("status") == "error":
+            payload = (
+                result.get("result", {}).get("payload", {})
+                if isinstance(result.get("result"), dict)
+                else {}
+            )
+            if isinstance(payload, str):
+                payload = _parse_payload(payload)
+            retcode = payload.get("retcode") if isinstance(payload, dict) else None
+            error_code = _map_trade_retcode(retcode) or "UNKNOWN"
+            result["error_code"] = error_code
+        _auto_log_trade(
+            symbol=req.symbol,
+            side=req.side,
+            action="pending_entry",
+            intent_id=req.intent_id,
+            session_id=req.session_id,
+            strategy_id=req.strategy_id,
+            entry_price=req.price,
+            volume_lots=req.volume_lots,
+            sl=req.sl,
+            tp=req.tp,
+            message=f"Pending {req.kind} order placed @ {req.price}",
+        )
+        return result
 
     gw_url = get_settings_cached().gateway_url
     client = get_http_client()
@@ -1412,13 +1770,41 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
     r.raise_for_status()
     req_id = r.json()["id"]
     res = _await_result(req_id, timeout_s=20.0)
+    if isinstance(res, dict) and res.get("status") == "error":
+        payload = (
+            res.get("result", {}).get("payload", {})
+            if isinstance(res.get("result"), dict)
+            else {}
+        )
+        if isinstance(payload, str):
+            payload = _parse_payload(payload)
+        retcode = payload.get("retcode") if isinstance(payload, dict) else None
+        error_code = _map_trade_retcode(retcode) or "UNKNOWN"
+        res["error_code"] = error_code
     if res.get("status") == "error":
         return {**res, "error": _error_payload(res.get("error"))}
+    _auto_log_trade(
+        symbol=req.symbol,
+        side=req.side,
+        action="pending_entry",
+        intent_id=req.intent_id,
+        session_id=req.session_id,
+        strategy_id=req.strategy_id,
+        entry_price=req.price,
+        volume_lots=req.volume_lots,
+        sl=req.sl,
+        tp=req.tp,
+        message=f"Pending {req.kind} order placed via HTTP @ {req.price}",
+    )
     return res
 
 
 @app.post("/tools/cancel_order", response_model=dict)
 def tool_cancel_order(req: CancelOrderRequest) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
     params: dict[str, object] = {"type": "cancel_order", "order_id": req.order_id}
 
     # Add ownership fields when provided
@@ -1565,13 +1951,28 @@ def tool_volatility_profile(req: VolatilityProfileRequest) -> dict:
             period=req.atr_period,
         )
     )
-    atr_value = float(atr_data.get("value", 0.0) or 0.0)
-    return build_volatility_profile(
+    atr_warning = None
+    if atr_data.get("status") == "error":
+        atr_warning = "ATR unavailable"
+        logger.warning(
+            f"ATR request failed for {req.symbol}: {atr_data.get('message', 'unknown error')}"
+        )
+        atr_value = 0.0
+    elif "value" in atr_data and atr_data["value"]:
+        atr_value = float(atr_data["value"])
+    elif "data" in atr_data and atr_data["data"]:
+        atr_value = float(atr_data["data"][-1])
+    else:
+        atr_value = 0.0
+    result = build_volatility_profile(
         symbol=req.symbol,
         timeframe=req.timeframe,
         bars=[bar.model_dump() for bar in bars.data],
         atr_value=atr_value,
     )
+    if atr_warning:
+        result["warning"] = atr_warning
+    return result
 
 
 @app.post("/tools/multi_timeframe_indicators", response_model=dict)
@@ -1684,7 +2085,18 @@ def tool_market_regime(req: MarketRegimeRequest) -> dict:
         )
     )
 
-    atr_value = float(atr_result.get("value", 0.0) or 0.0)
+    # Parse ATR with error detection and data fallback
+    atr_value = 0.0
+    if atr_result.get("status") == "error":
+        from mt5_mcp.observability.logging import logger
+
+        logger.warning(
+            f"ATR request failed for {req.symbol}: {atr_result.get('message', 'unknown error')}"
+        )
+    elif "value" in atr_result and atr_result["value"]:
+        atr_value = float(atr_result["value"])
+    elif "data" in atr_result and atr_result["data"]:
+        atr_value = float(atr_result["data"][-1])
     bars_data = [bar.model_dump() for bar in bars_result.data]
 
     # Try to get EMA for trend direction
@@ -1762,11 +2174,16 @@ def tool_market_scan(req: MarketScanRequest) -> dict:
                     try:
                         import json
 
-                        atr_value = float(json.loads(payload).get("value", 0) or 0)
+                        parsed = json.loads(payload)
+                        atr_value = float(parsed.get("value", 0) or 0)
+                        if atr_value == 0 and "data" in parsed and parsed["data"]:
+                            atr_value = float(parsed["data"][-1])
                     except Exception:
                         pass
                 elif isinstance(payload, dict):
                     atr_value = float(payload.get("value", 0) or 0)
+                    if atr_value == 0 and "data" in payload and payload["data"]:
+                        atr_value = float(payload["data"][-1])
 
             # Parse order book
             bid, ask = None, None
@@ -1814,6 +2231,655 @@ def tool_market_scan(req: MarketScanRequest) -> dict:
 
 
 # ============================================================
+# Symbol Snapshot — One-Call Market Context
+# ============================================================
+
+
+@app.post("/tools/market/snapshot", response_model=dict)
+def tool_market_snapshot(req: SnapshotRequest) -> dict:
+    """Complete market snapshot for a symbol in a single call.
+
+    Replaces 5+ separate API calls (bars, indicators, order book,
+    symbol info, coaching) with one authoritative snapshot payload.
+
+    OPTIMIZED: Uses batched bridge commands in a single round-trip,
+    then assembles the snapshot locally via SymbolSnapshotService.
+    """
+    symbol = req.symbol
+    symbol_norm = normalize_symbol(symbol)
+
+    commands = [
+        {
+            "type": "get_bars",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "count": req.bar_count,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "atr",
+            "period": 14,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "rsi",
+            "period": 14,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "ema",
+            "period": 20,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "ema",
+            "period": 50,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "macd",
+            "fast": 12,
+            "slow": 26,
+            "signal": 9,
+        },
+        {"type": "get_order_book", "symbol": symbol_norm},
+        {"type": "get_symbol_info", "symbol": symbol_norm},
+        {"type": "get_positions", "symbol": symbol_norm},
+    ]
+
+    try:
+        batch_results = _batch_enqueue_and_await(commands, timeout_s=30.0)
+    except Exception as e:
+        return {"symbol": symbol, "error": f"Batch fetch failed: {e}"}
+
+    bars_result = batch_results[0]
+    atr_result = batch_results[1]
+    rsi_result = batch_results[2]
+    ema20_result = batch_results[3]
+    ema50_result = batch_results[4]
+    macd_result = batch_results[5]
+    book_result = batch_results[6]
+    symbol_info_result = batch_results[7]
+    positions_result = batch_results[8]
+
+    def _parse_indicator_value(result: dict) -> float | None:
+        if result.get("status") != "completed":
+            return None
+        payload = result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                return float(json.loads(payload).get("value", 0) or 0)
+            except Exception:
+                return None
+        elif isinstance(payload, dict):
+            v = payload.get("value")
+            return float(v) if v is not None else None
+        return None
+
+    def _parse_payload_dict(result: dict) -> dict:
+        if result.get("status") != "completed":
+            return {}
+        payload = result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                return json.loads(payload)
+            except Exception:
+                return {}
+        elif isinstance(payload, dict):
+            return payload
+        return {}
+
+    atr_value = _parse_indicator_value(atr_result)
+    rsi = _parse_indicator_value(rsi_result)
+    ema_fast = _parse_indicator_value(ema20_result)
+    ema_slow = _parse_indicator_value(ema50_result)
+
+    macd_data = None
+    if macd_result.get("status") == "completed":
+        payload = macd_result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                macd_data = json.loads(payload)
+            except Exception:
+                pass
+        elif isinstance(payload, dict):
+            macd_data = payload
+
+    bid, ask = None, None
+    book_data = _parse_payload_dict(book_result)
+    if book_data:
+        bid, ask = _first_bid_ask(book_data)
+
+    symbol_info_data = _parse_payload_dict(symbol_info_result)
+    if "symbol" in symbol_info_data:
+        symbol_info_data["symbol"] = denormalize_symbol(symbol_info_data["symbol"])
+
+    bars_data = []
+    if bars_result.get("status") == "completed":
+        payload = bars_result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                bars_data = json.loads(payload).get("data", [])
+            except Exception:
+                pass
+        elif isinstance(payload, dict):
+            bars_data = payload.get("data", [])
+
+    positions_data = []
+    if positions_result.get("status") == "completed":
+        payload = positions_result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        positions_list = (
+            payload.get("positions", []) if isinstance(payload, dict) else []
+        )
+        for p in positions_list:
+            if p.get("symbol"):
+                p["symbol"] = denormalize_symbol(p["symbol"])
+            positions_data.append(p)
+
+    snapshot_svc = SymbolSnapshotService(
+        coach=TradingCoach(),
+        reconciliation_service=None,
+    )
+
+    return snapshot_svc.build(
+        symbol=symbol,
+        timeframe=req.timeframe,
+        bars_data=bars_data,
+        atr_value=atr_value,
+        rsi=rsi,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        macd=macd_data,
+        order_book_data=book_data,
+        bid=bid,
+        ask=ask,
+        symbol_info_data=symbol_info_data,
+        positions=positions_data,
+        include_coaching=req.include_coaching,
+        session_id=req.session_id,
+        strategy_id=req.strategy_id,
+    )
+
+
+# ============================================================
+# Opportunity Ranking — Multi-Symbol Trade-Readiness
+# ============================================================
+
+
+@app.post("/tools/market/opportunity_rank", response_model=dict)
+def tool_market_opportunity_rank(req: OpportunityRankRequest) -> dict:
+    """Rank symbols by trade-readiness across 7 weighted factors.
+
+    Returns a ranked list of symbols with composite scores, individual
+    factor scores, and skip reasons for symbols below threshold.
+
+    Factors: regime clarity, spread/ATR, volatility usability, session
+    quality, indicator confluence, portfolio overlap, calendar events.
+    """
+    if not req.symbols:
+        return {"rankings": [], "total_symbols": 0, "tradeable": 0}
+
+    symbol_norms = [normalize_symbol(s) for s in req.symbols]
+
+    # Build batch commands: for each symbol, get bars + ATR + indicators + order book
+    commands = []
+    for sym in symbol_norms:
+        commands.append(
+            {"type": "get_bars", "symbol": sym, "timeframe": req.timeframe, "count": 20}
+        )
+        commands.append(
+            {
+                "type": "get_indicator",
+                "symbol": sym,
+                "timeframe": req.timeframe,
+                "indicator": "atr",
+                "period": 14,
+            }
+        )
+        commands.append(
+            {
+                "type": "get_indicator",
+                "symbol": sym,
+                "timeframe": req.timeframe,
+                "indicator": "rsi",
+                "period": 14,
+            }
+        )
+        commands.append(
+            {
+                "type": "get_indicator",
+                "symbol": sym,
+                "timeframe": req.timeframe,
+                "indicator": "ema",
+                "period": 20,
+            }
+        )
+        commands.append(
+            {
+                "type": "get_indicator",
+                "symbol": sym,
+                "timeframe": req.timeframe,
+                "indicator": "ema",
+                "period": 50,
+            }
+        )
+        commands.append(
+            {
+                "type": "get_indicator",
+                "symbol": sym,
+                "timeframe": req.timeframe,
+                "indicator": "macd",
+                "fast": 12,
+                "slow": 26,
+                "signal": 9,
+            }
+        )
+        commands.append({"type": "get_order_book", "symbol": sym})
+        commands.append({"type": "get_positions"})
+
+    try:
+        batch_results = _batch_enqueue_and_await(commands, timeout_s=45.0)
+    except Exception as e:
+        return {
+            "rankings": [],
+            "total_symbols": len(req.symbols),
+            "error": f"Batch fetch failed: {e}",
+        }
+
+    # Parse results into snapshots
+    snapshots: dict[str, dict] = {}
+    n_commands_per_symbol = (
+        8  # bars, atr, rsi, ema20, ema50, macd, orderbook, positions
+    )
+
+    for i, sym in enumerate(req.symbols):
+        sym_upper = sym.upper()
+        base = i * n_commands_per_symbol
+
+        try:
+            bars_result = (
+                batch_results[base + 0] if base + 0 < len(batch_results) else {}
+            )
+            atr_result = (
+                batch_results[base + 1] if base + 1 < len(batch_results) else {}
+            )
+            rsi_result = (
+                batch_results[base + 2] if base + 2 < len(batch_results) else {}
+            )
+            ema20_result = (
+                batch_results[base + 3] if base + 3 < len(batch_results) else {}
+            )
+            ema50_result = (
+                batch_results[base + 4] if base + 4 < len(batch_results) else {}
+            )
+            macd_result = (
+                batch_results[base + 5] if base + 5 < len(batch_results) else {}
+            )
+            book_result = (
+                batch_results[base + 6] if base + 6 < len(batch_results) else {}
+            )
+            positions_result = (
+                batch_results[base + 7] if base + 7 < len(batch_results) else {}
+            )
+
+            def _parse_indicator_value(result: dict) -> float | None:
+                if result.get("status") != "completed":
+                    return None
+                payload = result.get("result", {}).get("payload", {})
+                if isinstance(payload, str):
+                    try:
+                        import json
+
+                        return float(json.loads(payload).get("value", 0) or 0)
+                    except Exception:
+                        return None
+                elif isinstance(payload, dict):
+                    v = payload.get("value")
+                    return float(v) if v is not None else None
+                return None
+
+            def _parse_payload_dict(result: dict) -> dict:
+                if result.get("status") != "completed":
+                    return {}
+                payload = result.get("result", {}).get("payload", {})
+                if isinstance(payload, str):
+                    try:
+                        import json
+
+                        return json.loads(payload)
+                    except Exception:
+                        return {}
+                elif isinstance(payload, dict):
+                    return payload
+                return {}
+
+            atr_value = _parse_indicator_value(atr_result)
+            rsi = _parse_indicator_value(rsi_result)
+            ema_fast = _parse_indicator_value(ema20_result)
+            ema_slow = _parse_indicator_value(ema50_result)
+
+            macd_data = None
+            if macd_result.get("status") == "completed":
+                payload = macd_result.get("result", {}).get("payload", {})
+                if isinstance(payload, str):
+                    try:
+                        import json
+
+                        macd_data = json.loads(payload)
+                    except Exception:
+                        pass
+                elif isinstance(payload, dict):
+                    macd_data = payload
+
+            bid, ask = None, None
+            book_data = _parse_payload_dict(book_result)
+            if book_data:
+                bid, ask = _first_bid_ask(book_data)
+
+            bars_data = []
+            if bars_result.get("status") == "completed":
+                payload = bars_result.get("result", {}).get("payload", {})
+                if isinstance(payload, str):
+                    try:
+                        import json
+
+                        bars_data = json.loads(payload).get("data", [])
+                    except Exception:
+                        pass
+                elif isinstance(payload, dict):
+                    bars_data = payload.get("data", [])
+
+            positions_data = []
+            if positions_result.get("status") == "completed":
+                payload = positions_result.get("result", {}).get("payload", {})
+                if isinstance(payload, str):
+                    try:
+                        import json
+
+                        payload = json.loads(payload)
+                    except Exception:
+                        payload = {}
+                positions_list = (
+                    payload.get("positions", []) if isinstance(payload, dict) else []
+                )
+                for p in positions_list:
+                    if p.get("symbol"):
+                        p["symbol"] = denormalize_symbol(p["symbol"])
+                    positions_data.append(p)
+
+            # Use snapshot service to build a consistent snapshot
+            snapshot_svc = SymbolSnapshotService(
+                coach=TradingCoach(),
+                reconciliation_service=None,
+            )
+            snapshot = snapshot_svc.build(
+                symbol=sym_upper,
+                timeframe=req.timeframe,
+                bars_data=bars_data,
+                atr_value=atr_value,
+                atr_percentile=None,
+                rsi=rsi,
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                macd=macd_data,
+                order_book_data=book_data,
+                bid=bid,
+                ask=ask,
+                symbol_info_data={},
+                positions=positions_data,
+                include_coaching=False,
+                session_id=req.session_id,
+                strategy_id=req.strategy_id,
+            )
+            snapshots[sym_upper] = snapshot
+
+        except Exception:
+            snapshots[sym_upper] = {}
+
+    # Collect all positions for portfolio overlap detection
+    all_positions: list[dict] = []
+    try:
+        all_pos_result = tool_get_positions()
+        if isinstance(all_pos_result, dict):
+            all_positions = all_pos_result.get("positions", [])
+    except Exception:
+        pass
+
+    # Run ranking
+    ranker = OpportunityRanker()
+    rankings = ranker.rank(
+        symbols=req.symbols,
+        snapshots=snapshots,
+        portfolio_positions=all_positions,
+        min_score=req.min_score,
+        weights=req.weights,
+    )
+
+    tradeable_count = sum(
+        1 for r in rankings if r.get("recommendation") in ("trade", "watch")
+    )
+
+    return {
+        "rankings": rankings,
+        "total_symbols": len(req.symbols),
+        "tradeable": tradeable_count,
+        "timeframe": req.timeframe,
+    }
+
+
+# ============================================================
+# Chart Intelligence — Unified Chart Analysis Bundle
+# ============================================================
+
+
+@app.post("/tools/market/chart_intelligence", response_model=dict)
+def tool_chart_intelligence(req: ChartIntelligenceRequest) -> dict:
+    """Unified chart intelligence: screenshot + S/R + indicators + patterns.
+
+    Replaces 3+ separate calls (screenshot, support/resistance, indicators)
+    with a single agent-friendly response bundle.
+
+    OPTIMIZED: Uses batched bridge commands in a single round-trip,
+    then assembles intelligence locally via ChartIntelligenceService.
+    """
+    symbol = req.symbol
+    symbol_norm = normalize_symbol(symbol)
+
+    commands: list[dict] = [
+        {
+            "type": "get_bars",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "count": req.bar_count,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "atr",
+            "period": 14,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "rsi",
+            "period": 14,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "ema",
+            "period": 20,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "ema",
+            "period": 50,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "macd",
+            "fast": 12,
+            "slow": 26,
+            "signal": 9,
+        },
+        {
+            "type": "get_indicator",
+            "symbol": symbol_norm,
+            "timeframe": req.timeframe,
+            "indicator": "bbands",
+            "period": 20,
+        },
+    ]
+
+    if req.include_screenshot:
+        commands.append(
+            {
+                "type": "get_chart_screenshot",
+                "symbol": symbol_norm,
+                "timeframe": req.timeframe,
+                "width": req.width,
+                "height": req.height,
+            }
+        )
+
+    try:
+        batch_results = _batch_enqueue_and_await(commands, timeout_s=30.0)
+    except Exception as e:
+        return {"symbol": symbol, "error": f"Batch fetch failed: {e}"}
+
+    idx = 0
+    bars_result = batch_results[idx]
+    idx += 1
+    atr_result = batch_results[idx]
+    idx += 1
+    rsi_result = batch_results[idx]
+    idx += 1
+    ema20_result = batch_results[idx]
+    idx += 1
+    ema50_result = batch_results[idx]
+    idx += 1
+    macd_result = batch_results[idx]
+    idx += 1
+    bbands_result = batch_results[idx]
+    idx += 1
+    screenshot_result = batch_results[idx] if req.include_screenshot else None
+
+    def _parse_indicator_value(result: dict) -> float | None:
+        if not result or result.get("status") != "completed":
+            return None
+        payload = result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                return float(json.loads(payload).get("value", 0) or 0)
+            except Exception:
+                return None
+        elif isinstance(payload, dict):
+            v = payload.get("value")
+            return float(v) if v is not None else None
+        return None
+
+    def _parse_payload_dict(result: dict) -> dict:
+        if not result or result.get("status") != "completed":
+            return {}
+        payload = result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                return json.loads(payload)
+            except Exception:
+                return {}
+        elif isinstance(payload, dict):
+            return payload
+        return {}
+
+    atr_value = _parse_indicator_value(atr_result)
+    rsi = _parse_indicator_value(rsi_result)
+    ema_fast = _parse_indicator_value(ema20_result)
+    ema_slow = _parse_indicator_value(ema50_result)
+
+    macd_data = _parse_payload_dict(macd_result)
+    bbands_data = _parse_payload_dict(bbands_result)
+
+    bars_data = []
+    if bars_result and bars_result.get("status") == "completed":
+        payload = bars_result.get("result", {}).get("payload", {})
+        if isinstance(payload, str):
+            try:
+                import json
+
+                bars_data = json.loads(payload).get("data", [])
+            except Exception:
+                pass
+        elif isinstance(payload, dict):
+            bars_data = payload.get("data", [])
+
+    screenshot_data = None
+    if req.include_screenshot and screenshot_result:
+        ss_payload = _parse_payload_dict(screenshot_result)
+        if ss_payload and ss_payload.get("image_base64"):
+            screenshot_data = {
+                "base64": ss_payload["image_base64"],
+                "width": req.width,
+                "height": req.height,
+            }
+
+    from mt5_mcp.services.chart_intelligence import ChartIntelligenceService
+
+    svc = ChartIntelligenceService()
+    return svc.get_intelligence(
+        symbol=symbol,
+        timeframe=req.timeframe,
+        bars_data=bars_data,
+        atr_value=atr_value,
+        rsi=rsi,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        macd=macd_data if macd_data else None,
+        bbands=bbands_data if bbands_data else None,
+        screenshot_data=screenshot_data,
+        include_screenshot_base64=req.include_screenshot_base64,
+        bar_count=req.bar_count,
+        session_id=req.session_id,
+        strategy_id=req.strategy_id,
+    )
+
+
+# ============================================================
 # Bracket Orders
 # ============================================================
 
@@ -1825,6 +2891,11 @@ def tool_place_bracket_order(req: BracketOrderRequest) -> BracketOrderResult:
     When one order fills, the other is auto-cancelled.
     SL/TP are computed from ATR.
     """
+    if is_frozen():
+        return BracketOrderResult(
+            status="error",
+            message="Trading is frozen",
+        )
     from mt5_mcp.policy.engine import get_policy
     import uuid
 
@@ -1839,111 +2910,148 @@ def tool_place_bracket_order(req: BracketOrderRequest) -> BracketOrderResult:
         )
 
     # Get ATR for SL/TP calculation
-    atr_result = tool_get_indicator(
-        IndicatorRequest(symbol=req.symbol, timeframe="H1", indicator="atr", period=14)
-    )
-    atr_value = float(atr_result.get("value", 0.0) or 0.0)
+    try:
+        atr_result = tool_get_indicator(
+            IndicatorRequest(
+                symbol=req.symbol, timeframe="H1", indicator="atr", period=14
+            )
+        )
+        # Parse ATR with error detection and data fallback
+        atr_value = 0.0
+        if atr_result.get("status") == "error":
+            from mt5_mcp.observability.logging import logger
 
-    if atr_value <= 0:
-        return BracketOrderResult(
-            status="error",
-            message="Could not determine ATR for SL/TP calculation",
+            logger.warning(
+                f"ATR request failed for {req.symbol}: {atr_result.get('message', 'unknown error')}"
+            )
+        elif "value" in atr_result and atr_result["value"]:
+            atr_value = float(atr_result["value"])
+        elif "data" in atr_result and atr_result["data"]:
+            atr_value = float(atr_result["data"][-1])
+
+        if atr_value <= 0:
+            return BracketOrderResult(
+                status="error",
+                message="Could not determine ATR for SL/TP calculation",
+            )
+
+        # Compute SL/TP distances
+        sl_distance = atr_value * req.sl_atr_multiplier
+        tp_distance = atr_value * req.tp_atr_multiplier
+
+        # BUY STOP order
+        buy_sl = req.buy_trigger - sl_distance
+        buy_tp = req.buy_trigger + tp_distance
+
+        # SELL STOP order
+        sell_sl = req.sell_trigger + sl_distance
+        sell_tp = req.sell_trigger - tp_distance
+
+        # Submit BUY STOP
+        buy_req = SubmitPendingOrderRequest(
+            symbol=req.symbol,
+            side="buy",
+            kind="stop",
+            price=req.buy_trigger,
+            volume_lots=req.volume_lots,
+            sl=buy_sl,
+            tp=buy_tp,
+        )
+        buy_result = tool_submit_pending_order(buy_req)
+
+        buy_order_id = (
+            buy_result.get("payload", {}).get("order")
+            if isinstance(buy_result, dict)
+            else None
         )
 
-    # Compute SL/TP distances
-    sl_distance = atr_value * req.sl_atr_multiplier
-    tp_distance = atr_value * req.tp_atr_multiplier
+        # If BUY failed, return immediately (no rollback needed)
+        if isinstance(buy_result, dict) and buy_result.get("status") == "error":
+            buy_error = buy_result.get("error", "unknown")
+            return BracketOrderResult(
+                status="error",
+                message=f"Bracket order failed — BUY STOP not placed: {buy_error}",
+            )
 
-    # BUY STOP order
-    buy_sl = req.buy_trigger - sl_distance
-    buy_tp = req.buy_trigger + tp_distance
+        # BUY succeeded, now try SELL STOP
+        sell_req = SubmitPendingOrderRequest(
+            symbol=req.symbol,
+            side="sell",
+            kind="stop",
+            price=req.sell_trigger,
+            volume_lots=req.volume_lots,
+            sl=sell_sl,
+            tp=sell_tp,
+        )
+        sell_result = tool_submit_pending_order(sell_req)
 
-    # SELL STOP order
-    sell_sl = req.sell_trigger + sl_distance
-    sell_tp = req.sell_trigger - tp_distance
-
-    # Submit BUY STOP
-    buy_req = SubmitPendingOrderRequest(
-        symbol=req.symbol,
-        side="buy",
-        kind="stop",
-        price=req.buy_trigger,
-        volume_lots=req.volume_lots,
-        sl=buy_sl,
-        tp=buy_tp,
-    )
-    buy_result = tool_submit_pending_order(buy_req)
-
-    # Submit SELL STOP
-    sell_req = SubmitPendingOrderRequest(
-        symbol=req.symbol,
-        side="sell",
-        kind="stop",
-        price=req.sell_trigger,
-        volume_lots=req.volume_lots,
-        sl=sell_sl,
-        tp=sell_tp,
-    )
-    sell_result = tool_submit_pending_order(sell_req)
-
-    buy_order_id = (
-        buy_result.get("payload", {}).get("order")
-        if isinstance(buy_result, dict)
-        else None
-    )
-    sell_order_id = (
-        sell_result.get("payload", {}).get("order")
-        if isinstance(sell_result, dict)
-        else None
-    )
-
-    if isinstance(buy_result, dict) and buy_result.get("status") == "error":
-        # Cancel sell if buy failed
-        if sell_order_id:
-            tool_cancel_order(CancelOrderRequest(order_id=str(sell_order_id)))
-        return BracketOrderResult(
-            status="error",
-            message=f"BUY STOP failed: {buy_result.get('error', 'unknown')}",
-            atr_used=atr_value,
+        sell_order_id = (
+            sell_result.get("payload", {}).get("order")
+            if isinstance(sell_result, dict)
+            else None
         )
 
-    if isinstance(sell_result, dict) and sell_result.get("status") == "error":
-        # Cancel buy if sell failed
-        if buy_order_id:
-            tool_cancel_order(CancelOrderRequest(order_id=str(buy_order_id)))
+        # If SELL failed, rollback the BUY order
+        if isinstance(sell_result, dict) and sell_result.get("status") == "error":
+            sell_error = sell_result.get("error", "unknown")
+            rollback_status = ""
+            if buy_order_id:
+                try:
+                    cancel_resp = tool_cancel_order(
+                        CancelOrderRequest(order_id=str(buy_order_id))
+                    )
+                    cancel_ok = (
+                        isinstance(cancel_resp, dict)
+                        and cancel_resp.get("status") != "error"
+                    )
+                    rollback_status = (
+                        f" Rollback: BUY order {buy_order_id} cancelled successfully."
+                        if cancel_ok
+                        else f" Rollback: BUY order {buy_order_id} cancellation also failed."
+                    )
+                except Exception as cancel_exc:
+                    rollback_status = f" Rollback: BUY order {buy_order_id} cancellation failed ({cancel_exc})."
+            return BracketOrderResult(
+                status="error",
+                message=(
+                    f"Bracket order partially failed — BUY STOP placed (order {buy_order_id}) "
+                    f"but SELL STOP failed: {sell_error}.{rollback_status}"
+                ),
+            )
+
+        # Both succeeded — log to journal (non-fatal)
+        try:
+            journal = get_journal_db()
+            import uuid as _uuid
+
+            journal.log_decision(
+                symbol=req.symbol,
+                side="bracket",
+                action="entry",
+                entry_price=0.0,  # Not filled yet
+                volume_lots=req.volume_lots,
+                model_justification=req.rationale
+                or f"Bracket order: buy@{req.buy_trigger}, sell@{req.sell_trigger}",
+                session_id=f"bracket_{_uuid.uuid4().hex[:8]}",
+                indicators_considered=["atr", "bracket_breakout"],
+            )
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
+
+            logger.warning(f"Bracket order journal failed (non-fatal): {e}")
+
         return BracketOrderResult(
-            status="error",
-            message=f"SELL STOP failed: {sell_result.get('error', 'unknown')}",
-            atr_used=atr_value,
+            buy_order_id=str(buy_order_id) if buy_order_id else None,
+            sell_order_id=str(sell_order_id) if sell_order_id else None,
+            status="placed",
+            message=f"Bracket orders placed. BUY STOP @ {req.buy_trigger}, SELL STOP @ {req.sell_trigger}",
         )
 
-    # Log to journal
-    journal = get_journal_db()
-    import uuid as _uuid
-
-    journal.log_decision(
-        symbol=req.symbol,
-        side="bracket",
-        action="entry",
-        entry_price=0.0,  # Not filled yet
-        volume_lots=req.volume_lots,
-        model_justification=req.rationale
-        or f"Bracket order: buy@{req.buy_trigger}, sell@{req.sell_trigger}",
-        session_id=f"bracket_{_uuid.uuid4().hex[:8]}",
-        indicators_considered=["atr", "bracket_breakout"],
-    )
-
-    return BracketOrderResult(
-        buy_order_id=str(buy_order_id) if buy_order_id else None,
-        sell_order_id=str(sell_order_id) if sell_order_id else None,
-        status="placed",
-        message=f"Bracket orders placed. BUY STOP @ {req.buy_trigger}, SELL STOP @ {req.sell_trigger}",
-        atr_used=atr_value,
-        computed_sl_buy=buy_sl,
-        computed_tp_buy=buy_tp,
-        computed_sl_sell=sell_sl,
-        computed_tp_sell=sell_tp,
-    )
+    except Exception as exc:
+        return BracketOrderResult(
+            status="error",
+            message=f"Unexpected error placing bracket order: {exc}",
+        )
 
 
 # ============================================================
@@ -1986,7 +3094,18 @@ def tool_set_trailing_stop(req: SetTrailingStopRequest) -> TrailingStopResult:
             symbol=position.symbol, timeframe="H1", indicator="atr", period=14
         )
     )
-    atr_value = float(atr_result.get("value", 0.0) or 0.0)
+    # Parse ATR with error detection and data fallback
+    atr_value = 0.0
+    if atr_result.get("status") == "error":
+        from mt5_mcp.observability.logging import logger
+
+        logger.warning(
+            f"ATR request failed for {position.symbol}: {atr_result.get('message', 'unknown error')}"
+        )
+    elif "value" in atr_result and atr_result["value"]:
+        atr_value = float(atr_result["value"])
+    elif "data" in atr_result and atr_result["data"]:
+        atr_value = float(atr_result["data"][-1])
 
     if atr_value <= 0:
         return TrailingStopResult(
@@ -2041,28 +3160,292 @@ def tool_trailing_stop_list() -> dict:
 
 
 # ============================================================
+# EA-Native ATR Trailing Stop (Phase 3)
+# ============================================================
+
+
+@app.post("/tools/ea_trailing/start", response_model=dict)
+def tool_ea_trailing_start(req: EATrailingStartRequest) -> dict:
+    """Start EA-native ATR trailing stop.
+
+    Unlike /tools/set_trailing_stop, this runs inside the EA process,
+    surviving MCP/gateway instability.
+    """
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
+
+    if req.atr_multiplier < 0.5 or req.atr_multiplier > 5.0:
+        return {
+            "status": "error",
+            "error": "atr_multiplier must be between 0.5 and 5.0",
+        }
+
+    params: dict[str, object] = {
+        "type": "trailing_start",
+        "ticket": req.ticket,
+        "atr_multiplier": req.atr_multiplier,
+        "check_interval": req.check_interval_seconds,
+        "lock_in_profit_atr": req.lock_in_profit_atr,
+    }
+    if req.magic_filter:
+        params["magic_filter"] = req.magic_filter
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+    if req.intent_id:
+        params["intent_id"] = req.intent_id
+    if req.idempotency_key:
+        params["idempotency_key"] = req.idempotency_key
+
+    tcp_result = _tcp_send_and_await("trailing_start", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+@app.post("/tools/ea_trailing/stop", response_model=dict)
+def tool_ea_trailing_stop(req: EATrailingStopRequest) -> dict:
+    """Stop EA-native trailing for a position."""
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
+
+    params: dict[str, object] = {
+        "type": "trailing_stop",
+        "ticket": req.ticket,
+    }
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+
+    tcp_result = _tcp_send_and_await("trailing_stop", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+@app.post("/tools/ea_trailing/list", response_model=dict)
+def tool_ea_trailing_list() -> dict:
+    """List all active EA-native trailing stops."""
+    params: dict[str, object] = {"type": "trailing_list"}
+
+    tcp_result = _tcp_send_and_await("trailing_list", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+@app.post("/tools/ea_trailing/tick", response_model=dict)
+def tool_ea_trailing_tick() -> dict:
+    """Manually trigger a trailing stop check cycle."""
+    params: dict[str, object] = {"type": "trailing_tick"}
+
+    tcp_result = _tcp_send_and_await("trailing_tick", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+# --- EA-Native Bracket/OCO Management ---
+
+
+@app.post("/tools/ea_bracket/start", response_model=dict)
+def tool_ea_bracket_start(req: EABracketStartRequest) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
+
+    params: dict[str, object] = {
+        "type": "bracket_start",
+        "buy_order_ticket": req.buy_order_ticket,
+        "sell_order_ticket": req.sell_order_ticket,
+        "bracket_id": req.bracket_id,
+    }
+    if req.comment:
+        params["comment"] = req.comment
+    if req.magic_filter:
+        params["magic_filter"] = req.magic_filter
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+    if req.intent_id:
+        params["intent_id"] = req.intent_id
+    if req.idempotency_key:
+        params["idempotency_key"] = req.idempotency_key
+
+    tcp_result = _tcp_send_and_await("bracket_start", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+@app.post("/tools/ea_bracket/stop", response_model=dict)
+def tool_ea_bracket_stop(req: EABracketStopRequest) -> dict:
+    if req.intent_id:
+        from mt5_mcp.observability.logging import set_intent_id
+
+        set_intent_id(req.intent_id)
+
+    params: dict[str, object] = {
+        "type": "bracket_stop",
+        "bracket_id": req.bracket_id,
+    }
+    if req.session_id:
+        params["session_id"] = req.session_id
+    if req.strategy_id:
+        params["strategy_id"] = req.strategy_id
+
+    tcp_result = _tcp_send_and_await("bracket_stop", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+@app.post("/tools/ea_bracket/list", response_model=dict)
+def tool_ea_bracket_list() -> dict:
+    params: dict[str, object] = {"type": "bracket_list"}
+
+    tcp_result = _tcp_send_and_await("bracket_list", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+@app.post("/tools/ea_bracket/tick", response_model=dict)
+def tool_ea_bracket_tick() -> dict:
+    params: dict[str, object] = {"type": "bracket_tick"}
+
+    tcp_result = _tcp_send_and_await("bracket_tick", params)
+    if tcp_result and tcp_result.get("status") == "completed":
+        return tcp_result.get("result", {})
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params=params,
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id)
+    if res.get("status") == "error":
+        return {**res, "error": _error_payload(res.get("error"))}
+    return res
+
+
+# ============================================================
 # Phase 4: Price Alert (Long-Polling)
 # ============================================================
 
 
 @app.post("/resources/market/wait_for_price", response_model=PriceAlertResult)
-def tool_wait_for_price(req: PriceAlertRequest) -> PriceAlertResult:
+async def tool_wait_for_price(req: PriceAlertRequest) -> PriceAlertResult:
     """Long-polling price alert. Holds connection until price condition is met.
 
     Eliminates manual polling — the server checks and returns when triggered.
     """
-    import time as _time
+    import asyncio
 
-    end_time = _time.time() + req.timeout_seconds
-    symbol_norm = normalize_symbol(req.symbol)
+    end_time = asyncio.get_event_loop().time() + req.timeout_seconds
 
-    while _time.time() < end_time:
+    while asyncio.get_event_loop().time() < end_time:
         try:
             book = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
             bid, ask = _first_bid_ask(book)
 
             if bid is None or ask is None:
-                _time.sleep(1)
+                await asyncio.sleep(1)
                 continue
 
             # Use mid price for crosses, ask for above, bid for below
@@ -2088,7 +3471,7 @@ def tool_wait_for_price(req: PriceAlertRequest) -> PriceAlertResult:
         except Exception:
             pass
 
-        _time.sleep(1)  # Check every second
+        await asyncio.sleep(1)  # Check every second
 
     # Timeout
     try:
@@ -2113,167 +3496,192 @@ def tool_wait_for_price(req: PriceAlertRequest) -> PriceAlertResult:
 # ============================================================
 
 
-@app.post("/tools/trading/log_decision", response_model=dict)
+@app.post("/tools/trading/log_decision")
 def tool_log_trade_decision(req: TradeDecisionLogRequest) -> dict:
-    """Log a trading decision with full AI reasoning.
+    try:
+        try:
+            journal = get_journal_db()
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
 
-    EVERY trading decision should be logged here. This enables:
-    - Post-trade reflection ("What did I do wrong?")
-    - Pattern recognition ("I always lose when anxious")
-    - Agentic metacognition (learning from own history)
+            logger.warning(f"Journal DB unavailable: {e}")
+            return {"status": "error", "message": f"Journal unavailable: {e}"}
 
-    The model_justification field is CRITICAL — it captures WHY
-    the AI made the decision, not just what it did.
-    """
-    journal = get_journal_db()
-    decision_id = req.decision_id
+        decision_id = req.decision_id
 
-    if decision_id:
-        # Update existing decision (e.g., adding exit info to an entry)
-        updated = journal.update_decision(
-            decision_id,
-            exit_price=req.exit_price,
-            pnl=req.pnl,
-            outcome=req.outcome,
-            lesson_learned=req.lesson_learned,
-            would_do_differently=req.would_do_differently,
-            mistake_category=req.mistake_category,
-            quality_rating=req.quality_rating,
-            emotional_self_report=req.emotional_self_report,
-            model_justification=req.model_justification,
-        )
-        return {
-            "status": "updated" if updated else "not_found",
-            "decision_id": decision_id,
-        }
+        try:
+            if decision_id:
+                updated = journal.update_decision(
+                    decision_id,
+                    exit_price=req.exit_price,
+                    pnl=req.pnl,
+                    outcome=req.outcome,
+                    lesson_learned=req.lesson_learned,
+                    would_do_differently=req.would_do_differently,
+                    mistake_category=req.mistake_category,
+                    quality_rating=req.quality_rating,
+                    emotional_self_report=req.emotional_self_report,
+                    model_justification=req.model_justification,
+                )
+                return {
+                    "status": "updated" if updated else "not_found",
+                    "decision_id": decision_id,
+                }
 
-    # New decision
-    decision_id = journal.log_decision(
-        symbol=req.symbol,
-        side=req.side,
-        action=req.action,
-        entry_price=req.entry_price,
-        exit_price=req.exit_price,
-        sl=req.sl,
-        tp=req.tp,
-        volume_lots=req.volume_lots,
-        pnl=req.pnl,
-        session_id=req.session_id,
-        regime=req.regime,
-        atr_value=req.atr_value,
-        atr_percent_of_price=req.atr_percent_of_price,
-        rsi_value=req.rsi_value,
-        indicator_snapshot=req.indicator_snapshot,
-        model_justification=req.model_justification,
-        indicators_considered=req.indicators_considered,
-        confidence_level=req.confidence_level,
-        risk_assessment=req.risk_assessment,
-        emotional_self_report=req.emotional_self_report,
-        alternatives_considered=req.alternatives_considered,
-        expected_duration=req.expected_duration,
-        expected_move_points=req.expected_move_points,
-        outcome=req.outcome,
-        lesson_learned=req.lesson_learned,
-        would_do_differently=req.would_do_differently,
-        mistake_category=req.mistake_category,
-        quality_rating=req.quality_rating,
-    )
+            decision_id = journal.log_decision(
+                symbol=req.symbol,
+                side=req.side,
+                action=req.action,
+                entry_price=req.entry_price,
+                exit_price=req.exit_price,
+                sl=req.sl,
+                tp=req.tp,
+                volume_lots=req.volume_lots,
+                pnl=req.pnl,
+                session_id=req.session_id,
+                regime=req.regime,
+                atr_value=req.atr_value,
+                atr_percent_of_price=req.atr_percent_of_price,
+                rsi_value=req.rsi_value,
+                indicator_snapshot=req.indicator_snapshot,
+                model_justification=req.model_justification,
+                indicators_considered=req.indicators_considered,
+                confidence_level=req.confidence_level,
+                risk_assessment=req.risk_assessment,
+                emotional_self_report=req.emotional_self_report,
+                alternatives_considered=req.alternatives_considered,
+                expected_duration=req.expected_duration,
+                expected_move_points=req.expected_move_points,
+                outcome=req.outcome,
+                lesson_learned=req.lesson_learned,
+                would_do_differently=req.would_do_differently,
+                mistake_category=req.mistake_category,
+                quality_rating=req.quality_rating,
+            )
 
-    return {
-        "status": "logged",
-        "decision_id": decision_id,
-        "message": "Decision logged. Use this ID to update with outcome later.",
-    }
+            return {
+                "status": "logged",
+                "decision_id": decision_id,
+                "message": "Decision logged. Use this ID to update with outcome later.",
+            }
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
+
+            logger.warning(f"Journal operation failed: {e}")
+            return {"status": "error", "message": f"Failed to log decision: {e}"}
+    except Exception as e:
+        from mt5_mcp.observability.logging import logger
+
+        logger.error(f"tool_log_trade_decision failed: {e}")
+        return {"status": "error", "message": f"tool_log_trade_decision failed: {e}"}
 
 
-@app.post("/tools/trading/reflect", response_model=dict)
+@app.post("/tools/trading/reflect")
 def tool_reflect_on_trades(req: TradeJournalReflectionRequest) -> dict:
-    """Query past decisions for metacognitive reflection.
+    try:
+        try:
+            journal = get_journal_db()
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
 
-    The AI agent uses this to understand its own patterns:
-    - "Show me my last 5 losing trades"
-    - "What regime was I in when I won?"
-    - "What happens when I'm anxious?"
-    """
-    journal = get_journal_db()
-    decisions = journal.query(
-        symbol=req.symbol,
-        outcome=req.outcome,
-        regime=req.regime,
-        emotional_self_report=req.emotional_self_report,
-        mistake_category=req.mistake_category,
-        action=req.action,
-        limit=req.limit,
-    )
+            logger.warning(f"Journal DB unavailable for reflection: {e}")
+            return {"count": 0, "decisions": [], "warning": f"Journal unavailable: {e}"}
 
-    # Clean up for response (parse JSON fields)
-    for d in decisions:
-        if d.get("indicator_snapshot"):
-            try:
-                d["indicator_snapshot"] = json.loads(d["indicator_snapshot"])
-            except Exception:
-                pass
-        if d.get("indicators_considered"):
-            try:
-                d["indicators_considered"] = json.loads(d["indicators_considered"])
-            except Exception:
-                pass
+        try:
+            decisions = journal.query(
+                symbol=req.symbol,
+                outcome=req.outcome,
+                regime=req.regime,
+                emotional_self_report=req.emotional_self_report,
+                mistake_category=req.mistake_category,
+                action=req.action,
+                limit=req.limit,
+            )
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
 
-    return {
-        "count": len(decisions),
-        "decisions": decisions,
-    }
+            logger.warning(f"Journal query failed: {e}")
+            return {"count": 0, "decisions": [], "warning": f"Query failed: {e}"}
+
+        for d in decisions:
+            if d.get("indicator_snapshot"):
+                try:
+                    d["indicator_snapshot"] = json.loads(d["indicator_snapshot"])
+                except Exception:
+                    pass
+            if d.get("indicators_considered"):
+                try:
+                    d["indicators_considered"] = json.loads(d["indicators_considered"])
+                except Exception:
+                    pass
+
+        return {
+            "count": len(decisions),
+            "decisions": decisions,
+        }
+    except Exception as e:
+        from mt5_mcp.observability.logging import logger
+
+        logger.error(f"tool_reflect_on_trades failed: {e}")
+        return {"status": "error", "message": f"tool_reflect_on_trades failed: {e}"}
 
 
-@app.post("/tools/trading/insights", response_model=dict)
+@app.post("/tools/trading/insights")
 def tool_trading_insights(lookback_days: int = 7) -> dict:
-    """Get metacognitive insights from recent trading history.
+    try:
+        try:
+            journal = get_journal_db()
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
 
-    Returns patterns like:
-    - Win rate by emotional state ("When anxious: 20% win rate")
-    - Win rate by regime ("Ranging: 60%, Trending: 35%")
-    - Most common mistakes
-    - Confidence on wins vs losses
-    - Recent lessons learned
+            logger.warning(f"Journal DB unavailable for insights: {e}")
+            return {"warning": f"Journal unavailable: {e}"}
 
-    The AI should call this at the start of each session to
-    orient itself and avoid repeating past mistakes.
-    """
-    journal = get_journal_db()
-    insights = journal.get_reflection_insights(lookback_days=lookback_days)
+        try:
+            insights = journal.get_reflection_insights(lookback_days=lookback_days)
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
 
-    # Add AI-actionable guidance
-    guidance = []
-    if insights.get("win_rate_by_emotional_state"):
-        for state, data in insights["win_rate_by_emotional_state"].items():
-            if data["win_rate"] < 30:
+            logger.warning(f"Journal insights failed: {e}")
+            return {"warning": f"Insights generation failed: {e}"}
+
+        # Add AI-actionable guidance
+        guidance = []
+        if insights.get("win_rate_by_emotional_state"):
+            for state, data in insights["win_rate_by_emotional_state"].items():
+                if data["win_rate"] < 30:
+                    guidance.append(
+                        f"⚠️ When you feel '{state}', your win rate is only {data['win_rate']}%. "
+                        f"Consider stepping back or reducing position size."
+                    )
+
+        if insights.get("mistake_frequency"):
+            top_mistake = insights["mistake_frequency"][0]
+            guidance.append(
+                f"📌 Your most common mistake: {top_mistake['category']} "
+                f"({top_mistake['count']} times). Be conscious of this today."
+            )
+
+        if insights.get("overall"):
+            overall = insights["overall"]
+            if overall["win_rate"] < 40:
                 guidance.append(
-                    f"⚠️ When you feel '{state}', your win rate is only {data['win_rate']}%. "
-                    f"Consider stepping back or reducing position size."
+                    f"📊 Your recent win rate is {overall['win_rate']}%. "
+                    "Consider reducing trade frequency and focusing on higher-conviction setups."
+                )
+            elif overall["win_rate"] > 60:
+                guidance.append(
+                    f"📊 Your recent win rate is {overall['win_rate']}%. "
+                    "You're in good form. Stick to your process."
                 )
 
-    if insights.get("mistake_frequency"):
-        top_mistake = insights["mistake_frequency"][0]
-        guidance.append(
-            f"📌 Your most common mistake: {top_mistake['category']} "
-            f"({top_mistake['count']} times). Be conscious of this today."
-        )
+        insights["ai_guidance"] = guidance
+        return insights
+    except Exception as e:
+        from mt5_mcp.observability.logging import logger
 
-    if insights.get("overall"):
-        overall = insights["overall"]
-        if overall["win_rate"] < 40:
-            guidance.append(
-                f"📊 Your recent win rate is {overall['win_rate']}%. "
-                "Consider reducing trade frequency and focusing on higher-conviction setups."
-            )
-        elif overall["win_rate"] > 60:
-            guidance.append(
-                f"📊 Your recent win rate is {overall['win_rate']}%. "
-                "You're in good form. Stick to your process."
-            )
-
-    insights["ai_guidance"] = guidance
-    return insights
+        logger.error(f"tool_trading_insights failed: {e}")
+        return {"status": "error", "message": f"tool_trading_insights failed: {e}"}
 
 
 # ============================================================
@@ -2283,7 +3691,7 @@ def tool_trading_insights(lookback_days: int = 7) -> dict:
 # ============================================================
 
 
-@app.post("/tools/trading/context", response_model=dict)
+@app.post("/tools/trading/context")
 def tool_trading_context(req: TradingContextRequest) -> dict:
     """Get LIVE market context for a symbol.
 
@@ -2359,11 +3767,16 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
             try:
                 import json
 
-                current_atr = float(json.loads(payload).get("value", 0) or 0)
+                parsed = json.loads(payload)
+                current_atr = float(parsed.get("value", 0) or 0)
+                if current_atr == 0 and "data" in parsed and parsed["data"]:
+                    current_atr = float(parsed["data"][-1])
             except Exception:
                 pass
         elif isinstance(payload, dict):
             current_atr = float(payload.get("value", 0) or 0)
+            if current_atr == 0 and "data" in payload and payload["data"]:
+                current_atr = float(payload["data"][-1])
 
     # Parse order book
     if book_result.get("status") == "completed":
@@ -2464,7 +3877,7 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
 # ============================================================
 
 
-@app.post("/tools/trading/coach", response_model=dict)
+@app.post("/tools/trading/coach")
 def tool_trading_coach(req: TradingCoachRequest) -> dict:
     """Get advisory coaching derived from LIVE market data.
 
@@ -2479,6 +3892,7 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
     symbol = req.symbol
     side = req.side
     symbol_norm = normalize_symbol(symbol)
+    symbol_info = resource_symbol_info(symbol)
 
     # Batch all bridge commands into a single round-trip
     commands = [
@@ -2519,7 +3933,7 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
     except Exception:
         # Fallback: coach with provided params only
         coach = TradingCoach()
-        advice = coach.evaluate(symbol=symbol, side=side)
+        advice = coach.evaluate(symbol=symbol, side=side, point=symbol_info.point)
         return {
             "recommendation": advice.recommendation,
             "warnings": advice.warnings,
@@ -2553,11 +3967,20 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
             try:
                 import json
 
-                current_atr = float(json.loads(payload).get("value", 0) or 0)
+                parsed = json.loads(payload)
+                current_atr = float(parsed.get("value", 0) or 0)
+                if current_atr == 0 and "data" in parsed and parsed["data"]:
+                    current_atr = float(parsed["data"][-1])
             except Exception:
                 pass
         elif isinstance(payload, dict):
             current_atr = float(payload.get("value", 0) or 0)
+            if current_atr == 0 and "data" in payload and payload["data"]:
+                current_atr = float(payload["data"][-1])
+    else:
+        logger.warning(
+            f"ATR batch request failed for {req.symbol}: status={atr_result.get('status', 'unknown')}"
+        )
 
     # Parse RSI
     if rsi_result.get("status") == "completed":
@@ -2614,6 +4037,7 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
             spread_points = ask - bid
 
     # Parse bars
+    bars_data = []
     if bars_result.get("status") == "completed":
         payload = bars_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
@@ -2700,6 +4124,7 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
         recent_bars_compression=recent_compression,
         proposed_sl_points=sl_points,
         proposed_tp_points=tp_points,
+        point=symbol_info.point,
         indicator_agreements=req.indicator_agreements,
         total_indicators_checked=None,
         trades_today=req.trades_today,
@@ -2737,6 +4162,7 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
     symbol = req.symbol
     side = req.side
     symbol_norm = normalize_symbol(symbol)
+    symbol_info = resource_symbol_info(symbol)
     result: dict = {"symbol": symbol, "side": side}
 
     # Batch all bridge commands into a single round-trip
@@ -2802,18 +4228,33 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
 
     # Parse ATR
     atr_value = 0.0
+    atr_warning = None
     if atr_result.get("status") == "completed":
         payload = atr_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
                 import json
 
-                atr_value = float(json.loads(payload).get("value", 0) or 0)
+                parsed = json.loads(payload)
+                atr_value = float(parsed.get("value", 0) or 0)
+                if atr_value == 0 and "data" in parsed and parsed["data"]:
+                    atr_value = float(parsed["data"][-1])
             except Exception:
                 pass
         elif isinstance(payload, dict):
             atr_value = float(payload.get("value", 0) or 0)
+            if atr_value == 0 and "data" in payload and payload["data"]:
+                atr_value = float(payload["data"][-1])
+    else:
+        atr_warning = "ATR unavailable"
+        from mt5_mcp.observability.logging import logger
+
+        logger.warning(
+            f"ATR batch request failed for decision_support: status={atr_result.get('status', 'unknown')}"
+        )
     result["atr"] = {"value": atr_value}
+    if atr_warning:
+        result["atr"]["warning"] = atr_warning
 
     # Parse RSI
     rsi = None
@@ -2897,6 +4338,7 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         current_price=(bid + ask) / 2 if bid and ask else None,
         proposed_sl_points=req.sl_distance_points,
         proposed_tp_points=req.tp_distance_points,
+        point=symbol_info.point,
     )
     result["coaching"] = {
         "recommendation": advice.recommendation,
@@ -3071,13 +4513,13 @@ def tool_agent_prompt(req: AgentSystemPromptRequest) -> dict:
 
 
 @app.post("/resources/positions/monitor", response_model=PositionMonitorResult)
-def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorResult:
+async def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorResult:
     """Long-polling position monitor. Holds connection until alert triggers."""
-    import time as _time
+    import asyncio
 
-    end_time = _time.time() + req.timeout_seconds
+    end_time = asyncio.get_event_loop().time() + req.timeout_seconds
 
-    while _time.time() < end_time:
+    while asyncio.get_event_loop().time() < end_time:
         try:
             positions = resource_positions_open()
             position = next(
@@ -3094,7 +4536,11 @@ def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorResult:
             current_pnl = position.pnl or 0
 
             for pnl_level in req.alert_at_pnl:
-                if current_pnl >= pnl_level:
+                # Direction-aware comparison: profit targets (>=0) trigger on rising P&L,
+                # loss thresholds (<0) trigger on falling P&L
+                if (pnl_level >= 0 and current_pnl >= pnl_level) or (
+                    pnl_level < 0 and current_pnl <= pnl_level
+                ):
                     return PositionMonitorResult(
                         position_id=req.position_id,
                         alert_type="pnl",
@@ -3127,7 +4573,7 @@ def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorResult:
         except Exception:
             pass
 
-        _time.sleep(2)
+        await asyncio.sleep(2)
 
     try:
         positions = resource_positions_open()
@@ -3145,6 +4591,111 @@ def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorResult:
         alert_type="timeout",
         current_pnl=current_pnl,
         current_price=current_price,
+        timed_out=True,
+    )
+
+
+# ============================================================
+# Agent Wait/Timer Tools
+# ============================================================
+
+
+@app.post("/tools/wait/delay", response_model=WaitDelayResult)
+def tool_wait_delay(req: WaitDelayRequest) -> WaitDelayResult:
+    import time as _time
+    from datetime import datetime, timezone
+
+    _time.sleep(req.duration_seconds)
+    return WaitDelayResult(
+        waited_seconds=req.duration_seconds,
+        resumed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@app.post("/tools/wait/indicator", response_model=WaitForIndicatorResult)
+async def tool_wait_for_indicator(
+    req: WaitForIndicatorRequest,
+) -> WaitForIndicatorResult:
+    import asyncio
+
+    end_time = asyncio.get_event_loop().time() + req.timeout_seconds
+
+    while asyncio.get_event_loop().time() < end_time:
+        try:
+            indicator_req = IndicatorRequest(
+                symbol=req.symbol,
+                timeframe=req.timeframe,
+                indicator=req.indicator,
+                period=req.period,
+                fast=req.fast,
+                slow=req.slow,
+                signal=req.signal,
+            )
+            result = tool_get_indicator(indicator_req)
+            current_value = result.get("value", 0.0) or 0.0
+
+            if req.condition == "above" and current_value >= req.value:
+                return WaitForIndicatorResult(
+                    symbol=req.symbol,
+                    indicator=req.indicator,
+                    condition=req.condition,
+                    target_value=req.value,
+                    actual_value=current_value,
+                    triggered=True,
+                )
+            elif req.condition == "below" and current_value <= req.value:
+                return WaitForIndicatorResult(
+                    symbol=req.symbol,
+                    indicator=req.indicator,
+                    condition=req.condition,
+                    target_value=req.value,
+                    actual_value=current_value,
+                    triggered=True,
+                )
+            elif req.condition == "equals":
+                tolerance = abs(req.value) * 0.001 if req.value != 0 else 0.001
+                if abs(current_value - req.value) <= tolerance:
+                    return WaitForIndicatorResult(
+                        symbol=req.symbol,
+                        indicator=req.indicator,
+                        condition=req.condition,
+                        target_value=req.value,
+                        actual_value=current_value,
+                        triggered=True,
+                    )
+            elif req.condition == "crosses":
+                return WaitForIndicatorResult(
+                    symbol=req.symbol,
+                    indicator=req.indicator,
+                    condition=req.condition,
+                    target_value=req.value,
+                    actual_value=current_value,
+                    triggered=True,
+                )
+        except Exception:
+            pass
+
+        await asyncio.sleep(req.check_interval_seconds)
+
+    try:
+        indicator_req = IndicatorRequest(
+            symbol=req.symbol,
+            timeframe=req.timeframe,
+            indicator=req.indicator,
+            period=req.period,
+        )
+        result = tool_get_indicator(indicator_req)
+        current_value = result.get("value", 0.0) or 0.0
+    except Exception:
+        current_value = None
+
+    return WaitForIndicatorResult(
+        symbol=req.symbol,
+        indicator=req.indicator,
+        condition=req.condition,
+        target_value=req.value,
+        actual_value=current_value,
+        triggered=False,
         timed_out=True,
     )
 
@@ -3334,6 +4885,192 @@ def tool_economic_calendar(req: EconomicCalendarRequest) -> dict:
         }
 
 
+@app.post("/tools/trading/safe_shutdown", response_model=dict)
+def tool_safe_shutdown(req: SafeShutdownRequest) -> dict:
+    mode = req.mode
+    positions_closed = []
+    orders_cancelled = []
+    failed = []
+
+    try:
+        positions_data = tool_get_positions()
+        orders_data = tool_get_orders()
+    except Exception as e:
+        return {
+            "error": f"Failed to fetch state: {e}",
+            "mode": mode,
+            "positions_closed": [],
+            "orders_cancelled": [],
+            "failed": [],
+        }
+
+    all_positions = positions_data.get("positions", [])
+    all_orders = orders_data.get("orders", [])
+
+    def _is_owned(item: dict) -> bool:
+        if req.session_id and item.get("session_id") != req.session_id:
+            return False
+        if req.strategy_id and item.get("strategy_id") != req.strategy_id:
+            return False
+        if not req.session_id and not req.strategy_id:
+            if item.get("session_id") is None and item.get("strategy_id") is None:
+                return False
+        return True
+
+    owned_positions = [p for p in all_positions if _is_owned(p)]
+    owned_orders = [o for o in all_orders if _is_owned(o)]
+
+    if mode in ("flatten", "full"):
+        for pos in owned_positions:
+            pos_id = pos.get("ticket") or pos.get("position_id") or pos.get("id")
+            if not pos_id:
+                failed.append({"type": "position", "item": pos, "reason": "no_id"})
+                continue
+            try:
+                close_req = ClosePosReq(
+                    position_id=str(pos_id),
+                    session_id=req.session_id,
+                    strategy_id=req.strategy_id,
+                )
+                result = tool_close_position(close_req)
+                if result.get("status") == "error":
+                    failed.append({"type": "position", "id": pos_id, "result": result})
+                else:
+                    positions_closed.append({"id": pos_id, "result": result})
+            except Exception as e:
+                failed.append({"type": "position", "id": pos_id, "error": str(e)})
+
+    if mode in ("freeze", "full"):
+        for order in owned_orders:
+            order_id = order.get("ticket") or order.get("order_id") or order.get("id")
+            if not order_id:
+                failed.append({"type": "order", "item": order, "reason": "no_id"})
+                continue
+            try:
+                cancel_req = CancelOrderRequest(
+                    order_id=str(order_id),
+                    session_id=req.session_id,
+                    strategy_id=req.strategy_id,
+                )
+                result = tool_cancel_order(cancel_req)
+                if result.get("status") == "error":
+                    failed.append({"type": "order", "id": order_id, "result": result})
+                else:
+                    orders_cancelled.append({"id": order_id, "result": result})
+            except Exception as e:
+                failed.append({"type": "order", "id": order_id, "error": str(e)})
+
+    if mode == "full":
+        set_frozen(True, by=req.intent_id or "safe_shutdown")
+
+    return {
+        "mode": mode,
+        "positions_closed": positions_closed,
+        "orders_cancelled": orders_cancelled,
+        "failed": failed,
+        "summary": {
+            "total_positions_found": len(owned_positions),
+            "total_orders_found": len(owned_orders),
+            "positions_closed": len(positions_closed),
+            "orders_cancelled": len(orders_cancelled),
+            "failed": len(failed),
+        },
+        "freeze_state": dict(_shutdown_state),
+    }
+
+
+@app.post("/tools/trading/thaw", response_model=dict)
+def tool_thaw() -> dict:
+    thaw()
+    return {
+        "status": "thawed",
+        "freeze_state": dict(_shutdown_state),
+    }
+
+
+@app.get("/tools/trading/freeze_status", response_model=dict)
+def tool_freeze_status() -> dict:
+    return {
+        "frozen": is_frozen(),
+        "freeze_state": dict(_shutdown_state),
+    }
+
+
+@app.post("/tools/trading/policy_config", response_model=dict)
+def tool_policy_config(req: TradingPolicyConfigRequest) -> dict:
+    """Update trading policy limits at runtime."""
+    from mt5_mcp.policy.engine import get_policy
+
+    config_dict = req.model_dump(exclude_none=True)
+    result = get_policy().update_limits(**config_dict)
+    return result
+
+
+@app.get("/tools/trading/policy_status", response_model=dict)
+def tool_policy_status() -> dict:
+    """Return current policy limits and status."""
+    from mt5_mcp.policy.engine import get_policy
+
+    policy = get_policy()
+    return {
+        "limits": policy.get_limits(),
+        "status": policy.get_status(),
+    }
+
+
+@app.post("/tools/market/custom_indicator", response_model=dict)
+def tool_custom_indicator(req: CustomIndicatorRequest) -> dict:
+    symbol_normalized = normalize_symbol(req.symbol)
+
+    tcp_result = _tcp_send_and_await(
+        "get_custom_indicator",
+        {
+            "symbol": symbol_normalized,
+            "timeframe": req.timeframe,
+            "indicator_name": req.indicator_name,
+            "params": req.params,
+            "buffer_index": req.buffer_index,
+            "count": req.count,
+        },
+    )
+    if tcp_result and tcp_result.get("status") == "completed":
+        payload = tcp_result.get("result", {}).get("payload", "{}")
+        if isinstance(payload, str):
+            data = _parse_payload(payload)
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {}
+        if "symbol" in data:
+            data["symbol"] = denormalize_symbol(data["symbol"])
+        return data
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/enqueue",
+        params={
+            "type": "get_custom_indicator",
+            "symbol": symbol_normalized,
+            "timeframe": req.timeframe,
+            "indicator_name": req.indicator_name,
+            "params": req.params,
+            "buffer_index": req.buffer_index,
+            "count": req.count,
+        },
+    )
+    r.raise_for_status()
+    req_id = r.json()["id"]
+    res = _await_result(req_id, timeout_s=20.0)
+    if res.get("status") != "completed":
+        return {"error": res.get("error", "timeout")}
+    payload = res.get("result", {}).get("payload", "{}")
+    data = _parse_payload(payload)
+    if "symbol" in data:
+        data["symbol"] = denormalize_symbol(data["symbol"])
+    return data
+
+
 class ReconcileRequest(BaseModel):
     intent_ids: list[str] = []
 
@@ -3393,6 +5130,44 @@ def tool_reconcile(req: ReconcileRequest) -> dict:
 
 
 # ============================================================
+# Portfolio Risk — Exposure & Pre-Trade Gate
+# ============================================================
+
+
+@app.post("/tools/portfolio/exposure", response_model=dict)
+def tool_portfolio_exposure(req: PortfolioExposureRequest) -> dict:
+    positions = resource_positions_open()
+    orders = resource_orders_pending()
+    account = resource_account_summary()
+
+    svc = PortfolioRiskService(
+        get_positions_fn=lambda: positions,
+        get_orders_fn=lambda: orders,
+        get_account_fn=lambda: account,
+    )
+    return svc.get_exposure()
+
+
+@app.post("/tools/portfolio/pre_trade_gate", response_model=dict)
+def tool_portfolio_pre_trade_gate(req: PreTradeGateRequest) -> dict:
+    positions = resource_positions_open()
+    orders = resource_orders_pending()
+    account = resource_account_summary()
+
+    svc = PortfolioRiskService(
+        get_positions_fn=lambda: positions,
+        get_orders_fn=lambda: orders,
+        get_account_fn=lambda: account,
+    )
+    return svc.pre_trade_gate(
+        symbol=req.symbol,
+        side=req.side,
+        volume=req.volume_lots,
+        sl_distance=req.sl_distance,
+    )
+
+
+# ============================================================
 # Server entry point — MUST be at the end so all routes register first
 # ============================================================
 
@@ -3400,3 +5175,143 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="127.0.0.1", port=8010)
+
+
+# ============================================================
+# ONNX ML Inference
+# ============================================================
+
+_onnx_service = None
+
+
+def _get_onnx_service():
+    global _onnx_service
+    if _onnx_service is None:
+        try:
+            from mt5_mcp.services.onnx_inference import ONNXInferenceService
+
+            _onnx_service = ONNXInferenceService()
+        except ImportError:
+            return None
+    return _onnx_service
+
+
+@app.post("/tools/ml/predict", response_model=dict)
+def tool_ml_predict(req: MLPredictRequest) -> dict:
+    svc = _get_onnx_service()
+    if svc is None:
+        return {"error": "ONNX runtime not available. Install onnxruntime package."}
+    try:
+        return svc.predict(req.model_name, req.features, req.feature_names)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tools/ml/models", response_model=dict)
+def tool_ml_models() -> dict:
+    svc = _get_onnx_service()
+    if svc is None:
+        return {"models": {}, "error": "ONNX runtime not available"}
+    return svc.list_models()
+
+
+@app.post("/tools/ml/models/reload", response_model=dict)
+def tool_ml_models_reload() -> dict:
+    svc = _get_onnx_service()
+    if svc is None:
+        return {"error": "ONNX runtime not available"}
+    return svc.reload()
+
+
+# ============================================================
+# Historical Data Cache (SQLite-backed)
+# ============================================================
+
+_data_store = None
+
+
+def _get_data_store():
+    global _data_store
+    if _data_store is None:
+        try:
+            from mt5_mcp.services.data_store import DataStore
+
+            _data_store = DataStore()
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
+
+            logger.warning(f"Data store initialization failed: {e}")
+            return None
+    return _data_store
+
+
+@app.post("/tools/data/import", response_model=dict)
+def tool_data_import(req: DataImportRequest) -> dict:
+    """Import historical data from CSV or JSON."""
+    store = _get_data_store()
+    if store is None:
+        return {"error": "Data store unavailable"}
+
+    try:
+        if req.data_type == "bars":
+            if req.format == "csv":
+                return store.import_bars_csv(req.content, req.symbol, req.timeframe)
+            else:
+                return store.import_bars_json(req.content)
+        elif req.data_type == "ticks":
+            if req.format == "csv":
+                return store.import_ticks_csv(req.content, req.symbol)
+            else:
+                return {"error": "JSON ticks import not yet supported"}
+        elif req.data_type == "deals":
+            if req.format == "json":
+                return store.import_deals_json(req.content)
+            else:
+                return {"error": "CSV deals import not yet supported"}
+    except Exception as e:
+        return {
+            "error": str(e),
+            "imported": 0,
+            "duplicates_skipped": 0,
+            "errors": [str(e)],
+        }
+
+
+@app.post("/tools/data/bars", response_model=dict)
+def tool_data_bars(req: HistoricalBarsRequest) -> dict:
+    """Query cached historical bars."""
+    store = _get_data_store()
+    if store is None:
+        return {"error": "Data store unavailable", "data": []}
+    return store.query_bars(
+        req.symbol, req.timeframe, req.start_time, req.end_time, req.limit
+    )
+
+
+@app.post("/tools/data/ticks", response_model=dict)
+def tool_data_ticks(req: HistoricalTicksRequest) -> dict:
+    """Query cached historical ticks."""
+    store = _get_data_store()
+    if store is None:
+        return {"error": "Data store unavailable", "data": []}
+    return store.query_ticks(req.symbol, req.start_time_ms, req.end_time_ms, req.limit)
+
+
+@app.post("/tools/data/deals", response_model=dict)
+def tool_data_deals(req: HistoricalDealsRequest) -> dict:
+    """Query cached deals history."""
+    store = _get_data_store()
+    if store is None:
+        return {"error": "Data store unavailable", "data": []}
+    return store.query_deals(req.symbol, req.limit)
+
+
+@app.get("/tools/data/stats", response_model=dict)
+def tool_data_stats() -> dict:
+    """Get stats about cached data."""
+    store = _get_data_store()
+    if store is None:
+        return {"error": "Data store unavailable"}
+    return store.get_stats()

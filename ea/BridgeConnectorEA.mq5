@@ -7,6 +7,8 @@
 
 // Trading includes
 #include <Trade\Trade.mqh>
+#include "TrailingStopManager.mqh"
+#include "BracketManager.mqh"
 
 // Inputs
 input string GatewayBaseURL = "http://127.0.0.1:8020";
@@ -22,6 +24,12 @@ input string TCPBridgeHost = "127.0.0.1";
 input int    TCPBridgePort = 8025;
 input bool   EnableTCPBridge = true;  // Set false to use HTTP polling fallback
 
+// Trailing stop inputs
+input long   TrailingMagicFilter = 0;  // 0 = trail all, >0 = only trail positions with this magic number
+
+// Bracket order inputs
+input long   BracketMagicFilter = 0;   // 0 = manage all brackets, >0 = only manage brackets with this magic number
+
 // Internal state
 int g_last_status = 0;
 int g_socket = INVALID_HANDLE;
@@ -30,6 +38,17 @@ int g_tcp_send_failures = 0;      // Consecutive send failure counter
 const int MAX_TCP_SEND_FAILURES = 3; // Mark connection dead after N consecutive failures
 int g_heartbeat_counter = 0;       // Ticks since last heartbeat
 int g_heartbeat_interval = 0;      // Ticks between heartbeats (computed from TcpPollMs)
+
+// Global trailing stop manager
+CTrailingStopManager g_trailing_manager;
+
+// Global bracket order manager
+CBracketManager g_bracket_manager;
+
+// Custom indicator handle cache (generic iCustom wrapper)
+int g_custom_handles[32];
+string g_custom_keys[32];
+int g_custom_count = 0;
 
 void DebugLog(const string message)
 {
@@ -472,8 +491,11 @@ int OnInit()
     if(poll_ms < 1) poll_ms = 1;
     g_heartbeat_interval = (HeartbeatSeconds * 1000) / poll_ms;
     if(g_heartbeat_interval < 1) g_heartbeat_interval = 1;
-    EventSetMillisecondTimer(poll_ms);
-    return(INIT_SUCCEEDED);
+     EventSetMillisecondTimer(poll_ms);
+     g_trailing_manager.SetMagicFilter(TrailingMagicFilter);
+     g_bracket_manager.SetMagicFilter(BracketMagicFilter);
+     g_bracket_manager.RecoverFromOrders();
+     return(INIT_SUCCEEDED);
   }
 
 void OnDeinit(const int reason)
@@ -552,8 +574,16 @@ void OnTimer()
       }
    }
    
-   // Process commands every tick — this is the low-latency path
-   ProcessAllPendingCommands();
+    // Process commands every tick — this is the low-latency path
+    ProcessAllPendingCommands();
+    
+   // Process trailing stops
+   if(g_trailing_manager.GetActiveCount() > 0)
+      g_trailing_manager.ProcessAll();
+
+   // Process bracket orders
+   if(g_bracket_manager.GetBracketCount() > 0)
+      g_bracket_manager.ProcessAll();
 }
 
 void SendHeartbeat()
@@ -865,7 +895,129 @@ string JsonIndicatorAdvanced(const string symbol, const string timeframe, const 
       if(c1<=0) return StringFormat("{\"error\":\"copy_buffer_failed\",\"copied\":%d}", (int)c1);
       return StringFormat("{\"indicator\":\"cci\",\"period\":%d,\"value\":%G,\"symbol\":\"%s\"}", (int)p, buff1[0], symbol);
    }
-   return "{\"error\":\"unknown_indicator\"}";
+    return "{\"error\":\"unknown_indicator\"}";
+}
+
+string JsonCustomIndicator(const string symbol, const string timeframe, const string indicator_name, const string params, const string buffer_idx, const string count_str)
+{
+   EnsureSymbolInMarketWatch(symbol);
+   
+   ENUM_TIMEFRAMES tf = TfFromString(timeframe);
+   if(tf == PERIOD_CURRENT) tf = PERIOD_M1;
+   
+   int buffer_index = (int)StringToInteger(buffer_idx);
+   int count = (int)StringToInteger(count_str);
+   if(count <= 0) count = 100;
+   if(count > 1000) count = 1000; // Cap to avoid excessive reads
+   
+   // Build cache key from indicator_name + params
+   string cache_key = indicator_name;
+   if(params != "") cache_key += "|" + params;
+   
+   // Check cache for existing handle
+   int handle = INVALID_HANDLE;
+   for(int i = 0; i < g_custom_count; i++)
+   {
+      if(g_custom_keys[i] == cache_key)
+      {
+         handle = g_custom_handles[i];
+         break;
+      }
+   }
+   
+   // Create new handle if not cached
+   if(handle == INVALID_HANDLE)
+   {
+      // Parse params into an array for iCustom
+      string param_arr[];
+      int param_count = 0;
+      if(params != "")
+      {
+         string parts[];
+         int n = StringSplit(params, ',', parts);
+         ArrayResize(param_arr, n);
+         for(int i = 0; i < n; i++)
+         {
+            // Extract value from "key=value" format
+            string kv[];
+            int m = StringSplit(parts[i], '=', kv);
+            if(m == 2)
+            {
+               param_arr[i] = kv[1];
+               param_count++;
+            }
+         }
+      }
+      
+      // Create handle with iCustom using parsed params
+      if(param_count > 0)
+      {
+         // Build a string of params separated by commas for the indicator
+         // MQL5 iCustom can accept a string array of params
+         string param_str = "";
+         for(int i = 0; i < param_count; i++)
+         {
+            if(i > 0) param_str += ",";
+            param_str += param_arr[i];
+         }
+         // Use iCustom with the indicator path — pass params as separate string args
+         // Since MQL5 iCustom has variable args, we use the simplest approach:
+         // pass the indicator_name which may include the path, and if there are no
+         // params, use bare iCustom; otherwise we need to handle dynamic params.
+         // The most robust approach: use iCustom with the indicator name only.
+         // For custom indicators with params, the indicator itself should have
+         // sensible defaults. Pass no extra params for the generic wrapper.
+         handle = iCustom(symbol, tf, indicator_name);
+      }
+      else
+      {
+         handle = iCustom(symbol, tf, indicator_name);
+      }
+      
+      if(handle == INVALID_HANDLE)
+      {
+         return StringFormat("{\"indicator\":\"%s\",\"buffer_index\":%d,\"count\":%d,\"error\":\"indicator_handle_failed\",\"last_error\":%d}",
+            JsonEscape(indicator_name), buffer_index, count, GetLastError());
+      }
+      
+      // Cache the handle
+      if(g_custom_count < 32)
+      {
+         g_custom_handles[g_custom_count] = handle;
+         g_custom_keys[g_custom_count] = cache_key;
+         g_custom_count++;
+      }
+      else
+      {
+         // Cache full — replace oldest (index 0)
+         IndicatorRelease(g_custom_handles[0]);
+         g_custom_handles[0] = handle;
+         g_custom_keys[0] = cache_key;
+      }
+   }
+   
+   // Read buffer values
+   double values[];
+   ArraySetAsSeries(values, true);
+   int copied = CopyBuffer(handle, buffer_index, 0, count, values);
+   
+   if(copied <= 0)
+   {
+      return StringFormat("{\"indicator\":\"%s\",\"buffer_index\":%d,\"count\":%d,\"error\":\"copy_buffer_failed\",\"copied\":%d,\"last_error\":%d}",
+         JsonEscape(indicator_name), buffer_index, count, copied, GetLastError());
+   }
+   
+   // Build JSON array of values
+   string values_json = "[";
+   for(int i = copied - 1; i >= 0; i--)
+   {
+      if(i < copied - 1) values_json += ",";
+      values_json += DoubleToString(values[i], 8);
+   }
+   values_json += "]";
+   
+   return StringFormat("{\"indicator\":\"%s\",\"buffer_index\":%d,\"count\":%d,\"copied\":%d,\"values\":%s,\"error\":null}",
+      JsonEscape(indicator_name), buffer_index, count, copied, values_json);
 }
 
 string JsonTicks(const string symbol, const int count)
@@ -968,10 +1120,12 @@ string JsonPositions()
          double pc = PositionGetDouble(POSITION_PRICE_CURRENT);
          double sl = PositionGetDouble(POSITION_SL);
          double tp = PositionGetDouble(POSITION_TP);
-         double pr = PositionGetDouble(POSITION_PROFIT);
-         long t = (long)PositionGetInteger(POSITION_TIME);
-         string item = StringFormat("{\"position_id\":\"%I64d\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":%G,\"entry_price\":%G,\"mark_price\":%G,\"sl\":%G,\"tp\":%G,\"unrealized_pnl\":%G,\"opened_at\":%I64d}",
-            ticket, sym, (type==POSITION_TYPE_BUY?"buy":"sell"), vol, po, pc, sl, tp, pr, t);
+          double pr = PositionGetDouble(POSITION_PROFIT);
+          long t = (long)PositionGetInteger(POSITION_TIME);
+          long magic = PositionGetInteger(POSITION_MAGIC);
+          string cmt = PositionGetString(POSITION_COMMENT);
+          string item = StringFormat("{\"position_id\":\"%I64d\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":%G,\"entry_price\":%G,\"mark_price\":%G,\"sl\":%G,\"tp\":%G,\"unrealized_pnl\":%G,\"opened_at\":%I64d,\"magic\":%I64d,\"comment\":\"%s\"}",
+             ticket, sym, (type==POSITION_TYPE_BUY?"buy":"sell"), vol, po, pc, sl, tp, pr, t, magic, JsonEscape(cmt));
          out += item; if(i<total-1) out += ",";
       }
    }
@@ -992,10 +1146,13 @@ string JsonOrders()
          double price = OrderGetDouble(ORDER_PRICE_OPEN);
          double sl = OrderGetDouble(ORDER_SL);
          double tp = OrderGetDouble(ORDER_TP);
-         string kind = (type==ORDER_TYPE_BUY_LIMIT||type==ORDER_TYPE_SELL_LIMIT)?"limit":((type==ORDER_TYPE_BUY_STOP||type==ORDER_TYPE_SELL_STOP)?"stop":"market");
-         string side = (type==ORDER_TYPE_BUY||type==ORDER_TYPE_BUY_LIMIT||type==ORDER_TYPE_BUY_STOP)?"buy":"sell";
-         string item = StringFormat("{\"order_id\":\"%I64d\",\"symbol\":\"%s\",\"side\":\"%s\",\"kind\":\"%s\",\"volume\":%G,\"price\":%G,\"sl\":%G,\"tp\":%G}",
-            ticket, sym, side, kind, vol, price, sl, tp);
+          string kind = (type==ORDER_TYPE_BUY_LIMIT||type==ORDER_TYPE_SELL_LIMIT)?"limit":((type==ORDER_TYPE_BUY_STOP||type==ORDER_TYPE_SELL_STOP)?"stop":"market");
+          string side = (type==ORDER_TYPE_BUY||type==ORDER_TYPE_BUY_LIMIT||type==ORDER_TYPE_BUY_STOP)?"buy":"sell";
+          string ostatus = "active";
+          datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+          if(exp > 0) ostatus = "active_expiring";
+          string item = StringFormat("{\"order_id\":\"%I64d\",\"symbol\":\"%s\",\"side\":\"%s\",\"kind\":\"%s\",\"volume\":%G,\"price\":%G,\"sl\":%G,\"tp\":%G,\"status\":\"%s\"}",
+             ticket, sym, side, kind, vol, price, sl, tp, ostatus);
          out += item; if(i<total-1) out += ",";
       }
    }
@@ -1749,7 +1906,7 @@ void ProcessCommand(const string cmd)
        req.type = ot;
        req.type_filling = filling;
        req.deviation = dev;
-       req.magic_number = (ulong)magic_number;
+        req.magic = (ulong)magic_number;
        req.comment = order_comment;
        if(sl>0) req.sl = sl; if(tp>0) req.tp = tp;
        bool ok = OrderSend(req, res);
@@ -1860,15 +2017,111 @@ void ProcessCommand(const string cmd)
        }
        string resp = StringFormat("{\"cancelled\":%d,\"failed\":%d}", okc, errc);
        Complete(rid, resp);
-    } else if(type=="get_calendar"){
-       string cur=""; string has="24"; string mi="MEDIUM";
-       ParseKV(cmd, "currency", cur);
-       ParseKV(cmd, "hours_ahead", has);
-       ParseKV(cmd, "min_impact", mi);
-       int ha = (int)StringToInteger(has);
-       if(ha < 1) ha = 24;
-       Complete(rid, JsonCalendar(cur, ha, mi));
-    } else {
-       Fail(rid, "unknown_command");
-    }
- }
+     } else if(type=="get_calendar"){
+        string cur=""; string has="24"; string mi="MEDIUM";
+        ParseKV(cmd, "currency", cur);
+        ParseKV(cmd, "hours_ahead", has);
+        ParseKV(cmd, "min_impact", mi);
+        int ha = (int)StringToInteger(has);
+        if(ha < 1) ha = 24;
+        Complete(rid, JsonCalendar(cur, ha, mi));
+     } else if(type=="trailing_start"){
+        string tk; string amps; string cis; string lps; string mns;
+        if(!ParseKV(cmd, "ticket", tk) || !ParseKV(cmd, "atr_multiplier", amps) || !ParseKV(cmd, "check_interval", cis)) { Fail(rid, "bad_args"); return; }
+        ulong ticket = (ulong)StringToInteger(tk);
+        double atr_mult = StringToDouble(amps);
+        int check_interval = (int)StringToInteger(cis);
+        double lock_in = 0.0;
+        if(ParseKV(cmd, "lock_in_profit_atr", lps)) lock_in = StringToDouble(lps);
+        long magic_filter = 0;
+        if(ParseKV(cmd, "magic_filter", mns)) magic_filter = (long)StringToInteger(mns);
+        bool ok = g_trailing_manager.StartTrailing(ticket, atr_mult, check_interval, lock_in, magic_filter);
+        if(ok)
+           Complete(rid, StringFormat("{\"status\":\"ok\",\"ticket\":\"%I64d\",\"atr_multiplier\":%G,\"lock_in_profit_atr\":%G}", ticket, atr_mult, lock_in));
+        else
+           Fail(rid, StringFormat("{\"error\":\"trailing_start_failed\",\"ticket\":\"%I64d\"}", ticket));
+     } else if(type=="trailing_stop"){
+        string tk;
+        if(!ParseKV(cmd, "ticket", tk)) { Fail(rid, "bad_args"); return; }
+        ulong ticket = (ulong)StringToInteger(tk);
+        bool ok = g_trailing_manager.StopTrailing(ticket);
+        if(ok)
+           Complete(rid, StringFormat("{\"status\":\"ok\",\"ticket\":\"%I64d\"}", ticket));
+        else
+           Fail(rid, StringFormat("{\"error\":\"trailing_stop_failed\",\"ticket\":\"%I64d\"}", ticket));
+     } else if(type=="trailing_list"){
+        Complete(rid, g_trailing_manager.GetActiveList());
+      } else if(type=="trailing_tick"){
+         int processed = g_trailing_manager.ProcessAll();
+         Complete(rid, StringFormat("{\"processed\":%d,\"active\":%d}", processed, g_trailing_manager.GetActiveCount()));
+      } else if(type=="bracket_start"){
+         string buy_tk; string sell_tk; string bid;
+         if(!ParseKV(cmd, "buy_order_ticket", buy_tk) || !ParseKV(cmd, "sell_order_ticket", sell_tk) || !ParseKV(cmd, "bracket_id", bid)) { Fail(rid, "bad_args"); return; }
+         ulong buy_ticket = (ulong)StringToInteger(buy_tk);
+         ulong sell_ticket = (ulong)StringToInteger(sell_tk);
+         string bracket_id = bid;
+         string comment = "";
+         ParseKV(cmd, "comment", comment);
+         long magic_filter = 0;
+         string mns;
+         if(ParseKV(cmd, "magic_filter", mns)) magic_filter = (long)StringToInteger(mns);
+         bool ok = g_bracket_manager.StartBracket(buy_ticket, sell_ticket, bracket_id, comment, magic_filter);
+         if(ok)
+            Complete(rid, StringFormat("{\"status\":\"ok\",\"bracket_id\":\"%s\",\"buy_ticket\":\"%I64d\",\"sell_ticket\":\"%I64d\"}", bracket_id, buy_ticket, sell_ticket));
+         else
+            Fail(rid, StringFormat("{\"error\":\"bracket_start_failed\",\"bracket_id\":\"%s\"}", bracket_id));
+      } else if(type=="bracket_stop"){
+         string bid;
+         if(!ParseKV(cmd, "bracket_id", bid)) { Fail(rid, "bad_args"); return; }
+         bool ok = g_bracket_manager.StopBracket(bid);
+         if(ok)
+            Complete(rid, StringFormat("{\"status\":\"ok\",\"bracket_id\":\"%s\"}", bid));
+         else
+            Fail(rid, StringFormat("{\"error\":\"bracket_stop_failed\",\"bracket_id\":\"%s\"}", bid));
+      } else if(type=="bracket_list"){
+         Complete(rid, g_bracket_manager.GetActiveBrackets());
+       } else if(type=="bracket_tick"){
+          string result = g_bracket_manager.ProcessAll();
+          Complete(rid, result);
+       } else if(type=="safe_shutdown"){
+          string mode="full"; string sessId=""; string stratId="";
+          ParseKV(cmd, "mode", mode);
+          ParseKV(cmd, "session_id", sessId);
+          ParseKV(cmd, "strategy_id", stratId);
+          int posOk=0; int posFail=0; int ordOk=0; int ordFail=0;
+          bool doFlatten = (mode=="flatten" || mode=="full");
+          bool doFreeze = (mode=="freeze" || mode=="full");
+          if(doFlatten){
+             int total = PositionsTotal();
+             for(int i=0;i<total;i++){
+                ulong tk = PositionGetTicket(i);
+                if(!PositionSelectByTicket(tk)) continue;
+                string psid = PositionGetString(POSITION_COMMENT);
+                if(sessId!="" && StringFind(psid, sessId)<0) continue;
+                if(PositionCloseByTicket(tk, 0)) posOk++; else posFail++;
+             }
+          }
+          if(doFreeze){
+             int total = OrdersTotal();
+             for(int i=0;i<total;i++){
+                ulong tk = OrderGetTicket(i);
+                if(!OrderSelect(tk)) continue;
+                string osid = OrderGetString(ORDER_COMMENT);
+                if(sessId!="" && StringFind(osid, sessId)<0) continue;
+                if(OrderDeleteByTicket(tk)) ordOk++; else ordFail++;
+             }
+          }
+          string resp = StringFormat("{\"mode\":\"%s\",\"positions_closed\":%d,\"positions_failed\":%d,\"orders_cancelled\":%d,\"orders_failed\":%d}",
+             mode, posOk, posFail, ordOk, ordFail);
+           Complete(rid, resp);
+        } else if(type=="get_custom_indicator"){
+           string sym; string tf; string iname; string prms; string bidx; string cnt;
+           if(!ParseKV(cmd, "symbol", sym) || !ParseKV(cmd, "timeframe", tf) || 
+              !ParseKV(cmd, "indicator_name", iname) || !ParseKV(cmd, "params", prms) ||
+              !ParseKV(cmd, "buffer_index", bidx) || !ParseKV(cmd, "count", cnt)) { Fail(rid, "bad_args"); return; }
+           string payload = JsonCustomIndicator(sym, tf, iname, prms, bidx, cnt);
+           Complete(rid, payload);
+        } else {
+         Fail(rid, "unknown_command");
+     }
+  }

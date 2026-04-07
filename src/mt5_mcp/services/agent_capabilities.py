@@ -161,6 +161,87 @@ def validate_trade_setup(
     normalized_sl = round(sl, digits) if sl is not None else None
     normalized_tp = round(tp, digits) if tp is not None else None
 
+    # --- Projected PnL calculation ---
+    tick_size = float(symbol_info.get("tick_size", 0.0) or 0.0)
+    tick_value = float(symbol_info.get("tick_value", 0.0) or 0.0)
+
+    if tick_size > 0 and tick_value > 0:
+        point_value_per_lot = tick_value / tick_size
+        pnl_per_point = volume_lots * point_value_per_lot
+    else:
+        point_value_per_lot = 0.0
+        pnl_per_point = None
+
+    effective_entry = normalized_entry
+    if effective_entry is None:
+        effective_entry = current_ask if side == "buy" else current_bid
+
+    risk_amount_usd = None
+    reward_amount_usd = None
+    risk_reward_ratio = None
+    required_win_rate_pct = None
+    projected_loss_if_sl_hit = None
+    projected_profit_if_tp_hit = None
+    sl_note = None
+    tp_note = None
+
+    if pnl_per_point is not None and normalized_sl is not None and normalized_sl > 0:
+        sl_distance = abs(effective_entry - normalized_sl)
+        if sl_distance == 0:
+            risk_amount_usd = 0.0
+            projected_loss_if_sl_hit = 0.0
+            sl_note = "SL equals entry price — zero risk distance"
+        else:
+            risk_amount_usd = round(sl_distance * pnl_per_point, 2)
+            projected_loss_if_sl_hit = -risk_amount_usd
+    else:
+        if normalized_sl is None or normalized_sl == 0:
+            sl_note = "No stop loss provided"
+        elif pnl_per_point is None:
+            sl_note = "tick_size or tick_value unavailable for PnL calculation"
+
+    if pnl_per_point is not None and normalized_tp is not None and normalized_tp > 0:
+        tp_distance = abs(normalized_tp - effective_entry)
+        if tp_distance == 0:
+            reward_amount_usd = 0.0
+            projected_profit_if_tp_hit = 0.0
+            tp_note = "TP equals entry price — zero reward distance"
+        else:
+            reward_amount_usd = round(tp_distance * pnl_per_point, 2)
+            projected_profit_if_tp_hit = reward_amount_usd
+    else:
+        if normalized_tp is None or normalized_tp == 0:
+            tp_note = "No take profit provided"
+        elif pnl_per_point is None:
+            tp_note = "tick_size or tick_value unavailable for PnL calculation"
+
+    if (
+        risk_amount_usd is not None
+        and reward_amount_usd is not None
+        and risk_amount_usd > 0
+    ):
+        risk_reward_ratio = round(reward_amount_usd / risk_amount_usd, 2)
+        required_win_rate_pct = round(1 / (1 + risk_reward_ratio) * 100, 1)
+    elif (
+        risk_amount_usd == 0 and reward_amount_usd is not None and reward_amount_usd > 0
+    ):
+        risk_reward_ratio = float("inf")
+        required_win_rate_pct = 0.0
+
+    projected_pnl: dict[str, object] = {
+        "pnl_per_point": round(pnl_per_point, 4) if pnl_per_point is not None else None,
+        "risk_amount_usd": risk_amount_usd,
+        "reward_amount_usd": reward_amount_usd,
+        "risk_reward_ratio": risk_reward_ratio,
+        "required_win_rate_pct": required_win_rate_pct,
+        "projected_loss_if_sl_hit": projected_loss_if_sl_hit,
+        "projected_profit_if_tp_hit": projected_profit_if_tp_hit,
+    }
+    if sl_note:
+        projected_pnl["sl_note"] = sl_note
+    if tp_note:
+        projected_pnl["tp_note"] = tp_note
+
     return {
         "valid": not errors,
         "errors": errors,
@@ -168,6 +249,7 @@ def validate_trade_setup(
         "normalized_entry_price": normalized_entry,
         "normalized_sl": normalized_sl,
         "normalized_tp": normalized_tp,
+        "projected_pnl": projected_pnl,
     }
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class OwnershipMixin(BaseModel):
@@ -52,6 +52,11 @@ class AccountSummary(BaseModel):
     server: Optional[str] = None
     environment: Literal["paper", "demo", "live"] = "demo"
 
+    @computed_field(alias="pnl")
+    @property
+    def pnl(self) -> Optional[float]:
+        return self.profit
+
 
 class SymbolInfo(BaseModel):
     symbol: str
@@ -98,6 +103,11 @@ class Deal(BaseModel):
     session_id: Optional[str] = None
     intent_id: Optional[str] = None
 
+    @computed_field(alias="pnl")
+    @property
+    def pnl(self) -> float:
+        return self.profit
+
 
 class PerformanceSummary(BaseModel):
     closed_trades: int = 0
@@ -129,6 +139,11 @@ class Position(BaseModel):
     source: Optional[str] = None
     magic_number: Optional[int] = None
     comment: Optional[str] = None
+
+    @computed_field(alias="pnl")
+    @property
+    def pnl(self) -> Optional[float]:
+        return self.unrealized_pnl
 
 
 class Order(BaseModel):

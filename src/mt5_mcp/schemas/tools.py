@@ -9,6 +9,7 @@ class OwnershipMixin(BaseModel):
     strategy_id: Optional[str] = None
     intent_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+    magic_number: Optional[int] = None
 
 
 class BarsRequest(BaseModel):
@@ -254,6 +255,87 @@ class TrailingStopResult(BaseModel):
     initial_sl: float | None = None
 
 
+# --- EA-Native ATR Trailing Stop (Phase 3) ---
+
+
+class EATrailingStartRequest(OwnershipMixin):
+    """Start EA-native ATR trailing stop for a position.
+
+    Unlike SetTrailingStopRequest, this runs inside the EA process,
+    surviving MCP/gateway instability. State persists across OnTimer() ticks
+    but not EA restarts.
+    """
+
+    ticket: str  # Position ticket number
+    atr_multiplier: float = 1.5  # ATR multiplier for trailing distance (0.5-5.0)
+    check_interval_seconds: int = 10  # How often to check (seconds)
+    lock_in_profit_atr: float = 0.0  # Start trailing only after this many ATR in profit
+    magic_filter: int = 0  # 0 = no filter, >0 = only trail positions with this magic
+
+
+class EATrailingStopRequest(OwnershipMixin):
+    """Stop EA-native trailing for a position."""
+
+    ticket: str
+
+
+class EATrailingListResult(BaseModel):
+    """Result from listing active EA trailing stops."""
+
+    active_trailing: list[dict] = []
+    count: int = 0
+
+
+class EATrailingTickResult(BaseModel):
+    """Result from processing EA trailing stops."""
+
+    processed: int = 0
+    active: int = 0
+
+
+# --- EA-Native Bracket/OCO Management (Phase 3) ---
+
+
+class EABracketStartRequest(OwnershipMixin):
+    """Start EA-native OCO bracket order management.
+
+    Registers a pair of pending orders as a bracket. When one leg fills,
+    the EA automatically cancels the sibling leg. The bracket_id is embedded
+    in order comments for recovery after EA restart.
+    """
+
+    buy_order_ticket: str  # BUY pending order ticket (0 if single-leg bracket)
+    sell_order_ticket: str  # SELL pending order ticket (0 if single-leg bracket)
+    bracket_id: str  # Unique identifier for this bracket pair
+    comment: str = ""  # Additional comment to embed in orders
+    magic_filter: int = 0  # 0 = no filter, >0 = only manage orders with this magic
+
+
+class EABracketStopRequest(OwnershipMixin):
+    """Stop and remove an EA-native bracket order.
+
+    Cancels both legs if still pending and removes from tracking.
+    """
+
+    bracket_id: str  # Bracket identifier to stop
+
+
+class EABracketListResult(BaseModel):
+    """Result from listing active EA brackets."""
+
+    brackets: list[dict] = []
+    count: int = 0
+
+
+class EABracketTickResult(BaseModel):
+    """Result from processing EA bracket orders."""
+
+    processed: int = 0
+    events: list[dict] = []
+    errors: int = 0
+    active: int = 0
+
+
 # --- Phase 4: Price Alert (Long-Polling) ---
 
 
@@ -296,6 +378,46 @@ class PositionMonitorResult(BaseModel):
     timed_out: bool = False
 
 
+# --- Agent Wait/Timer Tools ---
+
+
+class WaitDelayRequest(BaseModel):
+    """Simple time-based delay for AI agent trading loops."""
+
+    duration_seconds: int = 60
+
+
+class WaitDelayResult(BaseModel):
+    waited_seconds: int
+    resumed_at: str
+
+
+class WaitForIndicatorRequest(BaseModel):
+    """Wait until an indicator meets a condition or timeout."""
+
+    symbol: str
+    timeframe: str = "H1"
+    indicator: str  # rsi, macd, cci, atr, adx, sma, ema, etc.
+    condition: str = "below"  # above, below, crosses, equals
+    value: float
+    period: int | None = None
+    fast: int | None = None
+    slow: int | None = None
+    signal: int | None = None
+    timeout_seconds: int = 300
+    check_interval_seconds: int = 5
+
+
+class WaitForIndicatorResult(BaseModel):
+    symbol: str
+    indicator: str
+    condition: str
+    target_value: float
+    actual_value: float | None = None
+    triggered: bool
+    timed_out: bool = False
+
+
 # --- Phase 2: Market Regime ---
 
 
@@ -316,10 +438,27 @@ class TradingPolicyStatusRequest(BaseModel):
 class TradingPolicyConfigRequest(BaseModel):
     max_trades_per_day: int | None = None
     max_loss_per_day_pct: float | None = None
-    min_rest_between_trades_min: int | None = None
+    min_rest_between_trades_sec: int | None = None
+    max_loss_per_trade_pct: float | None = None
     require_indicator_confluence: bool | None = None
-    max_position_size_pct: float | None = None
+    min_confluence_count: int | None = None
     cooldown_after_consecutive_losses: int | None = None
+    cooldown_duration_after_losses_sec: int | None = None
+    min_profit_before_breakeven_atr: float | None = None
+    allow_live_trading: bool | None = None
+    session_start_time: str | None = None
+    session_end_time: str | None = None
+
+
+class PolicyConfigResult(BaseModel):
+    applied: dict
+    limits: dict
+    skipped_unknown_fields: list[str] | None = None
+
+
+class PolicyStatusResult(BaseModel):
+    limits: dict
+    status: dict
 
 
 # --- Phase 2: Trade Journal ---
@@ -486,3 +625,205 @@ class SessionContextRequest(BaseModel):
 
     symbol: str | None = None  # Optional: filter for specific pair
     include_all_pairs: bool = False  # Include session quality for all pairs
+
+
+# ============================================================
+# Symbol Snapshot — One-Call Market Context
+# ============================================================
+
+
+class SnapshotRequest(BaseModel):
+    """Get complete market snapshot for a symbol in one call.
+
+    Replaces 5+ separate API calls (bars, indicators, order book,
+    symbol info, coaching) with a single authoritative snapshot.
+    """
+
+    symbol: str
+    timeframe: str = "H1"
+    bar_count: int = 100
+    include_coaching: bool = True
+    session_id: str | None = None
+    strategy_id: str | None = None
+
+
+# ============================================================
+# Opportunity Ranking — Multi-Symbol Trade-Readiness Scoring
+# ============================================================
+
+
+class OpportunityRankRequest(BaseModel):
+    """Rank symbols by trade-readiness across 7 weighted factors.
+
+    Custom weights can be provided to adjust the importance of each factor.
+    Valid keys: regime_clarity, spread_atr_ratio, volatility_usability,
+    session_quality, confluence, portfolio_overlap, calendar.
+    Values should sum to approximately 1.0 (0.95–1.05 tolerance).
+    If not provided or invalid, default weights are used.
+    """
+
+    symbols: list[str]
+    timeframe: str = "H1"
+    min_score: float = 50.0
+    session_id: str | None = None
+    strategy_id: str | None = None
+    weights: dict[str, float] | None = None
+
+
+# ============================================================
+# Chart Intelligence — Unified Chart Analysis Bundle
+# ============================================================
+
+
+class SafeShutdownRequest(BaseModel):
+    """Safe shutdown request with configurable modes.
+
+    Provides a single escape hatch to safely flatten positions and freeze
+    trading when conditions degrade (bridge disconnect, data staleness,
+    foreign activity confusion).
+
+    Modes:
+    - "flatten": Close all owned positions, cancel all owned pending orders
+    - "freeze": Cancel all owned pending orders, keep positions open
+    - "full": Flatten + freeze (set frozen flag to reject new orders)
+    """
+
+    mode: Literal["flatten", "freeze", "full"] = "full"
+    preserve_stops: bool = True  # When closing, do NOT modify SL — close at market
+    session_id: Optional[str] = None
+    strategy_id: Optional[str] = None
+    intent_id: Optional[str] = None
+
+
+class SafeShutdownResult(BaseModel):
+    mode: str
+    positions_closed: list[dict] = []
+    orders_cancelled: list[dict] = []
+    failed: list[dict] = []
+    summary: dict = {}
+    freeze_state: dict = {}
+
+
+class ChartIntelligenceRequest(BaseModel):
+    """Get unified chart intelligence: screenshot + S/R + indicators + patterns.
+
+    Replaces separate calls for screenshot, support/resistance levels,
+    and indicator summary with a single agent-friendly response.
+    """
+
+    symbol: str
+    timeframe: str = "H1"
+    width: int = 1920
+    height: int = 1080
+    include_screenshot: bool = True
+    include_screenshot_base64: bool = False
+    bar_count: int = 100
+    session_id: Optional[str] = None
+    strategy_id: Optional[str] = None
+
+
+# ============================================================
+# Custom Indicator — Generic iCustom() Wrapper
+# ============================================================
+
+
+class CustomIndicatorRequest(BaseModel):
+    """Query any custom indicator via iCustom() wrapper.
+
+    Supports both built-in indicators (Examples\\MACD) and custom indicators
+    placed in MQL5/Indicators/ directory.
+    """
+
+    symbol: str
+    timeframe: str
+    indicator_name: str  # e.g., "Examples\\MACD" or "Custom\\MyIndicator"
+    params: str = ""  # KV format: "period=14,deviation=2.0,method=0"
+    buffer_index: int = 0  # Which buffer to read (0-based)
+    count: int = 100  # How many values to return
+
+
+class PortfolioExposureRequest(BaseModel):
+    """Get current portfolio exposure across all open positions."""
+
+    pass
+
+
+class PreTradeGateRequest(BaseModel):
+    """Check if a proposed trade is safe given current portfolio exposure."""
+
+    symbol: str
+    side: Literal["buy", "sell"]
+    volume_lots: float
+    sl_distance: float
+
+
+# ============================================================
+# ONNX ML Inference
+# ============================================================
+
+
+class MLPredictRequest(BaseModel):
+    """Run inference on a pre-trained ONNX model."""
+
+    model_name: str
+    features: list[float]
+    feature_names: list[str] | None = None
+
+
+class MLModelsListRequest(BaseModel):
+    """List available ONNX models."""
+
+    pass
+
+
+class MLReloadModelsRequest(BaseModel):
+    """Reload ONNX models from disk."""
+
+    pass
+
+
+# ============================================================
+# Historical Data Cache (SQLite-backed)
+# ============================================================
+
+
+class DataImportRequest(BaseModel):
+    """Import historical data from CSV or JSON."""
+
+    data_type: Literal["bars", "ticks", "deals"]
+    format: Literal["csv", "json"]
+    content: str
+    symbol: str | None = None
+    timeframe: str | None = None
+
+
+class HistoricalBarsRequest(BaseModel):
+    """Query cached historical bars."""
+
+    symbol: str
+    timeframe: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    limit: int = 1000
+
+
+class HistoricalTicksRequest(BaseModel):
+    """Query cached historical ticks."""
+
+    symbol: str
+    start_time_ms: int | None = None
+    end_time_ms: int | None = None
+    limit: int = 1000
+
+
+class HistoricalDealsRequest(BaseModel):
+    """Query cached deals history."""
+
+    symbol: str | None = None
+    limit: int = 100
+
+
+class DataStatsRequest(BaseModel):
+    """Get stats about cached data."""
+
+    pass

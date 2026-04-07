@@ -218,10 +218,14 @@ class EABridgeAdapter(ExecutionPort):
             result = self._send_command("get_positions", {}, timeout_s=10.0)
 
             if result.get("status") != "completed":
+                logger.error(
+                    f"get_positions command failed: {result.get('error', 'unknown')}"
+                )
                 return []
 
             payload = result.get("result", {}).get("payload")
             if not payload:
+                logger.warning("EA returned empty payload for get_positions")
                 return []
 
             if isinstance(payload, str):
@@ -238,7 +242,7 @@ class EABridgeAdapter(ExecutionPort):
                 results.append(
                     Position(
                         position_id=str(p.get("position_id", "")),
-                        symbol=p.get("symbol", ""),
+                        symbol=denormalize_symbol(p.get("symbol", "")),
                         side=p.get("side", "buy"),
                         volume=float(p.get("volume", 0.0)),
                         entry_price=float(p.get("entry_price", 0.0)),
@@ -268,10 +272,14 @@ class EABridgeAdapter(ExecutionPort):
             result = self._send_command("get_orders", {}, timeout_s=10.0)
 
             if result.get("status") != "completed":
+                logger.error(
+                    f"get_orders command failed: {result.get('error', 'unknown')}"
+                )
                 return []
 
             payload = result.get("result", {}).get("payload")
             if not payload:
+                logger.warning("EA returned empty payload for get_orders")
                 return []
 
             if isinstance(payload, str):
@@ -288,7 +296,7 @@ class EABridgeAdapter(ExecutionPort):
                 results.append(
                     Order(
                         order_id=str(o.get("order_id", "")),
-                        symbol=o.get("symbol", ""),
+                        symbol=denormalize_symbol(o.get("symbol", "")),
                         side=o.get("side", "buy"),
                         kind=o.get("kind", "market"),
                         volume=float(o.get("volume", 0.0)),
@@ -704,3 +712,60 @@ class EABridgeAdapter(ExecutionPort):
                 session_id=req.session_id,
                 idempotency_key=req.idempotency_key,
             )
+
+    def ea_trailing_start(
+        self,
+        ticket: str,
+        atr_multiplier: float = 1.5,
+        check_interval_seconds: int = 10,
+        lock_in_profit_atr: float = 0.0,
+        magic_filter: int = 0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ticket": ticket,
+            "atr_multiplier": atr_multiplier,
+            "check_interval": check_interval_seconds,
+            "lock_in_profit_atr": lock_in_profit_atr,
+        }
+        if magic_filter:
+            payload["magic_filter"] = magic_filter
+        return self._send_command("trailing_start", payload, timeout_s=10.0)
+
+    def ea_trailing_stop(self, ticket: str) -> dict[str, Any]:
+        return self._send_command("trailing_stop", {"ticket": ticket}, timeout_s=10.0)
+
+    def ea_trailing_list(self) -> dict[str, Any]:
+        return self._send_command("trailing_list", {}, timeout_s=10.0)
+
+    def ea_trailing_tick(self) -> dict[str, Any]:
+        return self._send_command("trailing_tick", {}, timeout_s=10.0)
+
+    def ea_bracket_start(
+        self,
+        buy_order_ticket: str,
+        sell_order_ticket: str,
+        bracket_id: str,
+        comment: str = "",
+        magic_filter: int = 0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "buy_order_ticket": buy_order_ticket,
+            "sell_order_ticket": sell_order_ticket,
+            "bracket_id": bracket_id,
+        }
+        if comment:
+            payload["comment"] = comment
+        if magic_filter:
+            payload["magic_filter"] = magic_filter
+        return self._send_command("bracket_start", payload, timeout_s=10.0)
+
+    def ea_bracket_stop(self, bracket_id: str) -> dict[str, Any]:
+        return self._send_command(
+            "bracket_stop", {"bracket_id": bracket_id}, timeout_s=10.0
+        )
+
+    def ea_bracket_list(self) -> dict[str, Any]:
+        return self._send_command("bracket_list", {}, timeout_s=10.0)
+
+    def ea_bracket_tick(self) -> dict[str, Any]:
+        return self._send_command("bracket_tick", {}, timeout_s=10.0)
