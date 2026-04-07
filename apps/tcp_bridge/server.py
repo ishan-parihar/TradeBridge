@@ -8,6 +8,8 @@ import uuid
 from asyncio import StreamReader, StreamWriter
 from typing import Any
 
+import httpx
+
 from mt5_mcp.observability.logging import setup_logging, logger
 
 from .protocol import FrameParser, encode_frame
@@ -51,10 +53,12 @@ class TCPBridgeServer:
         host: str = "0.0.0.0",
         ea_port: int = 8025,
         mcp_port: int = 8026,
+        gateway_url: str = "http://127.0.0.1:8020",
     ):
         self._host = host
         self._ea_port = ea_port
         self._mcp_port = mcp_port
+        self._gateway_url = gateway_url
         self._ea_server: asyncio.Server | None = None
         self._mcp_server: asyncio.Server | None = None
         self._ea_writer: StreamWriter | None = None
@@ -64,6 +68,7 @@ class TCPBridgeServer:
         self._ea_address: str = ""
 
         self._mcp_pending: dict[str, dict[str, asyncio.Future]] = {}
+        self._http_client: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
         # EA listener: port 8025
@@ -166,8 +171,23 @@ class TCPBridgeServer:
 
         elif frame.get("type") == "heartbeat":
             logger.debug(f"EA heartbeat via TCP")
+            # Forward heartbeat to HTTP gateway so EABridgeAdapter sees it
+            await self._forward_heartbeat_to_gateway(frame)
         else:
             logger.warning(f"Unsolicited frame from EA: {frame}")
+
+    async def _forward_heartbeat_to_gateway(self, frame: dict[str, Any]) -> None:
+        """Relay TCP heartbeat to HTTP gateway so EABridgeAdapter sees EA as connected."""
+        try:
+            if self._http_client is None:
+                self._http_client = httpx.AsyncClient(timeout=5.0)
+            payload = {k: v for k, v in frame.items() if k != "type"}
+            await self._http_client.post(
+                f"{self._gateway_url}/bridge/terminal/heartbeat",
+                json=payload,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to forward heartbeat to gateway: {e}")
 
     async def _handle_mcp_frame(
         self, session_id: str, frame: dict[str, Any], writer: StreamWriter
@@ -282,5 +302,8 @@ def get_bridge_server() -> TCPBridgeServer:
     if _bridge_server is None:
         ea_port = int(os.getenv("MT5_TCP_BRIDGE_PORT", "8025"))
         mcp_port = int(os.getenv("MT5_TCP_BRIDGE_MCP_PORT", "8026"))
-        _bridge_server = TCPBridgeServer(ea_port=ea_port, mcp_port=mcp_port)
+        gateway_url = os.getenv("MT5_GATEWAY_URL", "http://127.0.0.1:8020")
+        _bridge_server = TCPBridgeServer(
+            ea_port=ea_port, mcp_port=mcp_port, gateway_url=gateway_url
+        )
     return _bridge_server

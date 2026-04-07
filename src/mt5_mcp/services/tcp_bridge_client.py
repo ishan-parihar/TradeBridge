@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 import time
 import uuid
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 _HEADER_FORMAT = "!I"
@@ -26,6 +29,9 @@ class TCPBridgeClient:
         "_writer",
         "_pending",
         "_recv_task",
+        "_running",
+        "_reconnect_task",
+        "_max_reconnect_delay",
     )
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8026):
@@ -35,14 +41,58 @@ class TCPBridgeClient:
         self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._recv_task: asyncio.Task | None = None
+        self._running: bool = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._max_reconnect_delay: float = 30.0
 
-    async def connect(self) -> None:
-        self._reader, self._writer = await asyncio.open_connection(
-            self._host, self._port
+    @property
+    def is_connected(self) -> bool:
+        return (
+            self._writer is not None
+            and self._writer.is_closing() is False
+            and self._reader is not None
+            and not self._reader.at_eof()
         )
-        self._recv_task = asyncio.create_task(self._recv_loop())
+
+    async def _reconnect_loop(self, max_reconnect_delay: float = 30.0) -> None:
+        delay = 1.0
+        while self._running:
+            try:
+                self._reader, self._writer = await asyncio.open_connection(
+                    self._host, self._port
+                )
+                delay = 1.0
+                await self._recv_loop()
+            except Exception:
+                if not self._running:
+                    break
+                logger.warning("TCP bridge disconnected, reconnecting in %.1fs", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_reconnect_delay)
+            finally:
+                for fut in self._pending.values():
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("TCP bridge disconnected"))
+                self._pending.clear()
+
+    async def connect(self, max_reconnect_delay: float = 30.0) -> None:
+        self._max_reconnect_delay = max_reconnect_delay
+        self._running = True
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        for _ in range(50):
+            if self._writer and self._writer.is_closing() is False:
+                return
+            await asyncio.sleep(0.1)
+        raise ConnectionError(f"Could not connect to {self._host}:{self._port}")
 
     async def close(self) -> None:
+        self._running = False
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
         if self._recv_task:
             self._recv_task.cancel()
             try:
@@ -90,9 +140,6 @@ class TCPBridgeClient:
     async def send_command(
         self, type: str, payload: dict[str, Any], timeout: float = 20.0
     ) -> dict[str, Any]:
-        if not self._writer:
-            await self.connect()
-
         request_id = str(uuid.uuid4())
         frame = {"type": type, "request_id": request_id, **payload}
 

@@ -189,7 +189,8 @@ class PyMT5Adapter(ExecutionPort):
                     )
                 )
             return results
-        except Exception:
+        except Exception as e:
+            logger.error(f"Get positions failed: {e}")
             return []
 
     def get_orders(self) -> list[Order]:

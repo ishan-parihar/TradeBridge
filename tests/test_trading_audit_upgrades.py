@@ -35,6 +35,7 @@ class TestTradingPolicy:
                 min_rest_between_trades_sec=0,  # Disabled for fast tests
                 cooldown_after_consecutive_losses=2,
                 cooldown_duration_after_losses_sec=0,  # Disabled for fast tests
+                min_profit_before_breakeven_atr=1.0,
             )
         )
 

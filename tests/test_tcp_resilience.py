@@ -70,7 +70,45 @@ async def _shutdown_echo_server(server: asyncio.Server):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Client auto-reconnects after server restart
+# Test 1: is_connected property
+# ---------------------------------------------------------------------------
+
+
+class TestIsConnected:
+    @pytest.mark.asyncio
+    async def test_is_connected_false_before_connect(self):
+        client = TCPBridgeClient()
+        assert client.is_connected is False
+
+    @pytest.mark.asyncio
+    async def test_is_connected_true_after_connect(self):
+        host = "127.0.0.1"
+        port = _free_port(80)
+        server = await _start_mock_echo_server(host, port)
+        try:
+            client = TCPBridgeClient(host=host, port=port)
+            await client.connect()
+            assert client.is_connected is True
+            await client.close()
+        finally:
+            await _shutdown_echo_server(server)
+
+    @pytest.mark.asyncio
+    async def test_is_connected_false_after_close(self):
+        host = "127.0.0.1"
+        port = _free_port(81)
+        server = await _start_mock_echo_server(host, port)
+        try:
+            client = TCPBridgeClient(host=host, port=port)
+            await client.connect()
+            await client.close()
+            assert client.is_connected is False
+        finally:
+            await _shutdown_echo_server(server)
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Client auto-reconnects after server restart
 # ---------------------------------------------------------------------------
 
 
@@ -90,16 +128,8 @@ class TestClientReconnect:
 
         await _shutdown_echo_server(server)
 
-        # Consume EOF from reader so _recv_loop breaks and cleans up
-        await asyncio.sleep(0.2)
-        if client._reader:
-            try:
-                await client._reader.read(1)
-            except Exception:
-                pass
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
 
-        # send_command should now fail — connection is known dead
         with pytest.raises(
             (ConnectionError, BrokenPipeError, ConnectionResetError, OSError)
         ):
@@ -107,18 +137,18 @@ class TestClientReconnect:
 
         server = await _start_mock_echo_server(host, port)
 
-        await client.close()
-        client2 = TCPBridgeClient(host=host, port=port)
-        resp2 = await client2.send_command("echo", {"data": "reconnected"}, timeout=5.0)
+        await asyncio.sleep(3.0)
+
+        resp2 = await client.send_command("echo", {"data": "reconnected"}, timeout=5.0)
         assert resp2["status"] == "ok"
         assert resp2["echoed"] is True
 
-        await client2.close()
+        await client.close()
         await _shutdown_echo_server(server)
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Server handles EA reconnecting
+# Test 3: Server handles EA reconnecting
 # ---------------------------------------------------------------------------
 
 
@@ -131,30 +161,24 @@ class TestServerHandlesClientReconnect:
 
         server = TCPBridgeServer(host=host, ea_port=port, mcp_port=mcp_port)
         server_task = asyncio.create_task(server.start())
-        await asyncio.sleep(0.2)  # let server bind
+        await asyncio.sleep(0.2)
 
         try:
-            # 2. Connect a mock client, verify server.ea_connected == True
             reader, writer = await asyncio.open_connection(host, port)
             await asyncio.sleep(0.1)
             assert server.ea_connected is True
 
-            # 3. Disconnect client
             writer.close()
             await writer.wait_closed()
             await asyncio.sleep(0.2)
 
-            # 4. Verify server.ea_connected == False
             assert server.ea_connected is False
 
-            # 5. Reconnect client
             reader2, writer2 = await asyncio.open_connection(host, port)
             await asyncio.sleep(0.1)
 
-            # 6. Verify server.ea_connected == True and can receive commands
             assert server.ea_connected is True
 
-            # Send a command via server and verify mock client can respond
             async def _mock_ea_response():
                 parser = FrameParser()
                 while True:
@@ -195,28 +219,24 @@ class TestServerHandlesClientReconnect:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Partial frame delivery — chunks reassembled correctly
+# Test 4: Partial frame delivery
 # ---------------------------------------------------------------------------
 
 
 class TestPartialFrameDelivery:
     @pytest.mark.asyncio
     async def test_partial_frame_reassembly(self):
-        # 1. Create a FrameParser
         parser = FrameParser()
         original = {"type": "get_bars", "request_id": "partial-test", "count": 50}
         frame_data = encode_frame(original)
 
-        # 2. Feed half a frame, verify has_frame() == False
         midpoint = len(frame_data) // 2
         parser.feed(frame_data[:midpoint])
         assert parser.has_frame() is False
 
-        # 3. Feed rest of frame, verify has_frame() == True
         parser.feed(frame_data[midpoint:])
         assert parser.has_frame() is True
 
-        # 4. Pop and verify content matches original
         result = parser.pop_frame()
         assert result == original
 
@@ -242,12 +262,10 @@ class TestPartialFrameDelivery:
         f2 = encode_frame({"type": "second", "id": 2})
         combined = f1 + f2
 
-        # Feed in 8-byte chunks
         chunk_size = 8
         for i in range(0, len(combined), chunk_size):
             parser.feed(combined[i : i + chunk_size])
 
-        # Should be able to extract both frames
         r1 = parser.pop_frame()
         assert r1["type"] == "first"
         assert r1["id"] == 1
@@ -258,7 +276,7 @@ class TestPartialFrameDelivery:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Concurrent commands — all responses match request_id
+# Test 5: Concurrent commands
 # ---------------------------------------------------------------------------
 
 
@@ -274,7 +292,6 @@ class TestConcurrentCommands:
         await asyncio.sleep(0.2)
 
         try:
-            # 2. Connect mock EA that responds after random delay
             ea_reader, ea_writer = await asyncio.open_connection(host, port)
             await asyncio.sleep(0.1)
             assert server.ea_connected is True
@@ -291,7 +308,6 @@ class TestConcurrentCommands:
                         parser.feed(data)
                         while parser.has_frame():
                             frame = parser.pop_frame()
-                            # Simulate EA processing with random delay
                             delay = random.uniform(0.01, 0.1)
                             await asyncio.sleep(delay)
                             request_id = frame.get("request_id", "")
@@ -309,7 +325,6 @@ class TestConcurrentCommands:
 
             ea_task = asyncio.create_task(_mock_ea_with_random_delay())
 
-            # 3. Send 10 commands concurrently
             num_commands = 10
             tasks = []
             for i in range(num_commands):
@@ -319,7 +334,6 @@ class TestConcurrentCommands:
 
             results = await asyncio.gather(*tasks)
 
-            # 4. Verify all 10 responses with correct request_id matching
             assert len(results) == num_commands
 
             seen_indices = set()
@@ -327,11 +341,9 @@ class TestConcurrentCommands:
                 assert result["status"] == "ok"
                 assert "payload" in result
                 idx = result["payload"]["original_type"]
-                # The type is cmd_X, extract X
                 assert idx.startswith("cmd_")
                 seen_indices.add(int(idx.split("_")[1]))
 
-            # 5. Verify no responses are mixed up — all indices present
             assert seen_indices == set(range(num_commands))
 
             ea_writer.close()
@@ -347,7 +359,7 @@ class TestConcurrentCommands:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Connection timeout — client handles gracefully
+# Test 6: Connection timeout
 # ---------------------------------------------------------------------------
 
 
@@ -355,14 +367,12 @@ class TestConnectionTimeout:
     @pytest.mark.asyncio
     async def test_connection_refused_on_nonexistent_port(self):
         host = "127.0.0.1"
-        port = _free_port(50)  # unlikely to be in use
+        port = _free_port(50)
 
-        # 1. Try to connect TCP client to non-existent port
         client = TCPBridgeClient(host=host, port=port)
 
-        # 2. Verify ConnectionRefusedError (not hang)
-        with pytest.raises((ConnectionRefusedError, OSError)):
-            await asyncio.wait_for(client.connect(), timeout=5.0)
+        with pytest.raises((ConnectionError, ConnectionRefusedError, OSError)):
+            await asyncio.wait_for(client.connect(), timeout=10.0)
 
         await client.close()
 
@@ -371,16 +381,13 @@ class TestConnectionTimeout:
         host = "127.0.0.1"
         port = _free_port(51)
 
-        # 1. First attempt fails — no server
         client = TCPBridgeClient(host=host, port=port)
-        with pytest.raises((ConnectionRefusedError, OSError)):
-            await asyncio.wait_for(client.connect(), timeout=5.0)
+        with pytest.raises((ConnectionError, ConnectionRefusedError, OSError)):
+            await asyncio.wait_for(client.connect(), timeout=10.0)
         await client.close()
 
-        # 2. Start server
         server = await _start_mock_echo_server(host, port)
 
-        # 3. Verify subsequent connect attempt works
         client2 = TCPBridgeClient(host=host, port=port)
         await client2.connect()
         resp = await client2.send_command("echo", {"after_failure": True}, timeout=5.0)
@@ -391,7 +398,7 @@ class TestConnectionTimeout:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Idle connection — long idle stays alive
+# Test 7: Idle connection
 # ---------------------------------------------------------------------------
 
 
@@ -401,27 +408,20 @@ class TestIdleConnection:
         host = "127.0.0.1"
         port = _free_port(60)
 
-        # 1. Start echo server
         server = await _start_mock_echo_server(host, port)
 
-        # 2. Connect client
         client = TCPBridgeClient(host=host, port=port)
         await client.connect()
 
-        # Verify connection works initially
         resp1 = await client.send_command("ping", {"n": 1}, timeout=5.0)
         assert resp1["status"] == "ok"
 
-        # 3. Wait 2 seconds with no commands
         await asyncio.sleep(2)
 
-        # 4. Send command, verify it still works
         resp2 = await client.send_command("ping", {"n": 2}, timeout=5.0)
         assert resp2["status"] == "ok"
         assert resp2["echoed"] is True
 
-        # 5. Verify no stale connection errors
-        # Additional command to confirm connection is still healthy
         resp3 = await client.send_command("ping", {"n": 3}, timeout=5.0)
         assert resp3["status"] == "ok"
 
@@ -441,6 +441,113 @@ class TestIdleConnection:
             await asyncio.sleep(1)
             resp = await client.send_command("idle_test", {"round": i}, timeout=5.0)
             assert resp["status"] == "ok", f"Failed on round {i}"
+
+        await client.close()
+        await _shutdown_echo_server(server)
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Reconnect lifecycle and exponential backoff
+# ---------------------------------------------------------------------------
+
+
+class TestReconnectLifecycle:
+    @pytest.mark.asyncio
+    async def test_close_stops_reconnect_loop(self):
+        host = "127.0.0.1"
+        port = _free_port(90)
+        server = await _start_mock_echo_server(host, port)
+
+        client = TCPBridgeClient(host=host, port=port)
+        await client.connect()
+        assert client._running is True
+        assert client._reconnect_task is not None
+        assert not client._reconnect_task.done()
+
+        await client.close()
+
+        assert client._running is False
+        assert client._reconnect_task.done()
+
+        await _shutdown_echo_server(server)
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_exponential_backoff(self):
+        host = "127.0.0.1"
+        port = _free_port(91)
+
+        client = TCPBridgeClient(host=host, port=port)
+
+        delays_recorded: list[float] = []
+        original_sleep = asyncio.sleep
+
+        async def _record_sleep(delay: float):
+            delays_recorded.append(delay)
+            if len(delays_recorded) >= 5:
+                client._running = False
+            await original_sleep(0.01)
+
+        asyncio.sleep = _record_sleep
+
+        try:
+            client._running = True
+            client._reconnect_task = asyncio.create_task(
+                client._reconnect_loop(max_reconnect_delay=30.0)
+            )
+            await asyncio.sleep(0.5)
+            await client._reconnect_task
+        finally:
+            asyncio.sleep = original_sleep
+
+        assert len(delays_recorded) >= 4
+        for i in range(len(delays_recorded) - 1):
+            assert delays_recorded[i + 1] >= delays_recorded[i] * 1.5
+
+    @pytest.mark.asyncio
+    async def test_backoff_resets_on_successful_connection(self):
+        host = "127.0.0.1"
+        port = _free_port(92)
+
+        server = await _start_mock_echo_server(host, port)
+        try:
+            client = TCPBridgeClient(host=host, port=port)
+            await client.connect()
+
+            await client.send_command("ping", {"n": 1}, timeout=5.0)
+
+            await _shutdown_echo_server(server)
+            await asyncio.sleep(0.5)
+
+            server = await _start_mock_echo_server(host, port)
+            await asyncio.sleep(2.0)
+
+            resp = await client.send_command("ping", {"n": 2}, timeout=5.0)
+            assert resp["status"] == "ok"
+
+            await client.close()
+        finally:
+            await _shutdown_echo_server(server)
+
+    @pytest.mark.asyncio
+    async def test_reconnect_after_server_restart(self):
+        host = "127.0.0.1"
+        port = _free_port(93)
+
+        server = await _start_mock_echo_server(host, port)
+        client = TCPBridgeClient(host=host, port=port)
+        await client.connect()
+
+        resp1 = await client.send_command("test", {"v": 1}, timeout=5.0)
+        assert resp1["status"] == "ok"
+
+        await _shutdown_echo_server(server)
+        await asyncio.sleep(0.5)
+
+        server = await _start_mock_echo_server(host, port)
+        await asyncio.sleep(2.0)
+
+        resp2 = await client.send_command("test", {"v": 2}, timeout=5.0)
+        assert resp2["status"] == "ok"
 
         await client.close()
         await _shutdown_echo_server(server)

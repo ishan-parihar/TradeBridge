@@ -18,7 +18,17 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
+
+from .mistake_categories import MistakeCategory
+
+_MistakeCategoryInput = Optional[Union[MistakeCategory, str]]
+
+
+def _normalize_mistake_category(value: _MistakeCategoryInput) -> Optional[str]:
+    if value is None:
+        return None
+    return value.value if isinstance(value, MistakeCategory) else value
 
 
 class TradeJournalDB:
@@ -31,6 +41,7 @@ class TradeJournalDB:
         timestamp TEXT NOT NULL,
         session_id TEXT,
         strategy_id TEXT,
+        intent_id TEXT,
 
         symbol TEXT NOT NULL,
         side TEXT NOT NULL,
@@ -77,6 +88,7 @@ class TradeJournalDB:
     CREATE INDEX IF NOT EXISTS idx_emotional ON trade_decisions(emotional_self_report);
     CREATE INDEX IF NOT EXISTS idx_mistake ON trade_decisions(mistake_category);
     CREATE INDEX IF NOT EXISTS idx_timestamp ON trade_decisions(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_intent_id ON trade_decisions(intent_id);
     """
 
     def __init__(self, db_path: Optional[str] = None) -> None:
@@ -85,9 +97,21 @@ class TradeJournalDB:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(self.SCHEMA)
         self._conn.commit()
+
+        # Idempotent migration: add intent_id column if it doesn't exist
+        try:
+            self._conn.execute("ALTER TABLE trade_decisions ADD COLUMN intent_id TEXT")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intent_id ON trade_decisions(intent_id)"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     def log_decision(
         self,
@@ -104,6 +128,7 @@ class TradeJournalDB:
         duration_seconds: Optional[float] = None,
         session_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
+        intent_id: Optional[str] = None,
         # Market context
         regime: Optional[str] = None,
         atr_value: Optional[float] = None,
@@ -126,7 +151,7 @@ class TradeJournalDB:
         outcome: Optional[str] = None,
         lesson_learned: Optional[str] = None,
         would_do_differently: Optional[str] = None,
-        mistake_category: Optional[str] = None,
+        mistake_category: _MistakeCategoryInput = None,
         quality_rating: Optional[int] = None,
         decision_id: Optional[str] = None,
     ) -> str:
@@ -142,7 +167,7 @@ class TradeJournalDB:
         self._conn.execute(
             """
             INSERT INTO trade_decisions (
-                decision_id, timestamp, session_id, strategy_id,
+                decision_id, timestamp, session_id, strategy_id, intent_id,
                 symbol, side, action,
                 entry_price, exit_price, sl, tp, volume_lots, pnl, duration_seconds,
                 regime, atr_value, atr_percent_of_price, rsi_value, ema_fast, ema_slow,
@@ -152,7 +177,7 @@ class TradeJournalDB:
                 expected_duration, expected_move_points,
                 outcome, lesson_learned, would_do_differently, mistake_category, quality_rating
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?
@@ -163,6 +188,7 @@ class TradeJournalDB:
                 ts,
                 session_id,
                 strategy_id,
+                intent_id,
                 symbol,
                 side,
                 action,
@@ -179,10 +205,14 @@ class TradeJournalDB:
                 rsi_value,
                 ema_fast,
                 ema_slow,
-                json.dumps(indicator_snapshot) if indicator_snapshot else None,
+                json.dumps(indicator_snapshot, default=str)
+                if indicator_snapshot
+                else None,
                 current_volatility_state,
                 model_justification,
-                json.dumps(indicators_considered) if indicators_considered else None,
+                json.dumps(indicators_considered, default=str)
+                if indicators_considered
+                else None,
                 confidence_level,
                 risk_assessment,
                 emotional_self_report,
@@ -192,7 +222,7 @@ class TradeJournalDB:
                 outcome,
                 lesson_learned,
                 would_do_differently,
-                mistake_category,
+                _normalize_mistake_category(mistake_category),
                 quality_rating,
             ),
         )
@@ -216,6 +246,9 @@ class TradeJournalDB:
             "quality_rating",
             "emotional_self_report",
             "model_justification",
+            "intent_id",
+            "session_id",
+            "strategy_id",
         }
         filtered = {k: v for k, v in kwargs.items() if k in allowed_fields}
         if not filtered:
@@ -229,6 +262,93 @@ class TradeJournalDB:
         self._conn.commit()
         return True
 
+    def update_decision_outcome(
+        self,
+        decision_id: str,
+        *,
+        outcome: Optional[str] = None,
+        exit_price: Optional[float] = None,
+        pnl: Optional[float] = None,
+        duration_seconds: Optional[float] = None,
+        mistake_category: _MistakeCategoryInput = None,
+    ) -> bool:
+        cursor = self._conn.execute(
+            """
+            UPDATE trade_decisions
+            SET outcome = COALESCE(?, outcome),
+                exit_price = COALESCE(?, exit_price),
+                pnl = COALESCE(?, pnl),
+                duration_seconds = COALESCE(?, duration_seconds),
+                mistake_category = COALESCE(?, mistake_category)
+            WHERE decision_id = ?
+            """,
+            (
+                outcome,
+                exit_price,
+                pnl,
+                duration_seconds,
+                _normalize_mistake_category(mistake_category),
+                decision_id,
+            ),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def log_execution_result(
+        self,
+        symbol: str,
+        side: str,
+        action: str,
+        *,
+        intent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        exit_price: Optional[float] = None,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+        volume_lots: Optional[float] = None,
+        pnl: Optional[float] = None,
+        outcome: Optional[str] = None,
+        message: Optional[str] = None,
+        decision_id: Optional[str] = None,
+    ) -> str:
+        if decision_id is None:
+            decision_id = f"dec_{uuid.uuid4().hex[:12]}"
+
+        ts = datetime.now(timezone.utc).isoformat()
+
+        self._conn.execute(
+            """
+            INSERT INTO trade_decisions (
+                decision_id, timestamp, session_id, strategy_id, intent_id,
+                symbol, side, action,
+                entry_price, exit_price, sl, tp, volume_lots, pnl,
+                outcome, model_justification
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id,
+                ts,
+                session_id,
+                strategy_id,
+                intent_id,
+                symbol,
+                side,
+                action,
+                entry_price,
+                exit_price,
+                sl,
+                tp,
+                volume_lots,
+                pnl,
+                outcome,
+                message,
+            ),
+        )
+        self._conn.commit()
+        return decision_id
+
     def query(
         self,
         symbol: Optional[str] = None,
@@ -237,9 +357,10 @@ class TradeJournalDB:
         outcome: Optional[str] = None,
         regime: Optional[str] = None,
         emotional_self_report: Optional[str] = None,
-        mistake_category: Optional[str] = None,
+        mistake_category: _MistakeCategoryInput = None,
         session_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
+        intent_id: Optional[str] = None,
         min_confidence: Optional[float] = None,
         limit: int = 50,
         order_by: str = "timestamp DESC",
@@ -268,13 +389,16 @@ class TradeJournalDB:
             params.append(emotional_self_report)
         if mistake_category:
             conditions.append("mistake_category = ?")
-            params.append(mistake_category)
+            params.append(_normalize_mistake_category(mistake_category))
         if session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
         if strategy_id:
             conditions.append("strategy_id = ?")
             params.append(strategy_id)
+        if intent_id:
+            conditions.append("intent_id = ?")
+            params.append(intent_id)
         if min_confidence is not None:
             conditions.append("confidence_level >= ?")
             params.append(min_confidence)
@@ -472,6 +596,41 @@ class TradeJournalDB:
 
         return insights
 
+    def get_mistake_taxonomy(
+        self, lookback_days: Optional[int] = None
+    ) -> dict[str, int]:
+        from datetime import timedelta
+
+        taxonomy: dict[str, int] = {}
+        if lookback_days is not None:
+            since = datetime.now(timezone.utc)
+            cutoff = (since - timedelta(days=lookback_days)).isoformat()
+            rows = self._conn.execute(
+                """
+                SELECT mistake_category, COUNT(*) as count
+                FROM trade_decisions
+                WHERE timestamp > ? AND mistake_category IS NOT NULL
+                GROUP BY mistake_category
+                ORDER BY count DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT mistake_category, COUNT(*) as count
+                FROM trade_decisions
+                WHERE mistake_category IS NOT NULL
+                GROUP BY mistake_category
+                ORDER BY count DESC
+                """
+            ).fetchall()
+
+        for r in rows:
+            taxonomy[r["mistake_category"]] = r["count"]
+
+        return taxonomy
+
     def get_decision(self, decision_id: str) -> Optional[dict]:
         """Get a single decision by ID."""
         row = self._conn.execute(
@@ -492,4 +651,10 @@ def get_journal_db(db_path: Optional[str] = None) -> TradeJournalDB:
     global _journal_db
     if _journal_db is None:
         _journal_db = TradeJournalDB(db_path=db_path)
+    else:
+        # Test connection liveness — recreate if dead
+        try:
+            _journal_db._conn.execute("SELECT 1")
+        except Exception:
+            _journal_db = TradeJournalDB(db_path=db_path)
     return _journal_db

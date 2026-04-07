@@ -58,6 +58,7 @@ class TradingCoach:
         # Trade proposal
         proposed_sl_points: Optional[float] = None,
         proposed_tp_points: Optional[float] = None,
+        point: Optional[float] = None,
         entry_price: Optional[float] = None,
         # Agent context
         indicator_agreements: Optional[int] = None,
@@ -133,7 +134,11 @@ class TradingCoach:
 
         # ====== SL/TP ANALYSIS (data-driven, not arbitrary) ======
         if proposed_sl_points is not None and atr_value is not None and atr_value > 0:
-            sl_atr = proposed_sl_points / atr_value
+            # Convert SL from points to price units for proper comparison with ATR
+            sl_in_price = (
+                proposed_sl_points * point if point is not None else proposed_sl_points
+            )
+            sl_atr = sl_in_price / atr_value
             advice.raw_metrics["sl_atr_ratio"] = round(sl_atr, 2)
 
             # What % of recent bars would this SL have survived?

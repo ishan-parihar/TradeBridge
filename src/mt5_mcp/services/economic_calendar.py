@@ -608,14 +608,7 @@ def _compute_event_dates(rule: str, year: int, month: int) -> list[date]:
             date(year, month, calendar.monthrange(year, month)[1])
         ],
         "end_of_month_plus_1": lambda: [
-            date(
-                year,
-                month,
-                min(
-                    calendar.monthrange(year, month)[1],
-                    calendar.monthrange(year, month)[1],
-                ),
-            )
+            date(year + (month // 12), (month % 12) + 1, 1)
         ],
         "monthly": lambda: [_first_business_day(year, month)],
         "monthly_gdp": lambda: [
@@ -847,7 +840,7 @@ def get_daily_briefing(utc_now: Optional[datetime] = None) -> dict:
     hours_remaining = (end_of_day - utc_now).total_seconds() / 3600
 
     today_events = get_upcoming_events(
-        hours_ahead=max(1, hours_remaining),
+        hours_ahead=int(max(1, hours_remaining)),
         min_impact="MEDIUM",
         utc_now=utc_now,
     )

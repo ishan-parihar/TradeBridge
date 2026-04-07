@@ -154,6 +154,15 @@ def ensure_servers_running() -> None:
         asyncio.run(ensure_servers_running_async())
 
 
+# Ownership fields for all write-path tool schemas (optional, not in required)
+_OWNERSHIP_PROPERTIES: dict[str, Any] = {
+    "session_id": {"type": "string"},
+    "strategy_id": {"type": "string"},
+    "intent_id": {"type": "string"},
+    "idempotency_key": {"type": "string"},
+    "magic_number": {"type": ["number", "string"]},
+}
+
 _NUMERIC_FIELDS: dict[str, set[str]] = {
     "get_bars": {"count"},
     "deals_history": {"limit", "days"},
@@ -273,6 +282,17 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
         "timeout_seconds",
         "alert_at_pnl",
         "alert_at_price",
+    },
+    # Agent wait/timer tools
+    "tools/wait/delay": {"duration_seconds"},
+    "tools/wait/indicator": {
+        "value",
+        "period",
+        "fast",
+        "slow",
+        "signal",
+        "timeout_seconds",
+        "check_interval_seconds",
     },
     # Economic calendar
     "economic_calendar": {"hours_ahead"},
@@ -1006,6 +1026,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "deviation_points": {"type": ["number", "string"]},
                 "sl": {"type": ["number", "string", "null"]},
                 "tp": {"type": ["number", "string", "null"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": [
                 "intent_id",
@@ -1055,6 +1076,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "deviation_points": {"type": ["number", "string"]},
                 "sl": {"type": ["number", "string", "null"]},
                 "tp": {"type": ["number", "string", "null"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": [
                 "intent_id",
@@ -1104,6 +1126,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "sl": {"type": ["number", "string", "null"]},
                 "tp": {"type": ["number", "string", "null"]},
                 "deviation": {"type": ["number", "string"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": ["symbol", "side", "kind", "price", "volume_lots"],
         },
@@ -1135,6 +1158,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "new_price": {"type": ["number", "string", "null"]},
                 "new_sl": {"type": ["number", "string", "null"]},
                 "new_tp": {"type": ["number", "string", "null"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": ["order_id"],
         },
@@ -1164,6 +1188,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "position_id": {"type": "string"},
                 "sl": {"type": ["number", "string", "null"]},
                 "tp": {"type": ["number", "string", "null"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": ["position_id"],
         },
@@ -1191,6 +1216,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "properties": {
                 "position_id": {"type": "string"},
                 "volume": {"type": ["number", "string", "null"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": ["position_id"],
         },
@@ -1218,6 +1244,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "properties": {
                 "symbol": {"type": ["string", "null"]},
                 "side": {"type": "string"},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": [],
         },
@@ -1239,7 +1266,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         ),
         "schema": {
             "type": "object",
-            "properties": {"order_id": {"type": "string"}},
+            "properties": {"order_id": {"type": "string"}, **_OWNERSHIP_PROPERTIES},
             "required": ["order_id"],
         },
     },
@@ -1265,6 +1292,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "properties": {
                 "symbol": {"type": ["string", "null"]},
                 "side": {"type": "string"},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": [],
         },
@@ -1336,6 +1364,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "tp_atr_multiplier": {"type": ["number", "string"]},
                 "strategy_id": {"type": "string"},
                 "rationale": {"type": ["string", "null"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": ["symbol", "buy_trigger", "sell_trigger", "volume_lots"],
         },
@@ -1369,6 +1398,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "distance_atr_multiplier": {"type": ["number", "string"]},
                 "check_interval_seconds": {"type": ["number", "string"]},
                 "lock_in_profit_after_atr": {"type": ["number", "string"]},
+                **_OWNERSHIP_PROPERTIES,
             },
             "required": ["position_id"],
         },
@@ -1495,6 +1525,80 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "timeout_seconds": {"type": ["number", "string"]},
             },
             "required": ["position_id"],
+        },
+    },
+    # === AGENT WAIT/TIMER TOOLS ===
+    "tools/wait/delay": {
+        "description": (
+            "What: Pauses execution for a specified duration. Use this in trading loops to wait between analysis cycles.\n"
+            "\n"
+            "Input:\n"
+            "  - duration_seconds: Integer. How long to wait. Default: 60. Range: 1-3600.\n"
+            "\n"
+            "Output: {waited_seconds: int, resumed_at: string}\n"
+            "  - resumed_at is ISO 8601 UTC timestamp.\n"
+            "\n"
+            "Assumptions:\n"
+            "  - Blocks the connection for the full duration.\n"
+            "  - Use for simple waits: 'wait 5 minutes then recheck market conditions'.\n"
+            "  - For event-driven waits (price levels, indicator values), use tools/wait/indicator instead.\n"
+            "\n"
+            "Composition: Use in loops: analyze → wait/delay(300) → analyze again. Alternative to polling get_bars() repeatedly."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "duration_seconds": {"type": ["number", "string"]},
+            },
+            "required": [],
+        },
+    },
+    "tools/wait/indicator": {
+        "description": (
+            "What: Long-polling wait until a technical indicator reaches a target value or condition.\n"
+            "\n"
+            "Input:\n"
+            "  - symbol: String. MT5 symbol name.\n"
+            '  - timeframe: String. Default: "H1".\n'
+            '  - indicator: String. Same as get_indicator(): "rsi", "macd", "cci", "atr", "adx", "sma", "ema", etc.\n'
+            '  - condition: String. "above", "below", "crosses", or "equals".\n'
+            "  - value: Float. Target indicator value.\n"
+            "  - period, fast, slow, signal: Integer | null. Indicator parameters (same as get_indicator).\n"
+            "  - timeout_seconds: Integer. Max wait time. Default: 300 (5 minutes). Range: 10-3600.\n"
+            "  - check_interval_seconds: Integer. Polling interval. Default: 5. Range: 1-60.\n"
+            "\n"
+            "Output: {symbol, indicator, condition, target_value, actual_value: float|null, triggered: bool, timed_out: bool}\n"
+            "  - triggered: true if condition was met before timeout.\n"
+            "  - timed_out: true if timeout elapsed without trigger.\n"
+            "  - actual_value: Indicator value at trigger (or last sampled on timeout).\n"
+            "\n"
+            "Assumptions:\n"
+            "  - Blocks the HTTP connection for up to timeout_seconds.\n"
+            "  - Indicator is sampled at check_interval_seconds intervals.\n"
+            "  - 'equals' uses 0.1% tolerance for floating-point comparison.\n"
+            "  - 'crosses' returns immediately on first indicator update (use with caution).\n"
+            "\n"
+            "Composition: Use for event-driven entries: 'wait until RSI drops below 30, then buy'. Alternative to polling get_indicator() in a loop."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "indicator": {"type": "string"},
+                "condition": {
+                    "type": "string",
+                    "enum": ["above", "below", "crosses", "equals"],
+                },
+                "value": {"type": ["number", "string"]},
+                "period": {"type": ["number", "string", "null"]},
+                "fast": {"type": ["number", "string", "null"]},
+                "slow": {"type": ["number", "string", "null"]},
+                "signal": {"type": ["number", "string", "null"]},
+                "timeout_seconds": {"type": ["number", "string"]},
+                "check_interval_seconds": {"type": ["number", "string"]},
+            },
+            "required": ["symbol", "indicator", "condition", "value"],
         },
     },
     # === METACOGNITION TOOLS ===
@@ -2065,6 +2169,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             res = await _post_json("/resources/market/wait_for_price", args)
         elif name == "resources/positions/monitor":
             res = await _post_json("/resources/positions/monitor", args)
+        # Agent wait/timer tools
+        elif name == "tools/wait/delay":
+            res = await _post_json("/tools/wait/delay", args)
+        elif name == "tools/wait/indicator":
+            res = await _post_json("/tools/wait/indicator", args)
         # IGS-MCP News & Macro
         elif name == "news_fetch":
             # Default to FINANCIAL_MARKETS pool if not specified
