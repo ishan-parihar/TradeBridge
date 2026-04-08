@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
-from typing import Literal, Optional
+from pydantic import BaseModel, field_validator
+from typing import Literal, Optional, Union
 
 
 class OwnershipMixin(BaseModel):
@@ -100,6 +100,7 @@ class SubmitPendingOrderRequest(OwnershipMixin):
     sl: float | None = None
     tp: float | None = None
     deviation: int = 20
+    trail_config: dict | None = None
 
 
 class CancelOrderRequest(OwnershipMixin):
@@ -213,6 +214,21 @@ class CorrelationMatrixRequest(BaseModel):
     lookback: int = 50
 
 
+class TrailConfig(OwnershipMixin):
+    """Auto-trailing stop configuration for order submission.
+
+    When provided with a market or pending order, trailing activates
+    immediately after the order fills. The EA expects flat JSON fields
+    in the order command (trail_atr_multiplier, etc.), NOT nested.
+    """
+
+    atr_multiplier: float = 2.0
+    lock_profit_atr: float = 1.0
+    check_interval_seconds: int = 10
+    atr_timeframe: str = "H1"
+    atr_period: int = 14
+
+
 # --- Phase 3: Bracket Orders ---
 
 
@@ -304,11 +320,25 @@ class EABracketStartRequest(OwnershipMixin):
     in order comments for recovery after EA restart.
     """
 
-    buy_order_ticket: str  # BUY pending order ticket (0 if single-leg bracket)
-    sell_order_ticket: str  # SELL pending order ticket (0 if single-leg bracket)
+    buy_order_ticket: Union[
+        int, str
+    ]  # BUY pending order ticket (0 if single-leg bracket)
+    sell_order_ticket: Union[
+        int, str
+    ]  # SELL pending order ticket (0 if single-leg bracket)
     bracket_id: str  # Unique identifier for this bracket pair
-    comment: str = ""  # Additional comment to embed in orders
-    magic_filter: int = 0  # 0 = no filter, >0 = only manage orders with this magic
+    comment: Optional[str] = ""  # Additional comment to embed in orders
+    magic_filter: Optional[int] = (
+        0  # 0 = no filter, >0 = only manage orders with this magic
+    )
+
+    @field_validator("buy_order_ticket", "sell_order_ticket", mode="before")
+    @classmethod
+    def coerce_tickets_to_str(cls, v):
+        """Coerce int ticket values to str for compatibility with EA bridge."""
+        if v is not None:
+            return str(v)
+        return v
 
 
 class EABracketStopRequest(OwnershipMixin):

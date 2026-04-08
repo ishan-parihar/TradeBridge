@@ -197,6 +197,7 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
         "equity",
     },
     "validate_trade_setup": {"volume_lots", "entry_price", "sl", "tp"},
+    "portfolio/risk": {"days", "limit"},
     "trail_position": {"distance_points", "lock_in_points"},
     "volatility_profile": {"lookback", "atr_period"},
     "correlation_matrix": {"lookback"},
@@ -267,6 +268,7 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
         "sl_atr_multiplier",
         "tp_atr_multiplier",
     },
+    "ea_bracket/start": {"buy_order_ticket", "sell_order_ticket", "magic_filter"},
     # New: Trailing stops
     "set_trailing_stop": {
         "distance_atr_multiplier",
@@ -294,6 +296,7 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
         "timeout_seconds",
         "check_interval_seconds",
     },
+    "tools/wait/trade_monitor": {"check_interval_seconds"},
     # Economic calendar
     "economic_calendar": {"hours_ahead"},
 }
@@ -344,25 +347,17 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     # === DATA TOOLS ===
     "get_bars": {
         "description": (
-            "What: Fetches OHLCV candle data for a symbol and timeframe via the MT5 EA bridge.\n"
+            "What: Fetches OHLCV candle data for a symbol/timeframe via the MT5 EA bridge.\n"
             "\n"
-            "Input:\n"
-            '  - symbol: String. MT5 symbol name (e.g. "XAUUSD", "EURUSD", "US30"). Normalized internally.\n'
-            '  - timeframe: String. Valid values: "M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN".\n'
-            "  - count: Integer. Number of candles to return. Default: 100. Maximum: 5000.\n"
+            "When: Use for fetching price history for technical analysis, indicator computation, chart visualization, or pattern recognition. Prefer over get_ticks() for historical/candle-level analysis; use get_ticks() for sub-candle precision.\n"
             "\n"
-            'Output: {symbol, timeframe, data: [{timestamp, open, high, low, close, volume, spread}], source: "tcp"|"bridge"}\n'
-            "  - Timestamps are broker server time (not UTC). Convert using symbol_info() for timezone offset.\n"
-            "  - Returns {data: []} if symbol is invalid or bridge is disconnected (no error raised).\n"
-            "  - Spread field is in points, not absolute price.\n"
+            "Output: {symbol: str, timeframe: str, data: [{timestamp: int, open: float, high: float, low: float, close: float, volume: int, spread: int}], source: 'tcp'|'bridge'}\n"
+            "  - Timestamps are broker server time (not UTC). Spread is in points. Volume is tick volume (price changes count).\n"
+            "  - Returns {data: []} if symbol invalid or bridge disconnected (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Data includes only regular trading sessions (no gaps for holidays; MT5 fills with last-known values).\n"
-            "  - Close price is unadjusted (no split/dividend adjustment \u2014 forex/crypto don't have these).\n"
-            "  - Volume is tick volume (number of price changes), not real traded volume (MT5 limitation).\n"
-            "  - Bridge latency: ~15-25ms via TCP, ~200-600ms via HTTP fallback.\n"
+            "Assumptions: Max count=5000. Data includes only regular trading sessions (MT5 fills gaps with last-known values). Close prices are unadjusted. Bridge latency: ~15-25ms TCP, ~200-600ms HTTP fallback. Do NOT call repeatedly in tight loops — cache results.\n"
             "\n"
-            "Composition: Primary input for get_indicator(), volatility_profile(), market/regime(), support_resistance()."
+            "Composition: Primary input for get_indicator(), volatility_profile(), market/regime(), support_resistance(). Call bridge_status() first to verify connectivity. Chain → get_bars() → get_indicator() for full technical analysis."
         ),
         "schema": {
             "type": "object",
@@ -376,48 +371,21 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     },
     "get_indicator": {
         "description": (
-            "What: Computes a technical indicator from MT5's built-in calculation engine.\n"
+            "What: Computes a technical indicator using MT5's built-in calculation engine.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - timeframe: String. Valid: "M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN".\n'
-            '  - indicator: String. Valid: "sma", "ema", "wma", "smma", "rsi", "macd", "bbands", "stoch", "atr", "adx", "dmi", "ichimoku", "obv", "cci".\n'
-            "  - period: Integer | null. Lookback window. Default varies by indicator (see below).\n"
-            "  - fast, slow, signal: Integer | null. MACD-specific parameters. Defaults: 12, 26, 9.\n"
-            "  - deviation: Float | null. Bollinger Bands standard deviation multiplier. Default: 2.\n"
-            "  - k_period, d_period, slowing: Integer | null. Stochastic parameters. Defaults: 5, 3, 3.\n"
-            "  - tenkan, kijun, senkou: Integer | null. Ichimoku parameters. Defaults: 9, 26, 52.\n"
-            "  - shift: Integer | null. Shift the indicator line N bars into the past.\n"
-            "  - window: Integer | null. Number of indicator values to return (from most recent). Omit for single latest value.\n"
-            "\n"
-            "Default indicator defaults applied server-side:\n"
-            "  - sma/ema: period=20\n"
-            "  - rsi: period=14\n"
-            "  - macd: fast=12, slow=26, signal=9\n"
-            "  - bbands: period=20, deviation=2\n"
-            "  - atr: period=14\n"
-            "  - adx/dmi: period=14\n"
-            "  - stoch: k_period=5, d_period=3, slowing=3\n"
-            "  - ichimoku: tenkan=9, kijun=26, senkou=52\n"
-            "  - cci: period=14\n"
+            "When: Use for computing specific technical indicators (RSI, MACD, EMA, BBands, ATR, ADX, Stochastic, Ichimoku, etc.) for entry/exit signals, crossover detection, or multi-indicator confluence. Prefer over manual Python calculation for accuracy and speed.\n"
             "\n"
             "Output: Shape varies by indicator:\n"
             "  - Single value (no window): {symbol, timeframe, indicator, value: float, data: [float], period: int}\n"
-            "  - Series (with window): {symbol, timeframe, indicator, data: [float], period: int} where data[0] is oldest, data[-1] is most recent.\n"
+            "  - Series (with window): {symbol, timeframe, indicator, data: [float], period: int} — data[0]=oldest, data[-1]=newest\n"
             "  - MACD: {main: [float], signal: [float], histogram: [float]}\n"
-            "  - Bollinger Bands: {upper: [float], middle: [float], lower: [float]}\n"
-            "  - Stochastic: {k: [float], d: [float]}\n"
-            "  - ADX: {adx: [float], plus_di: [float], minus_di: [float]}\n"
-            "  - Ichimoku: {tenkan: [float], kijun: [float], senkou_a: [float], senkou_b: [float], chikou: [float]}\n"
+            "  - BBands: {upper: [float], middle: [float], lower: [float]}\n"
+            "  - Stoch: {k: [float], d: [float]}. ADX: {adx, plus_di, minus_di}. Ichimoku: {tenkan, kijun, senkou_a, senkou_b, chikou}\n"
+            "  - Returns {value: 0, data: []} if symbol invalid (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Computed server-side by MT5 terminal (not Python). Uses MT5's native algorithms.\n"
-            "  - When window is provided, the first N values for any indicator may be unreliable (warmup period). RSI needs period+1 bars, MACD needs ~100 bars for convergence.\n"
-            "  - Returns {value: 0, data: []} if symbol is invalid or timeframe is unsupported (no error).\n"
-            "  - data array is sorted oldest\u2192newest.\n"
-            "  - Returns empty result for invalid indicator names.\n"
+            "Assumptions: Computed server-side by MT5 terminal. First N values of window series are unreliable (warmup: RSI needs period+1 bars, MACD needs ~100 bars). Use window=N to fetch series in one call instead of looping. Returns empty result for invalid indicator names.\n"
             "\n"
-            "Composition: Takes output from get_bars() conceptually (but computes independently). Input for market/regime(), volatility_profile(), trading/coach(), build_chart() overlays."
+            "Composition: Chains after get_bars() conceptually. Input for market/regime(), volatility_profile(), trading/coach(), multi_timeframe_indicators(). Typical flow: get_bars() → get_indicator() → trading/decision_support() → execute."
         ),
         "schema": {
             "type": "object",
@@ -446,21 +414,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Fetches recent tick data (bid/ask/last price updates) for a symbol.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - count: Integer. Number of ticks to return. Default: 200. Maximum: 2000.\n"
+            "When: Use for precise entry timing, bid/ask spread analysis, micro-price movement detection between candle closes, or tick volume spike confirmation. Prefer over get_bars() for sub-candle granularity.\n"
             "\n"
-            'Output: {symbol, ticks: [{time, bid, ask, last, volume, flags}], source: "tcp"|"bridge"}\n'
-            "  - Time is broker server time (Unix timestamp).\n"
-            "  - Bid/ask/last are raw price values. Spread = ask - bid.\n"
-            "  - Volume is tick volume for that individual tick.\n"
+            "Output: {symbol: str, ticks: [{time: int, bid: float, ask: float, last: float, volume: int, flags: int}], source: 'tcp'|'bridge'}\n"
+            "  - Time is Unix timestamp. Spread = ask - bid. Returns empty ticks array when market closed.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Only available during market hours. Returns empty ticks array when market is closed.\n"
-            "  - Maximum lookback is limited by MT5 terminal's internal tick buffer (~few thousand ticks).\n"
-            "  - Returns empty array for invalid symbols (no error).\n"
+            "Assumptions: Only available during market hours. Max lookback limited by MT5 terminal's tick buffer (~few thousand ticks). Max count=2000. Do NOT poll in rapid succession — use resources/market/wait_for_price() for event-driven waits.\n"
             "\n"
-            "Composition: Use for precise entry timing. Complements get_bars() for sub-candle analysis."
+            "Composition: Complements get_bars() for sub-candle analysis. Chain → get_ticks() → precise entry timing → submit_market_order(). Use economic_calendar() to verify market is open before calling."
         ),
         "schema": {
             "type": "object",
@@ -473,24 +434,17 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     },
     "symbol_info": {
         "description": (
-            "What: Fetches symbol metadata: contract specifications, trading constraints, and pricing parameters.\n"
+            "What: Fetches symbol metadata: contract specs, trading constraints, and pricing parameters.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
+            "When: Use before calculate_position_size(), validate_trade_setup(), or any execution to get point size, volume limits, stopsLevel (min SL/TP distance), and margin rate. Required for understanding symbol-specific constraints.\n"
             "\n"
-            "Output: {symbol, point, tick_size, tick_value, volume_min, volume_max, volume_step, stopsLevel, spread, margin_rate, trade_mode, ...}\n"
-            "  - point: Smallest price increment (e.g. 0.01 for XAUUSD, 0.00001 for EURUSD).\n"
-            "  - tick_size/tick_value: Used for position sizing calculations.\n"
-            "  - volume_min/volume_max/volume_step: Lot size constraints.\n"
-            "  - stopsLevel: Minimum distance (in points) for SL/TP from current price.\n"
-            "  - spread: Current spread in points.\n"
+            "Output: {symbol: str, point: float, tick_size: float, tick_value: float, volume_min: float, volume_max: float, volume_step: float, stopsLevel: int, spread: int, margin_rate: float, trade_mode: str, ...}\n"
+            "  - point: smallest price increment. stopsLevel: min SL/TP distance in points. volume_step: lot size granularity.\n"
+            "  - Returns {symbol: '<input>', error: '...'} if not found.\n"
             "\n"
-            "Assumptions:\n"
-            '  - Returns {symbol: "<input>", error: "..."} if symbol not found (check for error key).\n'
-            "  - Values may change during market open/close transitions.\n"
-            "  - Margin rate is broker-specific and may differ from theoretical.\n"
+            "Assumptions: Values may change during market open/close transitions. Margin rate is broker-specific. Check for 'error' key in response.\n"
             "\n"
-            "Composition: Required input for calculate_position_size(). Use before validate_trade_setup()."
+            "Composition: Required input for calculate_position_size(). Use before validate_trade_setup(). Chain → symbol_info() → calculate_position_size() → validate_trade_setup() → execute."
         ),
         "schema": {
             "type": "object",
@@ -502,22 +456,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Fetches executed deal (fill) history from the MT5 terminal.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String | null. Filter by symbol. Omit for all symbols.\n"
-            "  - limit: Integer. Maximum deals to return. Default: 100.\n"
-            "  - days: Integer. Lookback window in days. Default: 30.\n"
+            "When: Use for reviewing past trade fills, analyzing entry/exit prices, computing realized P&L, or feeding performance_summary(). Prefer over positions_open() for historical closed trades.\n"
             "\n"
-            "Output: {deals: [{deal_id, order_id, symbol, side, volume, price, commission, swap, profit, time, type, entry}], total: int}\n"
-            "  - profit is in account currency.\n"
-            '  - type: "deal_type_buy", "deal_type_sell", "deal_type_balance", etc.\n'
-            '  - entry: "deal_entry_in", "deal_entry_out", "deal_entry_inout".\n'
+            "Output: {deals: [{deal_id: int, order_id: int, symbol: str, side: str, volume: float, price: float, commission: float, swap: float, profit: float, time: int, type: str, entry: str}], total: int}\n"
+            "  - profit in account currency. type: deal_type_buy/sell/balance. entry: deal_entry_in/out/inout.\n"
+            "  - Returns empty deals array if no matches (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Only includes closed deals (fills), not pending orders.\n"
-            "  - Returns empty deals array if no matching deals (no error).\n"
-            "  - History depth limited by MT5 terminal settings (typically 1-3 months).\n"
+            "Assumptions: Only includes closed deals (fills), not pending orders. History depth limited by MT5 terminal settings (typically 1-3 months). Default: last 100 deals, 30 days.\n"
             "\n"
-            "Composition: Input for performance_summary(). Use with trading/reflect() to correlate decisions with outcomes."
+            "Composition: Input for performance_summary(). Chain → deals_history() → performance_summary() → trading/insights() for full performance analysis. Use with trading/reflect() to correlate decisions with outcomes."
         ),
         "schema": {
             "type": "object",
@@ -533,22 +480,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Computes realized trading performance metrics from deal history.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String | null. Filter by symbol. Omit for all.\n"
-            "  - limit: Integer. Max deals to analyze. Default: 100.\n"
-            "  - days: Integer. Lookback in days. Default: 30.\n"
+            "When: Use for quantitative performance review — win rate, profit factor, max drawdown, avg holding time. Prefer over manual calculation from deals_history() for pre-aggregated stats.\n"
             "\n"
-            "Output: {total_trades, winning_trades, losing_trades, win_rate, total_profit, avg_win, avg_loss, profit_factor, max_drawdown, avg_holding_time, ...}\n"
-            "  - All monetary values in account currency.\n"
-            "  - win_rate: winning_trades / total_trades (0.0-1.0).\n"
-            "  - profit_factor: gross_profit / gross_loss.\n"
-            "\n"
-            "Assumptions:\n"
-            "  - Only includes closed deals (realized P&L).\n"
+            "Output: {total_trades: int, winning_trades: int, losing_trades: int, win_rate: float, total_profit: float, avg_win: float, avg_loss: float, profit_factor: float, max_drawdown: float, avg_holding_time: str, ...}\n"
+            "  - All monetary values in account currency. win_rate: 0.0-1.0. profit_factor: gross_profit/gross_loss.\n"
             "  - Returns zero-valued metrics if no deals found (no error).\n"
-            "  - Max drawdown is peak-to-trough from the deal series, not account-wide.\n"
             "\n"
-            "Composition: Input for trading/insights(). Use with trading/reflect() for performance review."
+            "Assumptions: Only includes closed deals (realized P&L). Max drawdown is peak-to-trough from the deal series, not account-wide. Default: 100 deals, 30 days.\n"
+            "\n"
+            "Composition: Consumes deals_history() internally. Input for trading/insights(). Chain → deals_history() → performance_summary() → trading/insights() for progressive analysis."
         ),
         "schema": {
             "type": "object",
@@ -564,20 +504,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Fetches the current order book (Depth of Market / DOM) snapshot for a symbol.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
+            "When: Use for assessing liquidity depth before large orders, detecting order book imbalances for short-term bias, or verifying current bid/ask spread before market execution. Prefer over get_ticks() for multi-level depth analysis.\n"
             "\n"
-            "Output: {symbol, bids: [{price, volume}], asks: [{price, volume}], timestamp: int}\n"
-            "  - bids sorted highest\u2192lowest price. asks sorted lowest\u2192highest.\n"
-            "  - Volume is in lots.\n"
-            "  - Timestamp is Unix epoch.\n"
+            "Output: {symbol: str, bids: [{price: float, volume: float}], asks: [{price: float, volume: float}], timestamp: int}\n"
+            "  - bids sorted highest→lowest, asks lowest→highest. Volume in lots. Returns {bids: [], asks: []} for symbols without DOM (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Only available for symbols with exchange-traded order book data (not all forex pairs support DOM).\n"
-            "  - Returns {bids: [], asks: []} for symbols without order book data (no error).\n"
-            "  - Snapshot is stale by the time received; MT5 does not stream real-time DOM.\n"
+            "Assumptions: Only available for exchange-traded symbols (not all forex pairs support DOM). Snapshot is stale by receipt time — MT5 does not stream real-time DOM. Do NOT poll continuously.\n"
             "\n"
-            "Composition: Use with validate_trade_setup() for liquidity assessment. Complements get_ticks() for bid/ask analysis."
+            "Composition: Use with validate_trade_setup() for liquidity assessment. Complements get_ticks() for bid/ask analysis. Chain → get_order_book() → validate_trade_setup() → submit_market_order()."
         ),
         "schema": {
             "type": "object",
@@ -587,80 +521,67 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     },
     "account_summary": {
         "description": (
-            "What: Fetches current trading account state.\n"
+            "What: Fetches current trading account state (balance, equity, margin, leverage).\n"
             "\n"
-            "Input: None.\n"
+            "When: Use before any trade to verify available margin and equity, during active sessions to monitor account health, or as input for calculate_position_size(). Prefer as first call in any trading cycle.\n"
             "\n"
-            "Output: {account_id, name, balance, equity, margin, free_margin, currency, leverage, margin_level, ...}\n"
-            "  - balance: Realized P&L (closed positions only).\n"
-            "  - equity: balance + unrealized P&L (open positions).\n"
-            "  - margin: Used margin for open positions.\n"
-            "  - free_margin: equity - margin (available for new trades).\n"
-            "  - margin_level: (equity / margin) \u00d7 100. Below 100% = no new positions. Below margin_call_level = liquidation risk.\n"
+            "Output: {account_id: int, name: str, balance: float, equity: float, margin: float, free_margin: float, currency: str, leverage: int, margin_level: float, ...}\n"
+            "  - balance: realized P&L. equity: balance + unrealized P&L. margin_level: (equity/margin)×100. Below 100% = no new positions.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Returns partial data with null fields if bridge is disconnected.\n"
-            "  - Values reflect real-time account state at call time.\n"
-            "  - Currency is the account's base currency (not symbol-specific).\n"
+            "Assumptions: Returns partial data with null fields if bridge disconnected. Values reflect real-time state at call time. Currency is account's base currency. Do NOT call in tight loops.\n"
             "\n"
-            "Composition: Required input for calculate_position_size() (equity field). Use before any execution tool."
+            "Composition: Required input for calculate_position_size() (equity field). Call before any execution tool. Chain → account_summary() → calculate_position_size() → validate_trade_setup() → submit_market_order()."
         ),
         "schema": {"type": "object"},
     },
     "positions_open": {
         "description": (
-            "What: Lists all currently open positions.\n"
+            "What: Lists all currently open positions with P&L, SL/TP, entry details, health metrics, and time-based exit data.\n"
             "\n"
-            "Input: None.\n"
+            "When: Use before placing new orders to assess current exposure, monitoring open position P&L during active trades, or identifying position IDs for SL/TP modifications or closures. Prefer over polling for state awareness.\n"
             "\n"
-            "Output: {positions: [{position_id, symbol, side, volume, entry_price, sl, tp, mark_price, profit, swap, commission, time, magic, comment}], count: int}\n"
-            "  - mark_price: Current market price for the position's symbol.\n"
-            "  - profit: Unrealized P&L in account currency.\n"
-            "  - sl/tp: May be 0.0 if no stop is set.\n"
+            "Output: {positions: [{position_id: int, symbol: str, side: str, volume: float, entry_price: float, sl: float, tp: float, mark_price: float, profit: float, swap: float, commission: float, time: int, magic: int, comment: str, health: object, time_health: object}], count: int, sync_status: object}\n"
+            "  - mark_price: current market price. profit: unrealized P&L in account currency. sl/tp: 0.0 if not set.\n"
+            "  - health: {distance_to_sl_pips, distance_to_tp_pips, pnl_percent_of_risk, time_in_trade_minutes, time_in_trade_bars_h1, is_winning, is_at_breakeven, trail_eligible, spread_cost_pips, profit_multiple_of_spread}\n"
+            "  - time_health: {is_registered, bars_elapsed, bars_remaining, min_profit_points, current_profit_points} — requires PositionTimeManager EA\n"
+            "  - sync_status: {positions_count, last_sync_age_ms, retry_count, stale_warning} — if stale_warning is true, data was stale on first attempt; reconcile before trading\n"
+            "  - Returns empty positions array if none open (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Returns empty positions array if no open positions (no error).\n"
-            "  - Positions are from the connected account only.\n"
-            "  - magic field identifies the strategy/EA that opened the position.\n"
+            "Assumptions: Positions from connected account only. magic field identifies strategy/EA. Do NOT poll continuously — use resources/positions/monitor() for event-driven alerts. If sync_status.stale_warning is true, treat as Degraded mode (Phase 1).\n"
             "\n"
-            "Composition: Use before execution to check exposure. Input for modify_position_sl_tp(), close_position(), trailing stop tools."
+            "Composition: Input for modify_position_sl_tp(), close_position(), trailing stop tools. Chain → positions_open() → modify_position_sl_tp() or close_position(). Use portfolio/risk() for portfolio-level view. Use position.health fields for trailing decisions instead of manual computation."
         ),
         "schema": {"type": "object"},
     },
     "orders_pending": {
         "description": (
-            "What: Lists all pending (unfilled) orders.\n"
+            "What: Lists all pending (unfilled) orders with type, price, and status.\n"
             "\n"
-            "Input: None.\n"
+            "When: Use before placing pending orders to avoid duplicates, monitoring pending order status, or identifying order IDs for cancellation/modification. Prefer over positions_open() for unfilled orders.\n"
             "\n"
-            "Output: {orders: [{order_id, symbol, side, kind, price, volume, sl, tp, time, expiration, status}], count: int}\n"
-            '  - kind: "buy_limit", "sell_limit", "buy_stop", "sell_stop".\n'
-            '  - status: "pending", "partially_filled", etc.\n'
+            "Output: {orders: [{order_id: int, symbol: str, side: str, kind: str, price: float, volume: float, sl: float, tp: float, time: int, expiration: int, status: str}], count: int}\n"
+            "  - kind: 'buy_limit', 'sell_limit', 'buy_stop', 'sell_stop'. status: 'pending', 'partially_filled', etc.\n"
+            "  - Returns empty orders array if none pending (no error). Does NOT include open positions.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Returns empty orders array if no pending orders (no error).\n"
-            "  - Does NOT include open positions \u2014 use positions_open for those.\n"
-            "  - Expired or cancelled orders are not included.\n"
+            "Assumptions: Expired/cancelled orders excluded. Pending orders may fill, expire, or be cancelled between calls. Do NOT poll in tight loops.\n"
             "\n"
-            "Composition: Use before submit_pending_order() to avoid duplicates. Input for cancel_order(), modify_order()."
+            "Composition: Input for cancel_order(), modify_order(). Chain → orders_pending() → cancel_order() or modify_order(). Use ea_bracket/list() for EA-managed brackets."
         ),
         "schema": {"type": "object"},
     },
     "bridge_status": {
         "description": (
-            "What: Fetches the MT5 EA bridge heartbeat status.\n"
+            "What: Fetches the MT5 EA bridge heartbeat status (connectivity, trade permission, last heartbeat).\n"
             "\n"
-            "Input: None.\n"
+            "When: Use as the FIRST call in any automated trading cycle to verify infrastructure health before data or execution calls. Essential pre-flight check.\n"
             "\n"
-            "Output: {connected: bool, login: int, server: string, trade_allowed: bool, last_heartbeat: int, ...}\n"
-            "  - last_heartbeat: Unix timestamp of last EA heartbeat. Age > 30s indicates disconnection risk.\n"
-            "  - trade_allowed: false during market close, weekend, or terminal error.\n"
+            "Output: {connected: bool, login: int, server: str, trade_allowed: bool, last_heartbeat: int, ...}\n"
+            "  - last_heartbeat: Unix timestamp. Age > 30s indicates disconnection risk. trade_allowed: false during market close/weekend/terminal error.\n"
+            "  - Returns {connected: false} if gateway unreachable (no error raised).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Returns {connected: false} if gateway is unreachable (no error raised).\n"
-            "  - Does not verify actual trading capability \u2014 only EA connectivity.\n"
+            "Assumptions: Verifies EA connectivity only, not actual trading capability. Does not validate account permissions or broker restrictions.\n"
             "\n"
-            "Composition: Call first in any automated trading cycle to verify infrastructure health."
+            "Composition: Call first before any other tool. Chain → bridge_status() → if connected: account_summary() → positions_open() → analysis → execute."
         ),
         "schema": {"type": "object"},
     },
@@ -669,22 +590,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Computes a volatility summary for a symbol, combining ATR and bar-range analysis.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - timeframe: String. Valid timeframe string.\n"
-            "  - lookback: Integer. Number of bars to analyze. Default: 20. Max: 500.\n"
-            "  - atr_period: Integer. ATR calculation period. Default: 14. Valid: 2-500.\n"
+            "When: Use for assessing whether current volatility suits your strategy, setting SL distances via ATR multiples, detecting volatility squeezes preceding breakouts, or comparing volatility across symbols. Prefer over manual ATR calculation.\n"
             "\n"
-            'Output: {symbol, timeframe, atr: {value, pct_of_price, raw}, avg_bar_range, max_bar_range, min_bar_range, spread_analysis: {avg_spread_points, max_spread_points}, volatility_regime: "low"|"normal"|"high"|"extreme"}\n'
-            "  - atr.pct_of_price: ATR as percentage of current price (for cross-symbol comparison).\n"
-            "  - volatility_regime is computed relative to the symbol's own historical ATR distribution.\n"
+            "Output: {symbol: str, timeframe: str, atr: {value: float, pct_of_price: float, raw: float}, avg_bar_range: float, max_bar_range: float, min_bar_range: float, spread_analysis: {avg_spread_points: int, max_spread_points: int}, volatility_regime: 'low'|'normal'|'high'|'extreme'}\n"
+            "  - atr.pct_of_price enables cross-symbol comparison. volatility_regime is relative to symbol's own historical ATR distribution.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Requires get_bars() and get_indicator(atr) internally. Returns partial data if either fails.\n"
-            "  - Spread analysis uses current spread, not historical spread distribution.\n"
-            "  - Returns zero-valued output if symbol has no price data.\n"
+            "Assumptions: Uses get_bars() and get_indicator(atr) internally. Returns partial data if either fails. Spread analysis uses current spread, not historical. Default: lookback=20, atr_period=14.\n"
             "\n"
-            "Composition: Takes symbol+timeframe from get_bars(). Input for trading/context(), calculate_position_size() (indirectly via ATR)."
+            "Composition: Input for trading/context(), calculate_position_size() (indirectly via ATR), market/regime(). Chain → volatility_profile() → set appropriate SL distances → validate_trade_setup()."
         ),
         "schema": {
             "type": "object",
@@ -701,22 +614,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Computes a single indicator across multiple timeframes in one call.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - indicator: String. Same valid values as get_indicator().\n"
-            '  - timeframes: Array[String]. List of timeframes (e.g. ["M15", "H1", "H4", "D1"]). Maximum: 8.\n'
-            "  - period, fast, slow, signal, deviation, etc.: Same as get_indicator(). Applied uniformly across all timeframes.\n"
+            "When: Use for checking indicator alignment across timeframes for confluence, confirming higher timeframe trend before lower timeframe entries, or detecting timeframe divergence. Prefer over calling get_indicator() N times.\n"
             "\n"
-            "Output: {symbol, indicator, readings: {timeframe: {value, data, ...}}}\n"
-            "  - Each timeframe's value has the same structure as get_indicator()'s single-value output.\n"
-            '  - If a timeframe fails, that key contains {error: "..."}.\n'
+            "Output: {symbol: str, indicator: str, readings: {timeframe: {value: float, data: [float], ...}}}\n"
+            "  - Each timeframe's value matches get_indicator()'s single-value output. Failed timeframes contain {error: str}.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Each timeframe is computed independently (sequential calls under the hood).\n"
-            "  - Total latency \u2248 N \u00d7 single-timeframe latency (not parallelized).\n"
-            "  - All timeframes use the same indicator parameters.\n"
+            "Assumptions: Each timeframe computed independently (sequential, not parallelized). Max 8 timeframes. Total latency ≈ N × single-call latency. All timeframes use same indicator parameters. Default indicator params apply.\n"
             "\n"
-            "Composition: Alternative to calling get_indicator() N times. Input for confluence analysis across timeframes."
+            "Composition: Batch alternative to N × get_indicator(). Input for confluence analysis. Chain → multi_timeframe_indicators() → confirm alignment → trading/decision_support() → execute."
         ),
         "schema": {
             "type": "object",
@@ -748,21 +653,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Computes the Pearson correlation matrix of close-price returns across multiple symbols.\n"
             "\n"
-            "Input:\n"
-            "  - symbols: Array[String]. List of MT5 symbol names. Minimum: 2. Maximum: 10.\n"
-            '  - timeframe: String. Timeframe for price data. Default: "H1".\n'
-            "  - lookback: Integer. Number of bars for correlation. Default: 50. Min: 10.\n"
+            "When: Use before opening positions on multiple symbols to assess combined risk, detecting hidden correlation in a diversified portfolio, or adjusting position sizes for correlated exposures. Require ≥2 symbols.\n"
             "\n"
-            "Output: {timeframe, lookback, matrix: {symbol_a: {symbol_b: correlation, ...}, ...}}\n"
-            "  - Correlation values range -1.0 to 1.0.\n"
-            "  - Diagonal (self-correlation) is always 1.0.\n"
+            "Output: {timeframe: str, lookback: int, matrix: {symbol_a: {symbol_b: float, ...}, ...}}\n"
+            "  - Correlation values -1.0 to 1.0. Diagonal (self-correlation) always 1.0.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Uses percentage returns, not raw prices, for stationarity.\n"
-            "  - If symbols have different trading hours, correlation may be artificially low.\n"
-            "  - Requires sufficient overlapping bars; returns reduced matrix if symbols have mismatched data.\n"
+            "Assumptions: Uses percentage returns (not raw prices) for stationarity. Min 2, max 10 symbols. If symbols have different trading hours, correlation may be artificially low. Default: timeframe=H1, lookback=50.\n"
             "\n"
-            "Composition: Use before opening multiple positions to detect correlated risk exposure. Takes data from get_bars() for each symbol."
+            "Composition: Input for portfolio/risk() correlation analysis. Chain → correlation_matrix() → if |corr| > 0.7, reduce position sizes → validate_trade_setup() with correlation_warning."
         ),
         "schema": {
             "type": "object",
@@ -781,21 +679,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Detects support and resistance levels from recent price action using swing high/low clustering.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - timeframe: String. Valid timeframe. Default: "H1".\n'
-            "  - lookback: Integer. Bars to scan. Default: 100. Min: 20.\n"
+            "When: Use for identifying entry zones near support (buys) or resistance (sells), setting SL beyond S/R for invalidation-based exits, placing bracket order triggers beyond key levels, or setting TP at next resistance/support.\n"
             "\n"
-            'Output: {symbol, support_levels: [float], resistance_levels: [float], method: "swing_highs_lows", timeframe, lookback}\n'
-            "  - Levels are sorted by proximity to current price (closest first).\n"
-            "  - Empty arrays if insufficient data or no swings detected.\n"
+            "Output: {symbol: str, support_levels: [float], resistance_levels: [float], method: 'swing_highs_lows', timeframe: str, lookback: int}\n"
+            "  - Levels sorted by proximity to current price (closest first). Empty arrays if insufficient data. Min lookback=20, default=100.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Uses a swing window of max(2, min(5, lookback/10)) bars for swing detection.\n"
-            "  - Levels are price levels, not zones (no width/band provided).\n"
-            "  - Does NOT use volume profile, pivot points, or Fibonacci \u2014 only price-based swing detection.\n"
+            "Assumptions: Uses swing window of max(2, min(5, lookback/10)) bars. Levels are price points (not zones with width). Does NOT use volume profile, pivots, or Fibonacci — only price-based swing detection. Not reliable in strongly trending markets.\n"
             "\n"
-            "Composition: Takes output from get_bars(). Input for SL/TP placement, breakout trigger levels, bracket order triggers."
+            "Composition: Takes get_bars() data internally. Input for SL/TP placement, bracket order triggers, breakout levels. Chain → support_resistance() → use levels for entry/SL/TP → place_bracket_order() or submit_pending_order()."
         ),
         "schema": {
             "type": "object",
@@ -809,24 +700,17 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     },
     "market/regime": {
         "description": (
-            "What: Classifies the current market state into one of four regimes based on ADX and EMA alignment.\n"
+            "What: Classifies the current market state into one of four regimes: ranging, trending_up, trending_down, or compressing.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - timeframe: String. Valid timeframe string.\n"
-            "  - lookback: Integer. Bars to analyze. Default: 20.\n"
-            "  - atr_period: Integer. ATR period for volatility context. Default: 14.\n"
+            "When: Use before every trade to select appropriate strategy for current conditions, filter trade signals (only trend trades in trending regimes), or adjust position sizing (reduce in ranging/compressing). Essential pre-trade check.\n"
             "\n"
-            'Output: {symbol, timeframe, regime: "ranging"|"trending_up"|"trending_down"|"compressing", confidence: float, adx: float, ema_fast: float, ema_slow: float, atr: float}\n'
-            "  - confidence: 0.0-1.0, based on ADX strength and EMA separation.\n"
-            "  - compressing: Low volatility squeeze (narrowing Bollinger Bands + low ATR).\n"
+            "Output: {symbol: str, timeframe: str, regime: 'ranging'|'trending_up'|'trending_down'|'compressing', confidence: float, adx: float, ema_fast: float, ema_slow: float, atr: float}\n"
+            "  - confidence: 0.0-1.0 based on ADX strength and EMA separation. compressing = low volatility squeeze.\n"
+            "  - Returns {regime: 'ranging', confidence: 0.0} if data insufficient.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Classification uses ADX threshold and EMA(20)/EMA(50) crossover logic internally.\n"
-            "  - Regime is valid only for the specified timeframe; a symbol can be trending on H4 and ranging on M15.\n"
-            '  - Returns {regime: "ranging", confidence: 0.0} if data is insufficient.\n'
+            "Assumptions: Uses ADX threshold + EMA(20)/EMA(50) crossover logic. Regime valid only for specified timeframe — a symbol can be trending on H4 and ranging on M15. Default: lookback=20, atr_period=14.\n"
             "\n"
-            "Composition: Takes output from get_bars() + get_indicator(adx). Input for trading/coach(), trading/decision_support(), strategy selection."
+            "Composition: Input for trading/coach(), trading/decision_support(), strategy selection. Chain → market/regime() → select strategy → trading/coach() → execute."
         ),
         "schema": {
             "type": "object",
@@ -843,21 +727,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Performs a multi-symbol market scan, returning price, ATR, and regime for each symbol.\n"
             "\n"
-            "Input:\n"
-            "  - symbols: Array[String]. List of MT5 symbol names. Maximum: 20.\n"
-            '  - timeframe: String. Timeframe for analysis. Default: "H1".\n'
-            "  - atr_period: Integer. ATR period. Default: 14.\n"
+            "When: Use for screening a watchlist of symbols for trading opportunities, identifying which symbols are in favorable regimes, quick market overview before a trading session, or filtering symbols by volatility. Max 20 symbols.\n"
             "\n"
-            "Output: {symbols: [{symbol, price, atr, atr_pct, regime, recommendation}], timeframe}\n"
-            "  - recommendation: Generated suggestion based on regime + ATR context (not a trade signal).\n"
-            "  - Each symbol's data is computed independently.\n"
+            "Output: {symbols: [{symbol: str, price: float, atr: float, atr_pct: float, regime: str, recommendation: str}], timeframe: str}\n"
+            "  - recommendation: informational suggestion based on regime+ATR (not a trade signal). Invalid symbols return {symbol, error: str}.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Sequential processing: latency scales linearly with symbol count.\n"
-            '  - If a symbol is invalid, its entry contains {symbol, error: "..."}.\n'
-            "  - Recommendation is informational, not prescriptive.\n"
+            "Assumptions: Sequential processing — latency scales linearly with symbol count. Recommendation is informational, not prescriptive. Default: timeframe=H1, atr_period=14.\n"
             "\n"
-            "Composition: Batch alternative to calling get_bars() + market/regime() per symbol. Use for watchlist screening."
+            "Composition: Batch alternative to get_bars() + market/regime() per symbol. Chain → market/scan() → filter by regime → trading/context() on selected symbols → execute."
         ),
         "schema": {
             "type": "object",
@@ -872,25 +749,16 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     # === VISUALIZATION TOOLS ===
     "get_chart_screenshot": {
         "description": (
-            "What: Captures a screenshot of the MT5 chart for a specific symbol and timeframe.\n"
+            "What: Captures a screenshot of the MT5 chart for a symbol/timeframe as base64-encoded PNG.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - timeframe: String. Valid timeframe. Determines which chart is captured.\n"
-            "  - width: Integer. Image width in pixels. Default: 1280. Range: 640-3840.\n"
-            "  - height: Integer. Image height in pixels. Default: 720. Range: 480-2160.\n"
+            "When: Use for visual verification of chart patterns/indicators, generating visual reports for human review, or debugging indicator overlay configurations. NOT for automated price analysis — use get_bars()/get_indicator() instead.\n"
             "\n"
-            'Output: {image_base64: string, content_type: "image/png"}\n'
-            "  - image_base64 is the full PNG encoded as base64. Decode before use.\n"
-            "  - Typical file size: 200KB-2MB depending on resolution.\n"
+            "Output: {image_base64: str, content_type: 'image/png'}\n"
+            "  - image_base64 is full PNG encoded as base64 (200KB-2MB). Returns empty string if capture fails (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Screenshot reflects the chart as configured in the MT5 terminal (indicators, templates applied by the EA).\n"
-            "  - If MT5 terminal is minimized or headless, the image may be blank or low-quality.\n"
-            '  - Returns {image_base64: ""} if chart capture fails (no error raised).\n'
-            "  - Latency: 1-5 seconds (screenshot capture and encoding).\n"
+            "Assumptions: Screenshot reflects chart as configured in MT5 terminal (indicators, templates applied by EA). If MT5 is minimized or headless, image may be blank/low-quality. Latency: 1-5 seconds. Default: 1280×720.\n"
             "\n"
-            "Composition: Takes symbol+timeframe context from get_bars(). Feeds into visual analysis pipelines or Telegram reports."
+            "Composition: Takes symbol+timeframe from get_bars() context. Feeds into visual analysis pipelines or Telegram reports. Chain → get_chart_screenshot() → visual analysis → decision."
         ),
         "schema": {
             "type": "object",
@@ -908,27 +776,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Calculates optimal position size (in lots) using fixed-fractional risk model.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - entry_price: Float. Planned entry price.\n"
-            "  - stop_loss_price: Float. Planned stop-loss price.\n"
-            "  - risk_percent: Float. Percentage of account equity to risk. Range: 0.01-10.0 (0.01% to 10%).\n"
-            "  - equity: Float | null. Account equity. If null, fetches from account_summary() automatically.\n"
+            "When: Use before every trade to determine correct position size for risk management, when SL distance is known and risk_percent is defined by strategy, or comparing position sizes across symbols with different contract specs.\n"
             "\n"
-            "Output: {symbol, lot_size: float, dollar_risk: float, risk_reward_ratio: float, pip_value: float, margin_required: float, warnings: [string]}\n"
-            "  - lot_size: Rounded to symbol's volume_step (e.g. 0.01 for standard lots).\n"
-            "  - dollar_risk: Absolute USD risk amount (entry - SL) \u00d7 lot_size \u00d7 tick_value.\n"
-            "  - Warnings include: lot exceeds max_volume, SL too close to stopsLevel, risk > 5% of equity.\n"
+            "Output: {symbol: str, lot_size: float, dollar_risk: float, risk_reward_ratio: float, pip_value: float, margin_required: float, warnings: [str]}\n"
+            "  - lot_size: rounded to symbol's volume_step. Warnings include: lot exceeds max_volume, SL too close to stopsLevel, risk > 5% equity.\n"
+            "  - Formula: lot_size = (equity × risk% / 100) / |entry - SL| / tick_value, rounded to volume_step.\n"
             "\n"
-            "Formula: Fixed fractional \u2014 lot_size = (equity \u00d7 risk_percent / 100) / |entry - SL| / tick_value, then rounded to volume_step.\n"
+            "Assumptions: Does NOT account for slippage, commissions, swap, or gap risk. Single position only — no portfolio-level correlation adjustments. If entry == SL, returns lot_size: 0. Uses live symbol_info() for contract specs. If equity null, fetches from account_summary().\n"
             "\n"
-            "Assumptions:\n"
-            "  - Does NOT account for slippage, commissions, swap, or gap risk.\n"
-            "  - Single position only \u2014 no portfolio-level correlation adjustments.\n"
-            "  - If entry_price == stop_loss_price, returns lot_size: 0 with error warning.\n"
-            "  - Uses live symbol_info() for tick_value, volume_step, volume_max constraints.\n"
-            "\n"
-            "Composition: Takes equity from account_summary(). Uses symbol_info() for contract specs. Input for submit_market_order_via_bridge() volume_lots parameter."
+            "Composition: Takes equity from account_summary(). Uses symbol_info() for contract specs. Output feeds submit_market_order_via_bridge(volume_lots). Chain → account_summary() → calculate_position_size() → validate_trade_setup() → execute."
         ),
         "schema": {
             "type": "object",
@@ -946,27 +802,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Validates a proposed trade against broker constraints and market conditions.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - side: String. "buy" or "sell".\n'
-            '  - order_kind: String. "market", "limit", or "stop".\n'
-            "  - volume_lots: Float. Planned position size.\n"
-            "  - entry_price: Float | null. For limit/stop orders. Ignored for market orders (uses current market price).\n"
-            "  - sl: Float | null. Planned stop-loss price.\n"
-            "  - tp: Float | null. Planned take-profit price.\n"
+            "When: MANDATORY pre-flight check before any order submission. Use for verifying SL/TP distances comply with broker's stopsLevel, checking margin requirements, or detecting correlated portfolio exposure.\n"
             "\n"
-            "Output: {symbol, bid: float, ask: float, valid: bool, errors: [string], warnings: [string], required_margin: float}\n"
-            "  - valid: true only if errors array is empty.\n"
-            "  - errors: Hard violations (e.g. volume below minimum, SL within stopsLevel, insufficient margin).\n"
-            "  - warnings: Soft advisories (e.g. SL/TP ratio unusual, high spread, market close approaching).\n"
-            "  - required_margin: Estimated margin for this trade.\n"
+            "Output: {symbol: str, bid: float, ask: float, valid: bool, errors: [str], warnings: [str], required_margin: float, correlation_warning: {has_exposure: bool, same_symbol_positions: int, correlated_positions: [{symbol, correlation, existing_volume}], warning: str|null}}\n"
+            "  - valid: true only if errors array empty. correlation_warning: warns if existing positions on same/correlated symbol (>0.7).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Checks against LIVE broker constraints (stopsLevel, min_volume, max_volume, margin requirements).\n"
-            "  - Market price fetched from order book at call time \u2014 may differ from execution price.\n"
-            "  - Does NOT validate strategy logic (only mechanical constraints).\n"
+            "Assumptions: Checks against LIVE broker constraints (stopsLevel, min/max volume, margin). Market price fetched at call time — may differ from execution price. Does NOT validate strategy logic (only mechanical constraints). correlation_warning uses static correlation matrix for major forex pairs.\n"
             "\n"
-            "Composition: Takes order book data via get_order_book() internally. Call before any submit_*_order tool."
+            "Composition: Call after calculate_position_size(), before any submit_*_order. Chain → calculate_position_size() → validate_trade_setup() → if valid: submit_market_order_via_bridge()."
         ),
         "schema": {
             "type": "object",
@@ -982,36 +825,43 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["symbol", "side", "order_kind", "volume_lots"],
         },
     },
+    "portfolio/risk": {
+        "description": (
+            "What: Portfolio-wide risk analysis — aggregates exposure, concentration, and correlation across all open positions.\n"
+            "\n"
+            "When: Use before adding new positions to assess portfolio-wide impact, during periodic portfolio review to identify concentration risk, or when understanding net directional exposure (USD-long vs USD-short). Prefer over validate_trade_setup() for multi-position analysis.\n"
+            "\n"
+            "Output: {total_exposure_usd: float, net_exposure_usd: float, exposure_by_symbol: [{symbol: str, exposure_usd: float, net_exposure_usd: float, margin_usd: float}], risk_metrics: {concentration_ratio: float, max_single_position_pct: float, correlated_pairs: [{symbol_a: str, symbol_b: str, correlation: float}]}}\n"
+            "  - total_exposure_usd: sum of absolute correlated exposure. correlated_pairs: pairs with |corr| > 0.5.\n"
+            "  - Returns zeroed output if no open positions.\n"
+            "\n"
+            "Assumptions: Uses static correlation matrix for major forex pairs. Symbols outside matrix treated as uncorrelated. Default: 7 days lookback, 100 position limit.\n"
+            "\n"
+            "Composition: Uses positions_open() and account_summary() internally. Complements validate_trade_setup() (single-position vs portfolio-level). Chain → portfolio/risk() → if concentration high → reduce new position size → execute."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": ["string", "null"]},
+                "days": {"type": ["number", "string"]},
+                "limit": {"type": ["number", "string"]},
+            },
+            "required": [],
+        },
+    },
     # === EXECUTION TOOLS ===
     "submit_market_order_via_bridge": {
         "description": (
-            "What: Submits a market order through the MT5 EA bridge.\n"
+            "What: Submits a market order through the MT5 EA bridge with full audit trail.\n"
             "\n"
-            "Input:\n"
-            "  - intent_id: String. Unique identifier for tracking this order (e.g. UUID).\n"
-            "  - strategy_id: String. Strategy name for audit trail.\n"
-            '  - account_id: String. Target account identifier (e.g. "demo").\n'
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - side: String. "buy" or "sell".\n'
-            '  - order_kind: String. Must be "market".\n'
-            "  - volume_lots: Float. Position size in lots. Must be within symbol's volume_min to volume_max, aligned to volume_step.\n"
-            "  - sl: Float | null. Stop-loss price. Recommended but not required.\n"
-            "  - tp: Float | null. Take-profit price.\n"
-            "  - deviation_points: Integer. Maximum acceptable slippage in points. Default: 20.\n"
+            "When: Use for immediate market entry when signal conditions are met, executing trades with auto-trailing stop via trail_config, or placing orders with pre-attached SL/TP for risk-managed entries.\n"
             "\n"
-            'Output: {intent_id, status: "submitted"|"error", adapter: string, broker_order_id: string, retcode: string, message: string, raw: object}\n'
-            '  - status: "submitted" on success, "error" on failure.\n'
-            '  - retcode: MT5 trade return code label (e.g. "DONE", "REJECTED", "INVALID_STOPS", "NO_MONEY").\n'
-            "  - On error, broker_order_id may be empty. Check raw for MT5 retcode details.\n"
+            "Output: {intent_id: str, status: 'submitted'|'error', adapter: str, broker_order_id: str, retcode: str, message: str, raw: object}\n"
+            "  - retcode: MT5 trade return code ('DONE', 'REJECTED', 'INVALID_STOPS', 'NO_MONEY', etc.). On error, broker_order_id may be empty.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Gated by TradingPolicy engine: may be rejected if daily trade limit, loss limit, or other policy rules are triggered.\n"
-            "  - Order is sent via TCP bridge (preferred) or HTTP fallback. Execution latency: ~15-25ms TCP, ~200-600ms HTTP.\n"
-            "  - Market orders fill at current market price \u2014 slippage is possible, bounded by deviation_points.\n"
-            "  - If SL/TP provided, they are attached to the position simultaneously with entry.\n"
-            "  - Does NOT validate SL/TP distance against stopsLevel \u2014 use validate_trade_setup() first.\n"
+            "Assumptions: Gated by TradingPolicy engine (daily trade limit, loss limit, etc.). TCP bridge: ~15-25ms, HTTP fallback: ~200-600ms. SL/TP attached simultaneously with entry. Does NOT validate SL/TP against stopsLevel — use validate_trade_setup() first.\n"
             "\n"
-            "Composition: Input volume_lots from calculate_position_size(). Check with validate_trade_setup() before calling."
+            "Composition: Takes volume_lots from calculate_position_size(). Must call validate_trade_setup() first. Chain → validate_trade_setup() → if valid: submit_market_order_via_bridge() → trading/log_decision()."
         ),
         "schema": {
             "type": "object",
@@ -1026,42 +876,39 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "deviation_points": {"type": ["number", "string"]},
                 "sl": {"type": ["number", "string", "null"]},
                 "tp": {"type": ["number", "string", "null"]},
-                **_OWNERSHIP_PROPERTIES,
+                "trail_config": {
+                    "type": "object",
+                    "properties": {
+                        "atr_multiplier": {"type": "number", "default": 2.0},
+                        "lock_profit_atr": {"type": "number", "default": 1.0},
+                        "check_interval_seconds": {"type": "integer", "default": 10},
+                        "atr_timeframe": {"type": "string", "default": "H1"},
+                        "atr_period": {"type": "integer", "default": 14},
+                    },
+                    "description": (
+                        "Auto-trailing stop configuration. If provided, trailing activates "
+                        "immediately after order fill. EA-side — persistent, survives all restarts. "
+                        "ATR timeframe defaults to H1 but can be customized per position (M15 for faster trailing on volatile instruments, H4 for slower trailing on trends, D1 for swing positions). "
+                        "EA expects flat JSON fields."
+                    ),
+                },
             },
-            "required": [
-                "intent_id",
-                "strategy_id",
-                "account_id",
-                "symbol",
-                "side",
-                "order_kind",
-                "volume_lots",
-            ],
+            "required": ["intent_id", "symbol", "side", "volume_lots"],
         },
     },
     "submit_market_order": {
         "description": (
-            "What: Submits a market order (alternate endpoint with simplified parameters).\n"
+            "Legacy alias. Prefer submit_market_order_via_bridge for consistency.\n"
             "\n"
-            "Input:\n"
-            "  - intent_id: String. Unique tracking identifier.\n"
-            "  - strategy_id: String. Strategy name.\n"
-            "  - account_id: String. Account identifier.\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - side: String. "buy" or "sell".\n'
-            '  - order_kind: String. Must be "market".\n'
-            "  - volume_lots: Float. Position size.\n"
-            "  - sl: Float | null. Stop-loss price.\n"
-            "  - tp: Float | null. Take-profit price.\n"
-            "  - deviation_points: Integer. Max slippage in points. Default: 20.\n"
+            "What: Submits a market order (alternate endpoint, functionally identical to submit_market_order_via_bridge).\n"
             "\n"
-            "Output: Same as submit_market_order_via_bridge.\n"
+            "When: Same scenarios as submit_market_order_via_bridge — immediate market entry with audit trail. Pick one endpoint for consistency; do NOT use both in the same strategy.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Functionally identical to submit_market_order_via_bridge. Both route through the same execution gateway.\n"
-            "  - Subject to TradingPolicy gates.\n"
+            "Output: {intent_id: str, status: 'submitted'|'error', adapter: str, broker_order_id: str, retcode: str, message: str, raw: object} — identical to submit_market_order_via_bridge.\n"
             "\n"
-            "Composition: See submit_market_order_via_bridge."
+            "Assumptions: Functionally identical to submit_market_order_via_bridge. Both route through same execution gateway. Subject to TradingPolicy gates.\n"
+            "\n"
+            "Composition: Same chain as submit_market_order_via_bridge: validate_trade_setup() → submit_market_order() → trading/log_decision()."
         ),
         "schema": {
             "type": "object",
@@ -1076,6 +923,20 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "deviation_points": {"type": ["number", "string"]},
                 "sl": {"type": ["number", "string", "null"]},
                 "tp": {"type": ["number", "string", "null"]},
+                "trail_config": {
+                    "type": "object",
+                    "properties": {
+                        "atr_multiplier": {"type": "number", "default": 2.0},
+                        "lock_profit_atr": {"type": "number", "default": 1.0},
+                        "check_interval_seconds": {"type": "integer", "default": 10},
+                        "atr_timeframe": {"type": "string", "default": "H1"},
+                        "atr_period": {"type": "integer", "default": 14},
+                    },
+                    "description": (
+                        "Auto-trailing stop configuration. If provided, trailing activates "
+                        "immediately after order fill. EA expects flat JSON fields."
+                    ),
+                },
                 **_OWNERSHIP_PROPERTIES,
             },
             "required": [
@@ -1093,27 +954,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Submits a pending (limit or stop) order to the MT5 terminal.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - side: String. "buy" or "sell".\n'
-            '  - kind: String. "limit" or "stop".\n'
-            "  - price: Float. Trigger price for the pending order.\n"
-            "  - volume_lots: Float. Position size in lots.\n"
-            "  - sl: Float | null. Stop-loss (set when order fills).\n"
-            "  - tp: Float | null. Take-profit (set when order fills).\n"
-            "  - deviation: Integer. Maximum slippage in points. Default: 20.\n"
+            "When: Use for placing limit orders at support/resistance levels for better entry prices, setting stop orders for breakout entries, or scheduling entries at specific price levels without monitoring the market.\n"
             "\n"
-            'Output: {status: "placed"|"error", order_id: int, message: string, raw: object}\n'
-            "  - order_id: MT5 order ticket number. Use with modify_order() and cancel_order().\n"
-            "  - On error, order_id is null. Check raw for details.\n"
+            "Output: {status: 'placed'|'error', order_id: int|null, message: str, raw: object}\n"
+            "  - order_id: MT5 order ticket number for use with modify_order() and cancel_order(). Null on error.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Pending orders are subject to the same stopsLevel constraints as market orders.\n"
-            "  - If price is too close to current market (within stopsLevel), order is rejected.\n"
-            "  - SL/TP are attached when the order fills, not when placed.\n"
-            "  - Order may expire if the symbol has an expiration policy set by the broker.\n"
+            "Assumptions: Subject to stopsLevel constraints — price too close to current market will be rejected. SL/TP attach when order fills, not when placed. Order may expire per broker's expiration policy.\n"
             "\n"
-            'Composition: Input price from support_resistance() levels. Use validate_trade_setup(order_kind="limit"/"stop") before calling.'
+            "Composition: Input price from support_resistance() levels. Chain → support_resistance() → validate_trade_setup(order_kind='limit'/'stop') → submit_pending_order() → ea_bracket/start() for OCO management."
         ),
         "schema": {
             "type": "object",
@@ -1126,6 +974,22 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "sl": {"type": ["number", "string", "null"]},
                 "tp": {"type": ["number", "string", "null"]},
                 "deviation": {"type": ["number", "string"]},
+                "trail_config": {
+                    "type": "object",
+                    "properties": {
+                        "atr_multiplier": {"type": "number", "default": 2.0},
+                        "lock_profit_atr": {"type": "number", "default": 1.0},
+                        "check_interval_seconds": {"type": "integer", "default": 10},
+                        "atr_timeframe": {"type": "string", "default": "H1"},
+                        "atr_period": {"type": "integer", "default": 14},
+                    },
+                    "description": (
+                        "Auto-trailing stop configuration. If provided, trailing activates "
+                        "immediately after order fill. EA-side — persistent, survives all restarts. "
+                        "ATR timeframe defaults to H1 but can be customized per position (M15 for faster trailing on volatile instruments, H4 for slower trailing on trends, D1 for swing positions). "
+                        "EA expects flat JSON fields."
+                    ),
+                },
                 **_OWNERSHIP_PROPERTIES,
             },
             "required": ["symbol", "side", "kind", "price", "volume_lots"],
@@ -1135,21 +999,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Modifies a pending order's price, stop-loss, or take-profit.\n"
             "\n"
-            "Input:\n"
-            "  - order_id: String. MT5 pending order ticket number.\n"
-            "  - new_price: Float | null. New trigger price. Omit to keep current.\n"
-            "  - new_sl: Float | null. New stop-loss. Omit to keep current.\n"
-            "  - new_tp: Float | null. New take-profit. Omit to keep current.\n"
+            "When: Use for adjusting pending order trigger price as market conditions change, updating SL/TP on pending orders before they fill, or moving limit orders closer to market as price approaches.\n"
             "\n"
-            'Output: {status: "modified"|"error", message: string, raw: object}\n'
+            "Output: {status: 'modified'|'error', message: str, raw: object}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Only works on PENDING orders, not open positions. Use modify_position_sl_tp() for positions.\n"
-            "  - New price must still respect stopsLevel distance from current market.\n"
-            "  - Providing all null fields results in no modification.\n"
-            "  - If order has already filled, returns error (order no longer pending).\n"
+            "Assumptions: Only works on PENDING orders, NOT open positions (use modify_position_sl_tp() for those). New price must respect stopsLevel distance from current market. All null fields = no modification. If order already filled, returns error.\n"
             "\n"
-            "Composition: Use after orders_pending() to identify the target order_id."
+            "Composition: Use after orders_pending() to identify target order_id. Chain → orders_pending() → modify_order() → verify via orders_pending()."
         ),
         "schema": {
             "type": "object",
@@ -1167,20 +1023,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Adjusts the stop-loss and/or take-profit on an open position.\n"
             "\n"
-            "Input:\n"
-            "  - position_id: String. MT5 position ticket number.\n"
-            "  - sl: Float | null. New stop-loss price. Null to remove SL (if broker allows).\n"
-            "  - tp: Float | null. New take-profit price. Null to remove TP (if broker allows).\n"
+            "When: Use for moving SL to breakeven after favorable price movement, adjusting TP targets based on new support/resistance levels, or implementing manual trailing stop by progressively moving SL.\n"
             "\n"
-            'Output: {status: "modified"|"error", message: string, raw: object}\n'
+            "Output: {status: 'modified'|'error', message: str, raw: object}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Works on OPEN positions only. Use modify_order() for pending orders.\n"
-            "  - SL/TP must respect stopsLevel distance from current market price.\n"
-            "  - Setting sl=null may remove the stop entirely (broker-dependent).\n"
-            "  - Partial modifications are allowed (e.g. change SL but keep TP).\n"
+            "Assumptions: Works on OPEN positions only (use modify_order() for pending orders). SL/TP must respect stopsLevel from current market price. Setting sl=null may remove stop entirely (broker-dependent). Partial modifications allowed (change SL but keep TP).\n"
             "\n"
-            "Composition: Input position_id from positions_open(). Use with trailing stop tools for automated management."
+            "Composition: Input position_id from positions_open(). Use with trailing stop tools for automated management. Chain → positions_open() → modify_position_sl_tp() → verify via positions_open()."
         ),
         "schema": {
             "type": "object",
@@ -1197,19 +1046,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Closes an open position, either fully or partially.\n"
             "\n"
-            "Input:\n"
-            "  - position_id: String. MT5 position ticket number.\n"
-            "  - volume: Float | null. Amount to close in lots. Null or 0 = close entire position.\n"
+            "When: Use for exiting a specific position based on target hit or invalidation, partial profit-taking by closing a portion of a large position, or emergency exit of a single problematic position.\n"
             "\n"
-            'Output: {status: "closed"|"error", message: string, deal_id: int, close_price: float, raw: object}\n'
+            "Output: {status: 'closed'|'error', message: str, deal_id: int, close_price: float, raw: object}\n"
+            "  - close_price is the execution price (may differ from mark_price due to slippage).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Partial close: volume must be \u2264 position's current volume and \u2265 volume_min.\n"
-            "  - Remaining volume (after partial close) must still meet volume_min or position is fully closed.\n"
-            "  - Close price is the execution price (may differ from mark_price due to slippage).\n"
-            "  - Closing a position realizes its P&L (affects account balance immediately).\n"
+            "Assumptions: Partial close: volume must be ≤ position's current volume and ≥ volume_min. Remaining volume after partial close must still meet volume_min or position fully closes. Closing realizes P&L immediately (affects balance). Null/0 volume = full close.\n"
             "\n"
-            "Composition: Input position_id from positions_open(). Use before close_all_positions() for selective exits."
+            "Composition: Input position_id from positions_open(). Chain → positions_open() → close_position() → trading/log_decision(action='exit', outcome). Use before close_all_positions() for selective exits."
         ),
         "schema": {
             "type": "object",
@@ -1225,19 +1069,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Closes all open positions, optionally filtered by symbol and/or side.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String | null. Filter by symbol. Null = all symbols.\n"
-            '  - side: String. "buy", "sell", or "both". Default: "both".\n'
+            "When: Use for emergency flattening during extreme market events, end-of-day position closure for day trading strategies, or risk circuit breaker when drawdown exceeds thresholds.\n"
             "\n"
-            "Output: {closed: [{position_id, status, message}], failed: [{position_id, error}], summary: {total_attempted, total_closed, total_failed}}\n"
+            "Output: {closed: [{position_id: int, status: str, message: str}], failed: [{position_id: int, error: str}], summary: {total_attempted: int, total_closed: int, total_failed: int}}\n"
+            "  - Individual failures reported in failed array; tool continues closing remaining positions.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Positions are closed sequentially. Market conditions may change between closures.\n"
-            "  - Timeout: 60 seconds for all positions to close.\n"
-            "  - Individual position failures are reported in the failed array; the tool continues closing remaining positions.\n"
-            "  - Does NOT cancel pending orders \u2014 use cancel_all_orders() separately.\n"
+            "Assumptions: Positions closed sequentially — market conditions may change between closures. Timeout: 60 seconds. Does NOT cancel pending orders (use cancel_all_orders() separately).\n"
             "\n"
-            "Composition: Emergency exit tool. Check positions_open() before calling to verify scope."
+            "Composition: Emergency exit tool. Chain → positions_open() (verify scope) → close_all_positions() → cancel_all_orders() (full flat) → trading/log_decision()."
         ),
         "schema": {
             "type": "object",
@@ -1253,16 +1092,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Cancels a single pending order by ticket number.\n"
             "\n"
-            "Input:\n"
-            "  - order_id: String. MT5 pending order ticket number.\n"
+            "When: Use for cancelling a specific pending order that is no longer valid, removing the unfilled leg of a bracket order after one side fills, or cleaning up stale pending orders before placing new ones.\n"
             "\n"
-            'Output: {status: "cancelled"|"error", message: string, raw: object}\n'
+            "Output: {status: 'cancelled'|'error', message: str, raw: object}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Only cancels PENDING orders. Already-filled orders cannot be cancelled (use close_position instead).\n"
-            "  - If order doesn't exist or is already filled, returns error.\n"
+            "Assumptions: Only cancels PENDING orders — already-filled orders cannot be cancelled (use close_position()). If order doesn't exist or already filled, returns error.\n"
             "\n"
-            "Composition: Input order_id from orders_pending()."
+            "Composition: Input order_id from orders_pending(). Chain → orders_pending() → cancel_order() → verify via orders_pending(). For EA-managed brackets, check ea_bracket/list() first — may need ea_bracket/stop() instead."
         ),
         "schema": {
             "type": "object",
@@ -1274,18 +1110,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Cancels all pending orders, optionally filtered by symbol and/or side.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String | null. Filter by symbol. Null = all symbols.\n"
-            '  - side: String. "buy", "sell", or "both". Default: "both".\n'
+            "When: Use for flushing all pending orders before strategy reset or regime change, emergency cancellation during market events, or cleaning up stale orders at end of trading session.\n"
             "\n"
-            "Output: {cancelled: [{order_id, status}], failed: [{order_id, error}], summary: {total_attempted, total_cancelled, total_failed}}\n"
+            "Output: {cancelled: [{order_id: int, status: str}], failed: [{order_id: int, error: str}], summary: {total_attempted: int, total_cancelled: int, total_failed: int}}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Timeout: 60 seconds for all orders to cancel.\n"
-            "  - Does NOT close open positions \u2014 use close_all_positions() separately.\n"
-            "  - Individual failures reported in failed array.\n"
+            "Assumptions: Timeout: 60 seconds. Does NOT close open positions (use close_all_positions() separately). Individual failures reported in failed array.\n"
             "\n"
-            "Composition: Check orders_pending() before calling to verify scope."
+            "Composition: Chain → orders_pending() (verify scope) → cancel_all_orders() → verify via orders_pending(). For EA brackets, check ea_bracket/list() and stop them first."
         ),
         "schema": {
             "type": "object",
@@ -1299,23 +1130,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     },
     "trail_position": {
         "description": (
-            "What: Manually computes and applies a trailing stop to an open position based on current market price.\n"
+            "What: Manually computes and applies a one-shot trailing stop to an open position based on current market price.\n"
             "\n"
-            "Input:\n"
-            "  - position_id: String. MT5 position ticket number.\n"
-            "  - distance_points: Integer. Distance (in points) between current price and new SL.\n"
-            "  - lock_in_points: Integer | null. Minimum profit (in points) to lock in. New SL will not go below entry + lock_in_points for buys, or above entry - lock_in_points for sells. Default: 0.\n"
+            "When: Use for one-time manual trailing SL adjustment during active position management, fine-grained control over trailing distance without server-side automation, or ad-hoc SL updates based on real-time price action.\n"
             "\n"
-            'Output: {computed_sl: float, result: {status: "modified"|"error", ...}}\n'
+            "Output: {computed_sl: float, result: {status: 'modified'|'error', ...}}\n"
             "\n"
-            "Assumptions:\n"
-            "  - One-shot operation: computes and applies trailing SL immediately. Does NOT create a persistent trailing stop.\n"
-            "  - For buy positions: new_sl = current_ask - distance_points (bounded below by entry + lock_in_points and above by bid - point).\n"
-            "  - For sell positions: new_sl = current_bid + distance_points (bounded above by entry - lock_in_points and below by ask + point).\n"
-            "  - If computed SL would be worse than existing SL, the modification may fail (broker rejects).\n"
-            "  - Requires live order book data for current bid/ask.\n"
+            "Assumptions: ONE-SHOT operation — does NOT create persistent trailing stop. Buy: new_sl = current_ask - distance_points (bounded by entry + lock_in_points). Sell: new_sl = current_bid + distance_points. Requires live order book data.\n"
             "\n"
-            "Composition: Alternative to set_trailing_stop() for manual control. Takes position_id from positions_open()."
+            "Composition: Alternative to set_trailing_stop() for manual control. Chain → positions_open() → get_order_book() (for bid/ask) → trail_position() → verify via positions_open(). For persistent trailing, use set_trailing_stop() instead."
         ),
         "schema": {
             "type": "object",
@@ -1331,27 +1154,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Places paired BUY STOP and SELL STOP orders simultaneously for breakout capture.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - buy_trigger: Float. BUY STOP trigger price (must be above current ask).\n"
-            "  - sell_trigger: Float. SELL STOP trigger price (must be below current bid).\n"
-            "  - volume_lots: Float. Position size for each leg.\n"
-            "  - sl_atr_multiplier: Float. SL distance as ATR multiplier. Default: 1.0.\n"
-            "  - tp_atr_multiplier: Float. TP distance as ATR multiplier. Default: 2.0.\n"
-            '  - strategy_id: String. Strategy identifier. Default: "bracket".\n'
-            "  - rationale: String | null. Free-text reasoning for audit trail.\n"
+            "When: Use for capturing breakouts from consolidation zones with bidirectional entries, trading news events where direction is uncertain but volatility is expected, or setting up straddle strategies around key support/resistance levels.\n"
             "\n"
-            'Output: {buy_order_id: string|null, sell_order_id: string|null, status: "placed"|"partial"|"error", message: string, atr_used: float, computed_sl_buy: float, computed_tp_buy: float, computed_sl_sell: float, computed_tp_sell: float}\n'
-            '  - status "partial" means one leg placed but the other failed.\n'
-            "  - SL/TP are computed as: SL = trigger \u00b1 (ATR \u00d7 sl_atr_multiplier), TP = trigger \u00b1 (ATR \u00d7 tp_atr_multiplier).\n"
+            "Output: {buy_order_id: str|null, sell_order_id: str|null, status: 'placed'|'partial'|'error', message: str, atr_used: float, computed_sl_buy: float, computed_tp_buy: float, computed_sl_sell: float, computed_tp_sell: float}\n"
+            "  - status 'partial' = one leg placed, other failed. SL/TP computed as: trigger ± (ATR × multiplier).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Both orders are placed independently. If one fails, the other may still succeed (partial status).\n"
-            "  - ATR is fetched internally using current symbol's ATR(14) on H1 timeframe.\n"
-            "  - When one leg fills, the other should be manually cancelled (no automatic OCO behavior in MT5).\n"
-            "  - Requires buy_trigger > current ask and sell_trigger < current bid. Reversed triggers are rejected.\n"
+            "Assumptions: Both orders placed independently — one may fail while other succeeds. ATR fetched internally using ATR(14) on H1. When one leg fills, the other must be manually cancelled (no auto-OCO in MT5). Requires buy_trigger > current ask and sell_trigger < current bid.\n"
             "\n"
-            "Composition: Uses ATR internally. Input triggers from support_resistance() levels. Cancel the unfilled leg after one fills."
+            "Composition: Input triggers from support_resistance() levels. Chain → support_resistance() → place_bracket_order() → ea_bracket/start() (for auto-OCO) → cancel unfilled leg after one fills."
         ),
         "schema": {
             "type": "object",
@@ -1369,27 +1179,96 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["symbol", "buy_trigger", "sell_trigger", "volume_lots"],
         },
     },
+    # === EA-NATIVE BRACKET ORDER TOOLS ===
+    "ea_bracket/start": {
+        "description": (
+            "What: Registers a pair of pending orders with the EA's native OCO bracket manager. When one leg fills, the EA automatically cancels the sibling. Survives MCP/gateway instability.\n"
+            "\n"
+            "When: Use immediately after placing bracket orders to enable automatic OCO management, setting up brackets that must survive MCP/gateway restarts, or when you need the EA to automatically cancel the sibling leg on fill.\n"
+            "\n"
+            "Output: {success: bool, message: str}\n"
+            "\n"
+            "Assumptions: Orders MUST already exist in MT5 before calling — use place_bracket_order() or submit_pending_order() first. bracket_id embedded in order comments for recovery after EA restart. EA must be running and connected. Use '0' for single-leg bracket.\n"
+            "\n"
+            "Composition: Call immediately after place_bracket_order() succeeds. Chain → place_bracket_order() → ea_bracket/start() → ea_bracket/tick() (periodic processing). Requires ea_bracket/tick() for OCO processing."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "buy_order_ticket": {"type": ["number", "string"]},
+                "sell_order_ticket": {"type": ["number", "string"]},
+                "bracket_id": {"type": "string"},
+                "comment": {"type": ["string", "null"]},
+                "magic_filter": {"type": ["number", "string", "null"]},
+                **_OWNERSHIP_PROPERTIES,
+            },
+            "required": ["buy_order_ticket", "sell_order_ticket", "bracket_id"],
+        },
+    },
+    "ea_bracket/stop": {
+        "description": (
+            "What: Stops and removes an EA-native bracket order. Cancels both legs if still pending and removes from tracking.\n"
+            "\n"
+            "When: Use for aborting a bracket strategy when market conditions change, cleaning up brackets before end of trading session, or emergency stop when bracket triggers are no longer valid.\n"
+            "\n"
+            "Output: {success: bool, message: str}\n"
+            "\n"
+            "Assumptions: Only cancels pending legs — already-filled legs are not affected. Removing a non-existent bracket returns error.\n"
+            "\n"
+            "Composition: Chain → ea_bracket/list() (verify exists) → ea_bracket/stop() → verify via ea_bracket/list(). Use to abandon bracket setup before either leg fills."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "bracket_id": {"type": "string"},
+                **_OWNERSHIP_PROPERTIES,
+            },
+            "required": ["bracket_id"],
+        },
+    },
+    "ea_bracket/list": {
+        "description": (
+            "What: Lists all active EA-native bracket order pairs being managed by the EA.\n"
+            "\n"
+            "When: Use for verifying bracket registration succeeded after ea_bracket/start(), auditing all active EA-managed brackets for health and status, or before ea_bracket/stop() to confirm bracket_id exists.\n"
+            "\n"
+            "Output: {brackets: [{bracket_id: str, buy_ticket: str, sell_ticket: str, magic_filter: int, created_at: str, buy_exists: bool, sell_exists: bool}], count: int}\n"
+            "  - buy_exists/sell_exists reflect current pending order status. Returns empty array if none active (no error).\n"
+            "\n"
+            "Assumptions: buy_exists/sell_exists may not mean orders are still pending — cross-reference with orders_pending(). Mismatched exists flags indicate order may have filled or been cancelled.\n"
+            "\n"
+            "Composition: Chain → ea_bracket/list() → verify bracket health → ea_bracket/tick() (process) or ea_bracket/stop() (remove). Cross-reference with orders_pending() for order existence."
+        ),
+        "schema": {"type": "object"},
+    },
+    "ea_bracket/tick": {
+        "description": (
+            "What: Processes all active EA-native brackets, checking for fills and auto-cancelling orphan legs.\n"
+            "\n"
+            "When: Use for periodic processing of EA-native brackets for OCO auto-cancellation, as part of the main trading loop when EA brackets are active, or monitoring bracket fill events and orphan leg cancellation.\n"
+            "\n"
+            "Output: {processed: int, events: [{bracket_id: str, filled_leg: str, filled_ticket: str, cancelled_ticket: str, fill_price: float}], errors: int, active: int}\n"
+            "\n"
+            "Assumptions: Must be called periodically to activate OCO processing. If not called, EA's OnTimer() still processes brackets independently. Returns {processed: 0} if no brackets active.\n"
+            "\n"
+            "Composition: Call on a schedule after ea_bracket/start(). Chain → ea_bracket/list() → ea_bracket/tick() → handle events. Alternative to polling orders_pending() + cancel_order() for OCO management."
+        ),
+        "schema": {"type": "object"},
+    },
     # === TRAILING STOP TOOLS ===
     "set_trailing_stop": {
         "description": (
+            "LEGACY: Server-side automated trailing stop. Prefer trail_config in submit_market_order_via_bridge() or submit_pending_order() for persistent, EA-side trailing that survives restarts.\n"
+            "\n"
             "What: Starts a server-side automated trailing stop for an open position.\n"
             "\n"
-            "Input:\n"
-            "  - position_id: String. MT5 position ticket number.\n"
-            "  - distance_atr_multiplier: Float. SL distance as ATR multiplier. Default: 1.0. Valid: 0.5-5.0.\n"
-            "  - check_interval_seconds: Integer. How often to check and update SL. Default: 10. Valid: 5-300.\n"
-            "  - lock_in_profit_after_atr: Float. Begin trailing only after price moves this many ATR in profit. Default: 1.0.\n"
+            "When: Use ONLY when position was submitted without trail_config. For new positions, always use trail_config in the order submission instead.\n"
             "\n"
-            'Output: {position_id, status: "active"|"stopped"|"error", message: string, initial_sl: float|null}\n'
+            "Output: {position_id: str, status: 'active'|'stopped'|'error', message: str, initial_sl: float|null}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Server-side: trailing logic runs on the MCP server, not in MT5. Requires the MCP server to stay running.\n"
-            "  - SL is only moved in the profitable direction (never widened).\n"
-            "  - Initial SL is computed as: entry_price \u00b1 (ATR \u00d7 distance_atr_multiplier).\n"
-            "  - If MCP server restarts, active trailing stops are lost.\n"
-            "  - Does NOT work on pending orders \u2014 only open positions.\n"
+            "Assumptions: Server-side — trailing logic runs on MCP server, not MT5. LOST on MCP server restart. Requires MCP server to stay running and periodic trailing_stop/tick() calls. SL only moved in profitable direction (never widened). Initial SL = entry ± (ATR × distance_atr_multiplier). Does NOT work on pending orders. Default: distance=1.0 ATR, interval=10s, lock_in=1.0 ATR.\n"
             "\n"
-            "Composition: Alternative to trail_position() for automated management. Takes position_id from positions_open()."
+            "Composition: FALLBACK method. Chain → positions_open() → set_trailing_stop() → trailing_stop/tick() (periodic) → trailing_stop/list() (monitor). PRIMARY method: use trail_config in order submission."
         ),
         "schema": {
             "type": "object",
@@ -1407,16 +1286,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Processes all active trailing stops, updating SL positions based on current market prices.\n"
             "\n"
-            "Input: None.\n"
+            "When: Use for periodic processing of all active trailing stops (every 10-30 seconds recommended), updating SL positions based on latest market prices, or as part of the main trading loop when server-side trailing stops are active.\n"
             "\n"
-            "Output: {processed: int, updated: [{position_id, old_sl, new_sl}], errors: [{position_id, error}]}\n"
+            "Output: {processed: int, updated: [{position_id: int, old_sl: float, new_sl: float}], errors: [{position_id: int, error: str}]}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Must be called periodically (e.g. every 10-30 seconds) to activate trailing stops.\n"
-            "  - If not called, trailing stops do not update (no background thread).\n"
-            "  - Returns {processed: 0} if no trailing stops are active.\n"
+            "Assumptions: Must be called periodically — trailing stops do NOT update automatically (no background thread). Returns {processed: 0} if no trailing stops active.\n"
             "\n"
-            "Composition: Call on a schedule after set_trailing_stop(). Complements trailing_stop/list() for monitoring."
+            "Composition: Call on a schedule after set_trailing_stop(). Chain → set_trailing_stop() → loop: trailing_stop/tick() every 10-30s → trailing_stop/list() (monitor). Complements trailing_stop/list() for monitoring."
         ),
         "schema": {"type": "object"},
     },
@@ -1424,17 +1300,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Cancels an active server-side trailing stop for a position.\n"
             "\n"
-            "Input:\n"
-            "  - position_id: String. MT5 position ticket number.\n"
+            "When: Use for transitioning from automated trailing to manual SL management, disabling trailing stop when market regime changes from trending to ranging, or before closing a position to clean up trailing stop state.\n"
             "\n"
-            'Output: {position_id, status: "cancelled"|"error", message: string}\n'
+            "Output: {position_id: str, status: 'cancelled'|'error', message: str}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Does NOT close the position \u2014 only stops the automated trailing.\n"
-            "  - The position's SL remains at its last updated value.\n"
-            "  - Canceling a non-existent trailing stop returns an error.\n"
+            "Assumptions: Does NOT close the position — only stops the automated trailing. Position's SL remains at its last updated value. Canceling a non-existent trailing stop returns error.\n"
             "\n"
-            "Composition: Use when manually taking over SL management."
+            "Composition: Chain → trailing_stop/list() (verify active) → trailing_stop/cancel() → positions_open() (verify SL unchanged). Use when manually taking over SL management."
         ),
         "schema": {
             "type": "object",
@@ -1446,42 +1318,30 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Lists all currently active server-side trailing stops.\n"
             "\n"
-            "Input: None.\n"
+            "When: Use for auditing which positions have active server-side trailing stops, monitoring trailing stop health and last update timestamps, or before calling trailing_stop/tick() to confirm there are stops to process.\n"
             "\n"
-            "Output: {trailing_stops: [{position_id, symbol, side, distance_atr_multiplier, current_sl, initial_sl, last_update, check_interval}], count: int}\n"
+            "Output: {trailing_stops: [{position_id: int, symbol: str, side: str, distance_atr_multiplier: float, current_sl: float, initial_sl: float, last_update: int, check_interval: int}], count: int}\n"
+            "  - last_update is Unix timestamp of last SL modification. Returns empty list if none active (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Returns empty list if no trailing stops are active (no error).\n"
-            "  - Data reflects server-side state only (not MT5 terminal state).\n"
-            "  - last_update is Unix timestamp of last SL modification.\n"
+            "Assumptions: Data reflects server-side state only (not MT5 terminal state). Trailing stops do NOT persist across MCP server restarts.\n"
             "\n"
-            "Composition: Use with trailing_stop/tick() to verify active trailing stops are being updated."
+            "Composition: Chain → trailing_stop/list() → trailing_stop/tick() (process) or trailing_stop/cancel() (remove). Cross-reference with positions_open() to verify positions still exist."
         ),
         "schema": {"type": "object"},
     },
     # === LONG-POLLING TOOLS ===
     "resources/market/wait_for_price": {
         "description": (
-            "What: Long-polling price alert: holds the HTTP connection open until a price condition is met or timeout occurs.\n"
+            "What: Long-polling price alert: holds HTTP connection open until a price condition is met or timeout occurs.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - condition: String. "above", "below", or "crosses".\n'
-            "  - price: Float. Target price level.\n"
-            "  - timeout_seconds: Integer. Maximum time to wait. Default: 300 (5 minutes). Range: 10-600.\n"
+            "When: Use for waiting for price to reach a specific level before entering a trade, event-driven entry without manual price polling, or monitoring price levels for breakout/reversal setups.\n"
             "\n"
-            "Output: {symbol, condition: string, trigger_price: float, actual_price: float, triggered: bool, timed_out: bool}\n"
-            "  - triggered: true if condition was met before timeout.\n"
-            "  - timed_out: true if timeout_seconds elapsed without trigger.\n"
-            "  - actual_price: Price at the moment of trigger (or last sampled price on timeout).\n"
+            "Output: {symbol: str, condition: str, trigger_price: float, actual_price: float, triggered: bool, timed_out: bool}\n"
+            "  - triggered: true if condition met before timeout. timed_out: true if timeout elapsed. actual_price: price at trigger (or last sampled on timeout).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Blocks the HTTP connection for up to timeout_seconds. Client must handle long-lived connections.\n"
-            "  - Price is sampled at ~1-second intervals via tick data.\n"
-            "  - If bridge disconnects during wait, returns {triggered: false, timed_out: true}.\n"
-            "  - Not suitable for high-frequency monitoring \u2014 use get_ticks() for that.\n"
+            "Assumptions: Blocks HTTP connection for up to timeout_seconds. Price sampled at ~1-second intervals. If bridge disconnects during wait, returns {triggered: false, timed_out: true}. Not suitable for high-frequency monitoring.\n"
             "\n"
-            "Composition: Alternative to polling get_ticks() in a loop. Use for event-driven entry triggers."
+            "Composition: Alternative to polling get_ticks() in a loop. Chain → support_resistance() → resources/market/wait_for_price() → on trigger: submit_market_order(). Use for event-driven entry triggers."
         ),
         "schema": {
             "type": "object",
@@ -1496,25 +1356,16 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     },
     "resources/positions/monitor": {
         "description": (
-            "What: Long-polling position monitor: holds the connection open until a P&L or price alert fires, or timeout occurs.\n"
+            "What: Long-polling position monitor: holds connection open until a P&L or price alert fires, or timeout occurs.\n"
             "\n"
-            "Input:\n"
-            "  - position_id: String. MT5 position ticket number.\n"
-            "  - alert_at_pnl: Array[Float]. Alert when position P&L reaches any of these values (in account currency).\n"
-            "  - alert_at_price: Array[Float]. Alert when symbol price reaches any of these levels.\n"
-            "  - timeout_seconds: Integer. Maximum wait time. Default: 600 (10 minutes). Range: 60-3600.\n"
+            "When: Use for monitoring a position's P&L without constant polling, setting price-based alerts for active positions, or hands-free waiting between active trading cycles.\n"
             "\n"
-            'Output: {position_id, alert_type: "pnl"|"price"|"timeout"|"closed", current_pnl: float|null, current_price: float|null, triggered_value: float|null, timed_out: bool}\n'
-            '  - alert_type "closed" means the position was closed during monitoring.\n'
-            "  - triggered_value is the P&L or price that triggered the alert.\n"
+            "Output: {position_id: str, alert_type: 'pnl'|'price'|'timeout'|'closed', current_pnl: float|null, current_price: float|null, triggered_value: float|null, timed_out: bool}\n"
+            "  - alert_type 'closed' means position was closed during monitoring. triggered_value is the P&L or price that triggered.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Blocks the HTTP connection for up to timeout_seconds.\n"
-            "  - Samples position state at ~5-second intervals.\n"
-            '  - If position is closed externally (not by the agent), alert_type will be "closed".\n'
-            '  - If position_id doesn\'t exist, returns immediately with alert_type: "closed".\n'
+            "Assumptions: Blocks HTTP connection for up to timeout_seconds. Samples position state at ~5-second intervals. If position closed externally, alert_type='closed'. If position_id doesn't exist, returns immediately with alert_type='closed'.\n"
             "\n"
-            "Composition: Alternative to polling positions_open(). Use for hands-free position monitoring between active cycles."
+            "Composition: Alternative to polling positions_open(). Chain → positions_open() → resources/positions/monitor() → on alert: take action (close, modify SL, etc.). Use for hands-free position monitoring."
         ),
         "schema": {
             "type": "object",
@@ -1530,20 +1381,16 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     # === AGENT WAIT/TIMER TOOLS ===
     "tools/wait/delay": {
         "description": (
-            "What: Pauses execution for a specified duration. Use this in trading loops to wait between analysis cycles.\n"
+            "What: Pauses execution for a specified duration. Use in trading loops to wait between analysis cycles.\n"
             "\n"
-            "Input:\n"
-            "  - duration_seconds: Integer. How long to wait. Default: 60. Range: 1-3600.\n"
+            "When: Use for pausing between analysis cycles in a trading loop, waiting for a specific time interval before re-evaluating market conditions, or cooldown period after a trade before next signal check.\n"
             "\n"
-            "Output: {waited_seconds: int, resumed_at: string}\n"
+            "Output: {waited_seconds: int, resumed_at: str}\n"
             "  - resumed_at is ISO 8601 UTC timestamp.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Blocks the connection for the full duration.\n"
-            "  - Use for simple waits: 'wait 5 minutes then recheck market conditions'.\n"
-            "  - For event-driven waits (price levels, indicator values), use tools/wait/indicator instead.\n"
+            "Assumptions: Blocks the connection for the full duration. For event-driven waits (price levels, indicator values), use tools/wait/indicator instead. Default: 60s. Range: 1-3600s.\n"
             "\n"
-            "Composition: Use in loops: analyze → wait/delay(300) → analyze again. Alternative to polling get_bars() repeatedly."
+            "Composition: Use in loops: analyze → tools/wait/delay(300) → analyze again. Alternative to polling get_bars() repeatedly. Chain → market analysis → tools/wait/delay() → re-analyze."
         ),
         "schema": {
             "type": "object",
@@ -1557,28 +1404,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Long-polling wait until a technical indicator reaches a target value or condition.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - timeframe: String. Default: "H1".\n'
-            '  - indicator: String. Same as get_indicator(): "rsi", "macd", "cci", "atr", "adx", "sma", "ema", etc.\n'
-            '  - condition: String. "above", "below", "crosses", or "equals".\n'
-            "  - value: Float. Target indicator value.\n"
-            "  - period, fast, slow, signal: Integer | null. Indicator parameters (same as get_indicator).\n"
-            "  - timeout_seconds: Integer. Max wait time. Default: 300 (5 minutes). Range: 10-3600.\n"
-            "  - check_interval_seconds: Integer. Polling interval. Default: 5. Range: 1-60.\n"
+            "When: Use for waiting for specific indicator conditions before entry (e.g., RSI oversold), event-driven trading without manual polling loops, or confirming indicator crossovers/threshold breaches.\n"
             "\n"
-            "Output: {symbol, indicator, condition, target_value, actual_value: float|null, triggered: bool, timed_out: bool}\n"
-            "  - triggered: true if condition was met before timeout.\n"
-            "  - timed_out: true if timeout elapsed without trigger.\n"
-            "  - actual_value: Indicator value at trigger (or last sampled on timeout).\n"
+            "Output: {symbol: str, indicator: str, condition: str, target_value: float, actual_value: float|null, triggered: bool, timed_out: bool}\n"
+            "  - triggered: true if condition met before timeout. actual_value: indicator value at trigger (or last sampled on timeout).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Blocks the HTTP connection for up to timeout_seconds.\n"
-            "  - Indicator is sampled at check_interval_seconds intervals.\n"
-            "  - 'equals' uses 0.1% tolerance for floating-point comparison.\n"
-            "  - 'crosses' returns immediately on first indicator update (use with caution).\n"
+            "Assumptions: Blocks HTTP connection for up to timeout_seconds. Indicator sampled at check_interval_seconds intervals. 'equals' uses 0.1% tolerance. 'crosses' returns immediately on first update (may be noise). Default: timeout=300s, interval=5s.\n"
             "\n"
-            "Composition: Use for event-driven entries: 'wait until RSI drops below 30, then buy'. Alternative to polling get_indicator() in a loop."
+            "Composition: Use for event-driven entries: 'wait until RSI drops below 30, then buy'. Chain → get_indicator() (check current value) → tools/wait/indicator() → on trigger: submit_market_order(). Alternative to polling get_indicator() in a loop."
         ),
         "schema": {
             "type": "object",
@@ -1601,47 +1434,60 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["symbol", "indicator", "condition", "value"],
         },
     },
+    "tools/wait/trade_monitor": {
+        "description": (
+            "What: Long-polling trade monitor: holds HTTP connection open until a price target or invalidation level is reached, or monitoring duration expires.\n"
+            "\n"
+            "When: Use for waiting for a trade setup to play out without manually polling, monitoring active trades with predefined target and invalidation levels, or event-driven trade management.\n"
+            "\n"
+            "Output: {symbol: str, reason: 'target_reached'|'invalidation_hit'|'timeout', current_price: float, bid: float, ask: float, target_price: float, invalidation_price: float, distance_to_target_pips: float, distance_to_invalidation_pips: float, elapsed_seconds: int, duration_seconds: int, market_context: {regime: str, atr: float, rsi: float, spread_points: int}}\n"
+            "\n"
+            "Assumptions: Blocks HTTP connection for up to duration_seconds. For buy: target above entry, invalidation below. For sell: target below, invalidation above. Uses bid for buy-side checks, ask for sell-side. ATR-type boundaries fetch ATR(14) on H1 internally. Max duration: 3600s.\n"
+            "\n"
+            "Composition: Use after validating a trade setup. Chain → validate_trade_setup() → tools/wait/trade_monitor() → on reason: take action. Alternative to polling get_order_book() + manual checks. Complements resources/market/wait_for_price() (handles both target AND invalidation)."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "side": {"type": "string", "enum": ["buy", "sell"]},
+                "duration": {"type": "string"},
+                "expected": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["price", "pips", "atr"]},
+                        "value": {"type": ["number", "string"]},
+                        "multiplier": {"type": ["number", "string"]},
+                    },
+                    "required": ["type"],
+                },
+                "invalidation": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["price", "pips", "atr"]},
+                        "value": {"type": ["number", "string"]},
+                        "multiplier": {"type": ["number", "string"]},
+                    },
+                    "required": ["type"],
+                },
+                "check_interval_seconds": {"type": ["number", "string"]},
+            },
+            "required": ["symbol", "side", "duration", "expected", "invalidation"],
+        },
+    },
     # === METACOGNITION TOOLS ===
     "trading/log_decision": {
         "description": (
             "What: Records a trading decision with full reasoning metadata for self-learning and audit.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - side: String. "buy", "sell", or "neutral" (for hold decisions).\n'
-            '  - action: String. Valid: "entry", "exit", "modify_sl", "modify_tp", "trail", "close", "monitor", "decision_to_wait".\n'
-            "  - entry_price, exit_price, sl, tp: Float | null. Trade parameters as applicable.\n"
-            "  - volume_lots: Float | null. Position size.\n"
-            "  - pnl: Float | null. Realized or unrealized P&L.\n"
-            "  - session_id: String | null. Session identifier for grouping related decisions.\n"
-            "  - regime: String | null. Market regime at decision time (from market/regime).\n"
-            "  - atr_value, atr_percent_of_price: Float | null. Volatility context.\n"
-            "  - rsi_value: Float | null. RSI value at decision time.\n"
-            "  - indicator_snapshot: Dict | null. Arbitrary indicator values for context.\n"
-            "  - model_justification: String | null. Free-text reasoning for the decision.\n"
-            "  - indicators_considered: Array[String] | null. List of indicators consulted.\n"
-            "  - confidence_level: Float | null. Decision confidence. Range: 0.0-1.0.\n"
-            "  - risk_assessment: String | null. Free-text risk evaluation.\n"
-            '  - emotional_self_report: String | null. Valid: "calm", "cautious", "aggressive", "anxious", "uncertain", "confident".\n'
-            "  - alternatives_considered: String | null. What other actions were evaluated.\n"
-            "  - expected_duration: String | null. Expected holding period.\n"
-            "  - expected_move_points: Float | null. Anticipated price movement.\n"
-            '  - outcome: String | null. Filled on exit. Valid: "win", "loss", "breakeven", "still_open".\n'
-            "  - lesson_learned: String | null. Post-trade reflection.\n"
-            "  - would_do_differently: String | null. Improvement notes.\n"
-            '  - mistake_category: String | null. Valid: "premature_exit", "late_entry", "wrong_regime", "ignored_signal", "revenge_trade", "overtrading", "perfect_trade".\n'
-            "  - quality_rating: Integer | null. Trade quality. Range: 1-5.\n"
-            "  - decision_id: String | null. For updating an existing decision entry.\n"
+            "When: Use after every trading decision (entry, exit, modification, or decision to wait), recording the reasoning behind each trade for later analysis, or updating a decision entry with outcome data after position closes.\n"
             "\n"
-            'Output: {decision_id: string, status: "logged"|"updated"|"error", message: string}\n'
+            "Output: {decision_id: str, status: 'logged'|'updated'|'error', message: str}\n"
+            "  - decision_id returned can be used to update the entry later (e.g., fill outcome on exit).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Decisions are persisted to SQLite journal. Survives server restarts.\n"
-            "  - decision_id is returned and can be used to update the entry later (e.g. fill outcome on exit).\n"
-            "  - All text fields accept any string \u2014 no validation on content.\n"
-            "  - Empty/null fields are stored as-is; they don't trigger defaults.\n"
+            "Assumptions: Decisions persisted to SQLite journal (survives server restarts). All text fields accept any string. Empty/null fields stored as-is. Minimum required: symbol, side, action.\n"
             "\n"
-            "Composition: Call after every action (including the decision to wait). Input decision_id into trading/reflect() for querying."
+            "Composition: Call after every action. Input decision_id into trading/reflect() for querying. Chain → execute trade → trading/log_decision() → later: trading/reflect(decision_id) → trading/insights()."
         ),
         "schema": {
             "type": "object",
@@ -1677,23 +1523,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Queries the trade journal for past decisions, filterable by outcome, regime, emotion, or mistake type.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String | null. Filter by symbol.\n"
-            '  - outcome: String | null. Filter by outcome ("win", "loss", "breakeven").\n'
-            "  - regime: String | null. Filter by market regime.\n"
-            "  - emotional_self_report: String | null. Filter by emotional state.\n"
-            "  - mistake_category: String | null. Filter by mistake type.\n"
-            "  - action: String | null. Filter by action type.\n"
-            "  - limit: Integer. Maximum entries to return. Default: 50.\n"
+            "When: Use for investigating patterns in past trading decisions before making new ones, reviewing performance in specific market regimes or emotional states, or identifying recurring mistake categories for targeted improvement.\n"
             "\n"
-            "Output: {decisions: [{decision_id, symbol, side, action, entry_price, pnl, regime, confidence_level, emotional_self_report, outcome, mistake_category, quality_rating, timestamp, ...}], count: int, query: {filters}}\n"
+            "Output: {decisions: [{decision_id: str, symbol: str, side: str, action: str, entry_price: float, pnl: float, regime: str, confidence_level: float, emotional_self_report: str, outcome: str, mistake_category: str, quality_rating: int, timestamp: str, ...}], count: int, query: {filters: object}}\n"
+            "  - Results sorted by timestamp descending (most recent first). Returns empty array if no matches (no error).\n"
             "\n"
-            "Assumptions:\n"
-            "  - Returns empty decisions array if no matches (no error).\n"
-            "  - Results sorted by timestamp descending (most recent first).\n"
-            "  - Only returns fields that were populated at log time.\n"
+            "Assumptions: Only returns fields that were populated at log time. Default limit=50. Zero results may mean no matching decisions or unpopulated outcomes.\n"
             "\n"
-            'Composition: Input for trading/insights(). Use for pattern recognition: "Show my losses in ranging regimes."'
+            "Composition: Input for trading/insights(). Chain → trading/reflect(filters) → analyze patterns → trading/insights() → adjust strategy. Use for pattern recognition: 'Show my losses in ranging regimes.'"
         ),
         "schema": {
             "type": "object",
@@ -1713,19 +1550,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Analyzes the trade journal for aggregate patterns: win rates by regime, emotion, common mistakes.\n"
             "\n"
-            "Input:\n"
-            "  - lookback_days: Integer | null. Analysis window. Default: 7.\n"
+            "When: Use for periodic review of trading performance (daily or weekly), identifying systemic weaknesses across regime/emotion/mistake categories, or getting AI-generated recommendations for strategy improvement.\n"
             "\n"
-            "Output: {lookback_days: int, total_decisions: int, win_rate: float, avg_pnl: float, win_rate_by_regime: {regime: float}, win_rate_by_emotion: {emotion: float}, common_mistakes: [{category, count, avg_loss}], avg_confidence_when_winning: float, avg_confidence_when_losing: float, recommendations: [string]}\n"
-            "  - All rates are 0.0-1.0.\n"
-            "  - recommendations: AI-actionable guidance derived from patterns.\n"
-            "\n"
-            "Assumptions:\n"
-            "  - Only includes decisions with populated outcome fields (decisions_to_wait excluded from win rate).\n"
+            "Output: {lookback_days: int, total_decisions: int, win_rate: float, avg_pnl: float, win_rate_by_regime: {regime: float}, win_rate_by_emotion: {emotion: float}, common_mistakes: [{category: str, count: int, avg_loss: float}], avg_confidence_when_winning: float, avg_confidence_when_losing: float, recommendations: [str]}\n"
+            "  - All rates 0.0-1.0. recommendations: AI-actionable guidance derived from patterns.\n"
             "  - Returns zero-valued metrics if insufficient data (< 5 decisions).\n"
-            "  - recommendations are template-generated, not LLM-generated.\n"
             "\n"
-            "Composition: Takes data from trading/reflect(). Use periodically (e.g. daily) for strategy refinement."
+            "Assumptions: Only includes decisions with populated outcome fields. recommendations are template-generated, not LLM-generated. Default lookback=7 days.\n"
+            "\n"
+            "Composition: Takes data from trading/reflect(). Chain → trading/reflect() → trading/insights() → apply recommendations. Use periodically (e.g., daily) for strategy refinement."
         ),
         "schema": {
             "type": "object",
@@ -1738,23 +1571,16 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     # === COACHING/CONTEXT TOOLS ===
     "trading/context": {
         "description": (
-            "What: Fetches live market context for a symbol: ATR, volatility assessment, point values, and spread analysis.\n"
+            "What: Fetches live market context for a symbol: ATR, volatility assessment, point values, spread analysis, and trading session.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            "  - include_comparison: Bool. If true, includes comparison to historical averages. Default: true.\n"
+            "When: Use for getting quick market context before analyzing a specific symbol, checking if current volatility is normal or extreme, identifying current trading session (London, New York, Asian, Closed), or verifying spread conditions before entry.\n"
             "\n"
-            "Output: {symbol, current_price: float, bid: float, ask: float, spread_points: float, atr_14: float, atr_pct_of_price: float, avg_atr: float, atr_percentile: float, volatility_assessment: string, point_value: float, lot_size_info: {min, max, step}, composure_notes: string, session: string}\n"
-            "  - composure_notes: Contextual note about whether current volatility is unusual.\n"
-            '  - session: Current forex trading session (e.g. "London", "New York", "Asian", "Closed").\n'
+            "Output: {symbol: str, current_price: float, bid: float, ask: float, spread_points: int, atr_14: float, atr_pct_of_price: float, avg_atr: float, atr_percentile: float, volatility_assessment: str, point_value: float, lot_size_info: {min: float, max: float, step: float}, composure_notes: str, session: str}\n"
+            "  - session: 'London', 'New York', 'Asian', or 'Closed'. volatility_assessment: 'low', 'normal', 'high', 'extreme'.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Uses ATR(14) on H1 timeframe as baseline.\n"
-            "  - Comparison data based on last 100 bars of ATR history.\n"
-            "  - Returns partial data with null fields if symbol has no market data.\n"
-            '  - Volatility assessment is categorical ("low", "normal", "high", "extreme") based on ATR percentile.\n'
+            "Assumptions: Uses ATR(14) on H1 as baseline. Comparison data based on last 100 bars of ATR history. Returns partial data with null fields if symbol has no market data. Default: include_comparison=true.\n"
             "\n"
-            "Composition: Takes symbol_info() and get_indicator(atr) internally. Input for trading/coach(), calculate_position_size()."
+            "Composition: Takes symbol_info() and get_indicator(atr) internally. Input for trading/coach(), calculate_position_size(). Chain → trading/context() → trading/coach() → execute."
         ),
         "schema": {
             "type": "object",
@@ -1769,34 +1595,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Provides advisory feedback on a proposed trade setup using live market data. Does NOT block execution.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - side: String. "buy" or "sell".\n'
-            "  - regime: String | null. Current market regime. If null, fetched internally.\n"
-            "  - atr_value: Float | null. Current ATR. If null, fetched internally.\n"
-            "  - rsi: Float | null. Current RSI value. If null, not evaluated.\n"
-            "  - ema_fast, ema_slow: Float | null. Current EMA values. If null, not evaluated.\n"
-            "  - sl_distance_points: Float | null. Planned SL distance in points.\n"
-            "  - tp_distance_points: Float | null. Planned TP distance in points.\n"
-            "  - indicator_agreements: Integer | null. Count of indicators aligned with the trade direction.\n"
-            "  - trades_today: Integer. Number of trades taken today. Default: 0.\n"
-            "  - daily_pnl: Float. Current daily P&L. Default: 0.0.\n"
-            "  - recent_consecutive_losses: Integer. Number of consecutive losses. Default: 0.\n"
-            "  - position_in_range: Float | null. Current price position as 0-100 percentile of recent range.\n"
+            "When: Use for getting advisory feedback on a proposed trade setup before execution, checking SL/TP reasonableness relative to ATR, assessing confluence score from multiple indicator alignment, or monitoring overtrading risk.\n"
             "\n"
-            "Output: {symbol, side, advisory: {sl_atr_ratio: float, risk_reward: float, trend_alignment: string, bar_pattern_notes: string, volatility_notes: string, session_notes: string, confluence_score: int, warnings: [string], recommendations: [string]}, market_data: {atr, regime, rsi, ema_fast, ema_slow}}\n"
-            "  - sl_atr_ratio: SL distance / ATR. Values < 1.0 indicate tight stops.\n"
-            "  - risk_reward: TP distance / SL distance.\n"
-            "  - confluence_score: 0-5, based on indicator alignment, trend, and regime fit.\n"
-            '  - Warnings are factual observations (e.g. "SL is 0.3 ATR \u2014 below recommended minimum of 1.0 ATR").\n'
-            "  - Recommendations are optional suggestions (not mandatory).\n"
+            "Output: {symbol: str, side: str, advisory: {sl_atr_ratio: float, risk_reward: float, trend_alignment: str, bar_pattern_notes: str, volatility_notes: str, session_notes: str, confluence_score: int, warnings: [str], recommendations: [str]}, market_data: {atr: float, regime: str, rsi: float, ema_fast: float, ema_slow: float}}\n"
+            "  - confluence_score: 0-5. sl_atr_ratio < 1.0 = tight stops. Warnings are factual; recommendations are optional.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Advisory, NOT a gate. Returns warnings/recommendations but does NOT block execution.\n"
-            "  - Missing input parameters are fetched internally where possible; if unavailable, those checks are skipped.\n"
-            "  - Does not account for account balance, policy limits, or open positions \u2014 those are separate concerns.\n"
+            "Assumptions: Advisory only — does NOT block execution. Missing input parameters fetched internally where possible. Does not account for account balance, policy limits, or open positions.\n"
             "\n"
-            "Composition: Takes regime from market/regime(), ATR from get_indicator(atr). Call before execution tools for pre-trade validation."
+            "Composition: Takes regime from market/regime(), ATR from get_indicator(atr). Chain → trading/coach() → if confluence_score ≥ 3: validate_trade_setup() → execute. Not a substitute for validate_trade_setup() (doesn't check broker constraints)."
         ),
         "schema": {
             "type": "object",
@@ -1823,23 +1629,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Single-call aggregation: regime + ATR + RSI + EMA(20) + EMA(50) + coaching feedback. Returns all data needed for an informed trade decision.\n"
             "\n"
-            "Input:\n"
-            "  - symbol: String. MT5 symbol name.\n"
-            '  - side: String. "buy" or "sell".\n'
-            "  - sl_distance_points: Float | null. Planned SL distance in points.\n"
-            "  - tp_distance_points: Float | null. Planned TP distance in points.\n"
+            "When: Use for getting all pre-trade analysis data in a single efficient call (~400ms), before every trade execution to ensure informed decision-making, or when you need regime, ATR, RSI, EMA alignment, and coaching feedback simultaneously.\n"
             "\n"
-            "Output: {symbol, regime: {regime, confidence, adx}, atr: {value, pct_of_price}, rsi: {value}, ema: {ema_20, ema_50, alignment}, coaching: {confluence_score, warnings, recommendations}, execution_time_ms: int}\n"
-            "  - execution_time_ms: Total time to gather all data (~400ms vs 3-5s for sequential individual calls).\n"
-            "  - All indicator values computed at call time on the symbol's H1 timeframe.\n"
+            "Output: {symbol: str, regime: {regime: str, confidence: float, adx: float}, atr: {value: float, pct_of_price: float}, rsi: {value: float}, ema: {ema_20: float, ema_50: float, alignment: str}, coaching: {confluence_score: int, warnings: [str], recommendations: [str]}, execution_time_ms: int}\n"
+            "  - execution_time_ms: ~400ms vs 3-5s for sequential individual calls. All indicators on H1 timeframe.\n"
+            "  - If any internal fetch fails, that section contains {error: str}.\n"
             "\n"
-            "Assumptions:\n"
-            "  - All indicators use H1 timeframe. Cannot specify custom timeframes.\n"
-            "  - RSI uses period 14, EMAs use periods 20 and 50 (not configurable).\n"
-            '  - If any internal fetch fails, that section contains {error: "..."}.\n'
-            "  - Coaching feedback uses the same logic as trading/coach().\n"
+            "Assumptions: All indicators use H1 timeframe. RSI(14), EMA(20/50) are fixed (not configurable). Coaching feedback uses same logic as trading/coach().\n"
             "\n"
-            "Composition: Replaces sequential calls to market/regime() + trading/context() + get_indicator(rsi) + get_indicator(ema) + trading/coach(). Input for any execution decision."
+            "Composition: Replaces sequential calls to market/regime() + trading/context() + get_indicator(rsi) + get_indicator(ema) + trading/coach(). Chain → trading/decision_support() → if confluence_score ≥ 3: validate_trade_setup() → execute."
         ),
         "schema": {
             "type": "object",
@@ -1856,24 +1654,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Generates a complete system prompt for orienting a new trading agent session.\n"
             "\n"
-            "Input:\n"
-            "  - include_market_context: Bool. Include current market regime and volatility. Default: true.\n"
-            "  - include_news_context: Bool. Include recent news headlines. Default: true.\n"
-            "  - include_workflow: Bool. Include recommended analysis workflow. Default: true.\n"
-            "  - include_trading_rules: Bool. Include trading policy rules. Default: true.\n"
-            "  - include_tool_guide: Bool. Include tool usage guide. Default: true.\n"
-            "  - include_metacognition: Bool. Include self-reflection guidelines. Default: true.\n"
-            "  - live_account_context: Bool. Inject live account balance, equity, margin. Default: false.\n"
-            "  - live_symbol_context: Array[String] | null. Symbols to inject live context for.\n"
+            "When: Use once at the start of a new agent session to initialize with market context, trading rules, tool guides, and metacognition guidelines. Regenerate for each new session.\n"
             "\n"
-            "Output: {system_prompt: string, sections: [string], generated_at: string, context_summary: {account, symbols, news_count, rules_count}}\n"
+            "Output: {system_prompt: str, sections: [str], generated_at: str, context_summary: {account: object, symbols: [str], news_count: int, rules_count: int}}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Prompt is generated at call time with live data when live_* flags are true.\n"
-            "  - Stale if saved and reused later \u2014 regenerate for each new session.\n"
-            "  - Does NOT include tool definitions (the MCP protocol provides those separately).\n"
+            "Assumptions: Prompt generated at call time with live data when live_* flags true. Stale if saved and reused later — regenerate per session. Does NOT include tool definitions (MCP protocol provides those separately). Default: all include_* flags true.\n"
             "\n"
-            "Composition: Call once at the start of a new agent session. Combines data from account_summary(), market/regime(), economic_calendar(), and trading policy."
+            "Composition: Combines data from account_summary(), market/regime(), economic_calendar(), and trading policy. Chain → trading/agent_prompt() → use as system prompt for new agent session."
         ),
         "schema": {
             "type": "object",
@@ -1895,26 +1682,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Fetches financial news articles from configured RSS feed sources.\n"
             "\n"
-            "Input:\n"
-            '  - pools: Array[String] | null. News pools to query. Default: ["FINANCIAL_MARKETS"]. Available pools via news/pools.\n'
-            "  - limit: Integer. Max articles to return. Default: 20.\n"
-            "  - keywords: Array[String] | null. Include only articles containing keywords.\n"
-            "  - excludeKeywords: Array[String] | null. Exclude articles containing ANY keyword.\n"
-            "  - enrichArticles: Bool. Apply NLP enrichment (sentiment, topics, entities). Default: false.\n"
-            "  - countries: Array[String] | null. Filter by country codes.\n"
-            "  - domains: Array[String] | null. Filter by source domains.\n"
+            "When: Use for fundamental analysis before trades, detecting market-moving events, or supplementing technical analysis with news context. Prefer over news_enrich() for initial article retrieval.\n"
             "\n"
-            "Output: {articles: [{title, summary, url, source, published_at, currencies: [string], categories: [string]}], count: int, source: string}\n"
-            "  - If enrichArticles is true, each article also includes: sentiment, topics, entities, summary.\n"
-            "  - published_at is ISO 8601 UTC.\n"
+            "Output: {articles: [{title: str, summary: str, url: str, source: str, published_at: str, currencies: [str], categories: [str]}], count: int, source: str}\n"
+            "  - If enrichArticles=true, each article also includes: sentiment: float, topics: [str], entities: [str], summary: str. published_at is ISO 8601 UTC.\n"
+            "  - Returns empty articles array if no matches (no error). Default pool: FINANCIAL_MARKETS.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Articles fetched from RSS feeds, not real-time push. Refresh latency: 5-15 minutes from publication.\n"
-            "  - Returns empty articles array if no matches (no error).\n"
-            "  - Currency matching is heuristic (based on title/body keyword matching), not guaranteed.\n"
-            "  - enrichArticles=true increases latency significantly (NLP processing per article).\n"
+            "Assumptions: Articles from RSS feeds, not real-time push. Refresh latency: 5-15 minutes from publication. Currency matching is heuristic. enrichArticles=true increases latency significantly (NLP per article).\n"
             "\n"
-            "Composition: Input for fundamental analysis before trades. Complements economic_calendar() for event awareness."
+            "Composition: Input for fundamental analysis. Chain → news_fetch() → news_enrich() (for sentiment/topics) → economic_calendar() → decide. Complements economic_calendar() for event awareness."
         ),
         "schema": {
             "type": "object",
@@ -1934,20 +1710,14 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Applies NLP enrichment to news articles: sentiment analysis, topic extraction, entity recognition, and summarization.\n"
             "\n"
-            "Input:\n"
-            "  - items: Array[Object]. News articles to enrich (from news_fetch output).\n"
-            '  - extract: Array[String] | null. Specific enrichment types. Valid: "sentiment", "topics", "entities", "summary". Default: all.\n'
+            "When: Use for adding sentiment scores and topic/entity extraction to articles from news_fetch(), analyzing emotional tone of market news, or extracting currency/central bank mentions. Prefer selective enrichment for high-impact articles over bulk.\n"
             "\n"
-            "Output: {enriched: [{...original_fields, sentiment: float, topics: [string], entities: [string], summary: string}]}\n"
-            "  - sentiment: -1.0 (negative) to 1.0 (positive).\n"
-            "  - Enrichment is applied in-place; original fields are preserved.\n"
+            "Output: {enriched: [{...original_fields, sentiment: float, topics: [str], entities: [str], summary: str}]}\n"
+            "  - sentiment: -1.0 (negative) to 1.0 (positive). Original fields preserved. Enrichment applied in-place.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Enrichment is computationally expensive for large item arrays (> 50 articles).\n"
-            "  - Entity extraction covers currencies, central banks, and economic terms only.\n"
-            "  - If enrichment fails for an item, that item is returned unchanged (no error).\n"
+            "Assumptions: Computationally expensive for large arrays (> 50 articles). Entity extraction covers currencies, central banks, and economic terms only. If enrichment fails for an item, that item returned unchanged.\n"
             "\n"
-            "Composition: Takes output from news_fetch(). Use selectively for high-impact articles rather than bulk enrichment."
+            "Composition: Takes output from news_fetch(). Chain → news_fetch() → news_enrich() → analyze sentiment. Use selectively for high-impact articles rather than bulk."
         ),
         "schema": {
             "type": "object",
@@ -1962,19 +1732,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Detects entities (currencies, central banks, instruments) with increasing mention frequency in recent news.\n"
             "\n"
-            "Input:\n"
-            "  - timeWindowHours: Integer. Comparison window. Default: 24.\n"
-            "  - minGrowth: Float. Minimum growth factor (e.g. 2.0 = 2x increase). Default: 1.5.\n"
-            "  - minCurrentMentions: Integer. Minimum current mentions to qualify. Default: 3.\n"
+            "When: Use for detecting emerging market narratives, adjusting watchlist priorities based on news momentum, or identifying which currencies/instruments are gaining media attention.\n"
             "\n"
-            "Output: {trending: [{entity: string, current_mentions: int, previous_mentions: int, growth_factor: float, categories: [string]}], time_window: int}\n"
-            "\n"
-            "Assumptions:\n"
-            "  - Compares mention frequency in the current window vs. the preceding window of equal length.\n"
-            "  - Entity extraction is keyword-based, not NER (Named Entity Recognition).\n"
+            "Output: {trending: [{entity: str, current_mentions: int, previous_mentions: int, growth_factor: float, categories: [str]}], time_window: int}\n"
+            "  - Compares mention frequency in current window vs preceding window of equal length. Default: 24h window, 1.5x growth, 3 min mentions.\n"
             "  - Returns empty trending array if no entities meet thresholds (no error).\n"
             "\n"
-            "Composition: Use for detecting emerging market narratives. Input for adjusting watchlist priorities."
+            "Assumptions: Entity extraction is keyword-based, not NER. Growth factor = current/previous mentions.\n"
+            "\n"
+            "Composition: Chain → insights_trendingEntities() → if entity correlates with watchlist symbol: news_fetch(keywords=[entity]) → adjust strategy. Use for detecting emerging narratives."
         ),
         "schema": {
             "type": "object",
@@ -1991,21 +1757,15 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Fetches upcoming economic events and trading blackout windows.\n"
             "\n"
-            "Input:\n"
-            "  - hours_ahead: Integer. How far forward to look. Default: 24.\n"
-            '  - currency: String | null. Filter by currency code (e.g. "USD", "EUR"). Omit for all.\n'
-            '  - min_impact: String. Minimum event significance. Valid: "LOW", "MEDIUM", "HIGH", "CRITICAL". Default: "MEDIUM".\n'
+            "When: Use before any execution tool to check for HIGH/CRITICAL impact events, identifying trading blackout windows to avoid entries, or planning trades around economic releases.\n"
             "\n"
-            'Output: {events: [{name, currency, impact, timestamp, actual, forecast, previous}], event_count: int, blackout_windows: [{event_name, start_utc, end_utc, currency, impact, blackout_minutes}], current_blackout: {is_blackout: bool, events_causing_blackout: [...]}, source: "mt5_terminal_calendar"|"schedule_based_fallback"}\n'
-            '  - If source is "schedule_based_fallback", events are estimated from recurring schedules, not real terminal data.\n'
-            "  - Blackout windows indicate periods to avoid new entries (typically \u00b160-120 minutes around HIGH-impact events).\n"
+            "Output: {events: [{name: str, currency: str, impact: str, timestamp: int, actual: str, forecast: str, previous: str}], event_count: int, blackout_windows: [{event_name: str, start_utc: str, end_utc: str, currency: str, impact: str, blackout_minutes: int}], current_blackout: {is_blackout: bool, events_causing_blackout: [str]}, source: 'mt5_terminal_calendar'|'schedule_based_fallback'}\n"
+            "  - Blackout windows: ±60-120 minutes around HIGH-impact events. source='schedule_based_fallback' means estimated data, not real terminal.\n"
+            "  - Returns empty events during market holidays (no error). Default: 24h ahead, min_impact=MEDIUM.\n"
             "\n"
-            "Assumptions:\n"
-            "  - Primary source is MT5 Terminal's native Economic Calendar API. Falls back to schedule-based estimates if unavailable.\n"
-            '  - When source is "schedule_based_fallback", a warning field is included in the response.\n'
-            "  - Returns empty events array during market holidays (no error).\n"
+            "Assumptions: Primary source is MT5 Terminal's native Economic Calendar API. Falls back to schedule-based estimates. When source is 'schedule_based_fallback', a warning field is included.\n"
             "\n"
-            "Composition: Check before any execution tool. Complements news_fetch() for fundamental awareness."
+            "Composition: Check before any execution tool. Chain → economic_calendar() → if current_blackout: wait or reduce size → execute. Complements news_fetch() for fundamental awareness."
         ),
         "schema": {
             "type": "object",
@@ -2022,15 +1782,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "What: Lists available news source pools and individual sources for the news_fetch tool.\n"
             "\n"
-            "Input: None.\n"
+            "When: Use to discover valid pool values before calling news_fetch(), understanding which news sources are available, or selecting specific source pools for targeted news retrieval.\n"
             "\n"
-            "Output: {pools: [string], sources: [{id, name, url, category}]}\n"
+            "Output: {pools: [str], sources: [{id: str, name: str, url: str, category: str}]}\n"
             "\n"
-            "Assumptions:\n"
-            "  - Static metadata. Does not fetch actual news content.\n"
-            "  - Pool names are case-sensitive strings used in news_fetch's pools parameter.\n"
+            "Assumptions: Static metadata — does not fetch actual news content. Pool names are case-sensitive strings used in news_fetch's pools parameter.\n"
             "\n"
-            "Composition: Discover valid pool values before calling news_fetch()."
+            "Composition: Discover valid pool values before calling news_fetch(). Chain → news/pools() → news_fetch(pools=['FINANCIAL_MARKETS']) → analyze."
         ),
         "schema": {"type": "object"},
     },
@@ -2113,6 +1871,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             res = await _post_json("/tools/calculate_position_size", args)
         elif name == "validate_trade_setup":
             res = await _post_json("/tools/validate_trade_setup", args)
+        elif name == "portfolio/risk":
+            res = await _post_json("/tools/portfolio/risk", args)
         elif name == "trail_position":
             res = await _post_json("/tools/trail_position", args)
         elif name == "volatility_profile":
@@ -2154,6 +1914,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
         # Bracket orders
         elif name == "place_bracket_order":
             res = await _post_json("/tools/place_bracket_order", args)
+        # EA-native bracket orders
+        elif name == "ea_bracket/start":
+            res = await _post_json("/tools/ea_bracket/start", args)
+        elif name == "ea_bracket/stop":
+            res = await _post_json("/tools/ea_bracket/stop", args)
+        elif name == "ea_bracket/list":
+            res = await _post_json("/tools/ea_bracket/list", {})
+        elif name == "ea_bracket/tick":
+            res = await _post_json("/tools/ea_bracket/tick", {})
         # Trailing stops
         elif name == "set_trailing_stop":
             res = await _post_json("/tools/set_trailing_stop", args)
@@ -2174,6 +1943,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             res = await _post_json("/tools/wait/delay", args)
         elif name == "tools/wait/indicator":
             res = await _post_json("/tools/wait/indicator", args)
+        elif name == "tools/wait/trade_monitor":
+            res = await _post_json("/tools/wait/trade_monitor", args)
         # IGS-MCP News & Macro
         elif name == "news_fetch":
             # Default to FINANCIAL_MARKETS pool if not specified

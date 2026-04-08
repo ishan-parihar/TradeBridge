@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Literal
 import httpx
 import time
 import uuid
@@ -330,16 +331,201 @@ def resource_bars(symbol: str, timeframe: str, count: int = 100) -> Bars:
     return get_gateway().get_bars(symbol, timeframe, count)
 
 
-@app.get("/resources/positions/open", response_model=list[Position])
-def resource_positions_open() -> list[Position]:
-    from mt5_mcp.observability.logging import logger
+def _fetch_symbol_infos(symbols: list[str]) -> dict[str, dict]:
+    """Fetch symbol info for unique symbols."""
+    result: dict[str, dict] = {}
+    for sym in set(symbols):
+        try:
+            info = tool_get_symbol_info(sym)
+            result[sym] = info
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger as _si_logger
 
-    # Try adapter first (may have cached data)
-    positions = get_gateway().adapter.get_positions()
-    if positions:
+            _si_logger.warning(f"Failed to fetch symbol info for {sym}: {e}")
+            result[sym] = {}
+    return result
+
+
+def _compute_position_health(position: dict, symbol_info: dict) -> dict:
+    """Compute health metrics for a single position dict.
+
+    Returns a health dict with all fields computed from position + symbol data.
+    Handles missing data gracefully — sets field to null if computation fails.
+    """
+    from mt5_mcp.observability.logging import logger as _ch_logger
+
+    health: dict[str, object] = {
+        "distance_to_sl_pips": None,
+        "distance_to_tp_pips": None,
+        "pnl_percent_of_risk": None,
+        "time_in_trade_minutes": None,
+        "time_in_trade_bars_h1": None,
+        "is_winning": None,
+        "is_at_breakeven": None,
+        "trail_eligible": None,
+        "spread_cost_pips": None,
+        "profit_multiple_of_spread": None,
+    }
+
+    try:
+        mark_price = position.get("mark_price")
+        entry_price = position.get("entry_price")
+        sl = position.get("sl")
+        tp = position.get("tp")
+        volume = position.get("volume", 0.0)
+        side = position.get("side", "buy")
+
+        # Profit: use raw 'profit' if available, fall back to unrealized_pnl
+        profit_raw = position.get("profit")
+        if profit_raw is None:
+            profit_raw = position.get("unrealized_pnl", 0.0)
+        profit = float(profit_raw) if profit_raw is not None else 0.0
+
+        mark_price = float(mark_price) if mark_price else None
+        entry_price = float(entry_price) if entry_price else None
+        volume = float(volume) if volume else 0.0
+
+        # Point and tick_value from symbol_info
+        point = symbol_info.get("point")
+        point = float(point) if point else None
+        tick_value = symbol_info.get("tick_value")
+        tick_value = float(tick_value) if tick_value else None
+
+        # Spread: from position dict (raw EA data) or symbol_info
+        spread_raw = position.get("spread")
+        if spread_raw is None:
+            spread_raw = symbol_info.get("spread_points", 0)
+        spread = int(spread_raw) if spread_raw is not None else 0
+
+        if mark_price and point and point > 0:
+            # distance_to_sl_pips
+            if sl and float(sl) > 0:
+                sl_f = float(sl)
+                if side == "buy":
+                    health["distance_to_sl_pips"] = (mark_price - sl_f) / point
+                else:
+                    health["distance_to_sl_pips"] = (sl_f - mark_price) / point
+
+            # distance_to_tp_pips
+            if tp and float(tp) > 0:
+                tp_f = float(tp)
+                if side == "buy":
+                    health["distance_to_tp_pips"] = (tp_f - mark_price) / point
+                else:
+                    health["distance_to_tp_pips"] = (mark_price - tp_f) / point
+
+        # pnl_percent_of_risk
+        if entry_price and sl and float(sl) > 0 and tick_value and volume > 0:
+            sl_f = float(sl)
+            risk_per_lot = abs(entry_price - sl_f) * volume * tick_value
+            if risk_per_lot > 0:
+                health["pnl_percent_of_risk"] = (profit / risk_per_lot) * 100
+
+        # time_in_trade_minutes
+        time_raw = position.get("time")
+        if time_raw is not None:
+            try:
+                time_in_trade_minutes = int((time.time() - float(time_raw)) / 60)
+                health["time_in_trade_minutes"] = time_in_trade_minutes
+                health["time_in_trade_bars_h1"] = round(time_in_trade_minutes / 60.0, 1)
+            except (ValueError, TypeError, OverflowError):
+                pass
+        else:
+            opened_at = position.get("opened_at")
+            if opened_at:
+                try:
+                    from datetime import datetime, timezone
+
+                    if isinstance(opened_at, (int, float)):
+                        opened_dt = datetime.fromtimestamp(
+                            float(opened_at), tz=timezone.utc
+                        )
+                    else:
+                        opened_dt = datetime.fromisoformat(
+                            str(opened_at).replace("Z", "+00:00")
+                        )
+                    now = datetime.now(timezone.utc)
+                    delta = now - opened_dt
+                    time_in_trade_minutes = int(delta.total_seconds() / 60)
+                    health["time_in_trade_minutes"] = time_in_trade_minutes
+                    health["time_in_trade_bars_h1"] = round(
+                        time_in_trade_minutes / 60.0, 1
+                    )
+                except (ValueError, TypeError, OverflowError):
+                    pass
+
+        # is_winning
+        health["is_winning"] = profit > 0
+
+        # is_at_breakeven and trail_eligible (need spread + tick_value)
+        if spread > 0 and tick_value and volume > 0:
+            spread_cost_dollar = spread * volume * tick_value
+            health["is_at_breakeven"] = abs(profit) < (spread_cost_dollar * 0.5)
+            health["trail_eligible"] = health["is_winning"] and profit > (
+                spread_cost_dollar * 2
+            )
+        else:
+            health["is_at_breakeven"] = None
+            health["trail_eligible"] = None
+
+        # spread_cost_pips
+        health["spread_cost_pips"] = spread
+
+        # profit_multiple_of_spread
+        if spread > 0 and point and point > 0 and tick_value and volume > 0:
+            denom = volume * tick_value
+            profit_in_points = profit / denom if denom > 0 else 0
+            health["profit_multiple_of_spread"] = profit_in_points / spread
+
+    except Exception as e:
+        _ch_logger.error(
+            f"Health computation failed for position "
+            f"{position.get('position_id', 'unknown')}: {e}"
+        )
+
+    return health
+
+
+def _enrich_positions_with_health(positions: list[dict]) -> list[dict]:
+    """Enrich a list of position dicts with health metrics."""
+    if not positions:
         return positions
 
-    # Fallback to bridge — parse with per-item error logging
+    symbols = list({p.get("symbol", "") for p in positions if p.get("symbol")})
+    symbol_infos = _fetch_symbol_infos(symbols)
+
+    for position in positions:
+        sym = position.get("symbol", "")
+        sym_info = symbol_infos.get(sym, {})
+        position["health"] = _compute_position_health(position, sym_info)
+
+    return positions
+
+
+@app.get("/resources/positions/open")
+def resource_positions_open() -> dict:
+    from mt5_mcp.observability.logging import logger
+
+    sync_status = {
+        "positions_count": 0,
+        "last_sync_age_ms": 0,
+        "retry_count": 0,
+        "stale_warning": False,
+    }
+
+    start = time.monotonic()
+
+    positions = get_gateway().adapter.get_positions()
+    if positions:
+        position_dicts = [p.model_dump() for p in positions]
+        _enrich_positions_with_health(position_dicts)
+        sync_status["positions_count"] = len(position_dicts)
+        sync_status["last_sync_age_ms"] = int((time.monotonic() - start) * 1000)
+        return {
+            "positions": position_dicts,
+            "sync_status": sync_status,
+        }
+
     try:
         data = tool_get_positions()
         pos_list = data.get("positions", [])
@@ -352,22 +538,68 @@ def resource_positions_open() -> list[Position]:
                     f"Position parse failed: {e} — keys: {list(item.keys())}"
                 )
         if result:
-            return result
+            position_dicts = [p.model_dump() for p in result]
+            _enrich_positions_with_health(position_dicts)
+            sync_status["positions_count"] = len(position_dicts)
+            sync_status["last_sync_age_ms"] = int((time.monotonic() - start) * 1000)
+            return {
+                "positions": position_dicts,
+                "sync_status": sync_status,
+            }
     except Exception as e:
         logger.warning(f"positions_open bridge fallback failed: {e}")
 
-    # Last resort: direct TCP call
-    try:
-        tcp_result = _tcp_send_and_await("get_positions", {}, timeout_s=5.0)
-        if tcp_result and tcp_result.get("status") == "completed":
-            payload = tcp_result.get("result", {}).get("payload", "{}")
-            data = _parse_payload(payload)
-            pos_list = data.get("positions", [])
-            return [Position(**item) for item in pos_list if item]
-    except Exception as e:
-        logger.warning(f"positions_open TCP fallback failed: {e}")
+    _MAX_POSITIONS_RETRY_ATTEMPTS = 2
+    _POSITIONS_RETRY_DELAY_S = 0.5
 
-    return []
+    first_attempt_count = 0
+    retry_count = 0
+    best_result = []
+
+    for attempt in range(_MAX_POSITIONS_RETRY_ATTEMPTS):
+        try:
+            tcp_result = _tcp_send_and_await("get_positions", {}, timeout_s=5.0)
+            if tcp_result and tcp_result.get("status") == "completed":
+                payload = tcp_result.get("result", {}).get("payload", "{}")
+                data = _parse_payload(payload)
+                pos_list = data.get("positions", [])
+                parsed = [Position(**item) for item in pos_list if item]
+                if not best_result:
+                    first_attempt_count = len(parsed)
+                if parsed:
+                    best_result = parsed
+                    break
+        except Exception as e:
+            logger.warning(f"positions_open TCP attempt {attempt + 1} failed: {e}")
+
+        if attempt == 0 and not best_result:
+            retry_count = 1
+            logger.warning(
+                "positions_open: first attempt returned 0 positions, retrying"
+            )
+            time.sleep(_POSITIONS_RETRY_DELAY_S)
+
+    stale_warning = (
+        retry_count > 0 and first_attempt_count == 0 and len(best_result) > 0
+    )
+
+    position_dicts = [p.model_dump() for p in best_result]
+    _enrich_positions_with_health(position_dicts)
+
+    sync_status["positions_count"] = len(position_dicts)
+    sync_status["last_sync_age_ms"] = int((time.monotonic() - start) * 1000)
+    sync_status["retry_count"] = retry_count
+    sync_status["stale_warning"] = stale_warning
+
+    if stale_warning:
+        logger.warning(
+            f"positions_open: stale cache detected — first attempt=0, second attempt={len(position_dicts)} positions"
+        )
+
+    return {
+        "positions": position_dicts,
+        "sync_status": sync_status,
+    }
 
 
 @app.get("/resources/orders/pending", response_model=list[Order])
@@ -1363,6 +1595,18 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
 
     symbol_normalized = normalize_symbol(req.symbol)
 
+    # Flatten trail_config for EA bridge (nested → flat trail_* keys)
+    trail_params: dict[str, object] = {}
+    if req.trail_config and isinstance(req.trail_config, dict):
+        tc = req.trail_config
+        trail_params = {
+            "trail_atr_multiplier": tc.get("atr_multiplier"),
+            "trail_lock_profit_atr": tc.get("lock_profit_atr"),
+            "trail_check_interval": tc.get("check_interval_seconds"),
+            "trail_timeframe": tc.get("atr_timeframe"),
+            "trail_atr_period": tc.get("atr_period"),
+        }
+
     tcp_result = _tcp_send_and_await(
         "submit_order",
         {
@@ -1376,6 +1620,7 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
             "strategy_id": req.strategy_id,
             "intent_id": req.intent_id,
             "idempotency_key": req.idempotency_key,
+            **trail_params,
         },
     )
     if tcp_result and tcp_result.get("status") == "completed":
@@ -1432,6 +1677,7 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
             "strategy_id": req.strategy_id,
             "intent_id": req.intent_id,
             "idempotency_key": req.idempotency_key,
+            **trail_params,
         },
     )
     r.raise_for_status()
@@ -1702,6 +1948,18 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
         raise HTTPException(status_code=403, detail=decision.reason or "denied")
     symbol_normalized = normalize_symbol(req.symbol)
 
+    # Flatten trail_config for EA bridge (nested → flat trail_* keys)
+    trail_params: dict[str, object] = {}
+    if req.trail_config and isinstance(req.trail_config, dict):
+        tc = req.trail_config
+        trail_params = {
+            "trail_atr_multiplier": tc.get("atr_multiplier"),
+            "trail_lock_profit_atr": tc.get("lock_profit_atr"),
+            "trail_check_interval": tc.get("check_interval_seconds"),
+            "trail_timeframe": tc.get("atr_timeframe"),
+            "trail_atr_period": tc.get("atr_period"),
+        }
+
     tcp_result = _tcp_send_and_await(
         "submit_pending_order",
         {
@@ -1717,6 +1975,7 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
             "strategy_id": req.strategy_id,
             "intent_id": req.intent_id,
             "idempotency_key": req.idempotency_key,
+            **trail_params,
         },
     )
     if tcp_result and tcp_result.get("status") == "completed":
@@ -1765,6 +2024,7 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
             "strategy_id": req.strategy_id,
             "intent_id": req.intent_id,
             "idempotency_key": req.idempotency_key,
+            **trail_params,
         },
     )
     r.raise_for_status()
@@ -1885,18 +2145,98 @@ def tool_validate_trade_setup(req: ValidateTradeSetupRequest) -> dict:
         tp=req.tp,
         required_margin=margin_estimate.required_margin,
     )
+
+    # Correlation warning: check existing positions for same-symbol or correlated exposure
+    positions_data = resource_positions_open()
+    positions = positions_data.get("positions", [])
+    same_symbol_positions = [
+        p for p in positions if p.get("symbol", "").upper() == req.symbol.upper()
+    ]
+    same_symbol_count = len(same_symbol_positions)
+
+    correlated_positions = []
+    existing_symbols = set(
+        p.get("symbol", "").upper().replace("M", "").replace("m", "")
+        for p in positions
+        if p.get("symbol", "").upper() != req.symbol.upper()
+    )
+    req_sym_clean = req.symbol.upper().replace("M", "").replace("m", "")
+    for sym in existing_symbols:
+        corr = PortfolioRiskService.CORRELATION_MATRIX.get(req_sym_clean, {}).get(
+            sym, 0
+        )
+        if abs(corr) > 0.7:
+            matching = [
+                p
+                for p in positions
+                if p.get("symbol", "").upper().replace("M", "").replace("m", "") == sym
+            ]
+            total_vol = sum(float(p.get("volume", 0)) for p in matching)
+            correlated_positions.append(
+                {
+                    "symbol": sym,
+                    "correlation": round(corr, 4),
+                    "existing_volume": round(total_vol, 2),
+                }
+            )
+    req_sym_clean = req.symbol.upper().replace("M", "").replace("m", "")
+    for sym in existing_symbols:
+        corr = (
+            compute_correlation_matrix({req_sym_clean: [], sym: []})
+            .get(req_sym_clean, {})
+            .get(sym, 0)
+            if req_sym_clean in compute_correlation_matrix({req_sym_clean: [], sym: []})
+            else 0
+        )
+        if abs(corr) > 0.7:
+            matching = [
+                p
+                for p in positions
+                if p.get("symbol", "").upper().replace("M", "").replace("m", "") == sym
+            ]
+            total_vol = sum(float(p.get("volume", 0)) for p in matching)
+            correlated_positions.append(
+                {
+                    "symbol": sym,
+                    "correlation": round(corr, 4),
+                    "existing_volume": round(total_vol, 2),
+                }
+            )
+
+    has_exposure = same_symbol_count > 0 or len(correlated_positions) > 0
+    warning_msg = None
+    if same_symbol_count > 0:
+        warning_msg = f"Already have {same_symbol_count} open position(s) on {req.symbol} — concentrated exposure"
+    elif correlated_positions:
+        cp = correlated_positions[0]
+        warning_msg = f"High correlation ({cp['correlation']:.2f}) with open {cp['symbol']} position"
+
+    correlation_warning = {
+        "has_exposure": has_exposure,
+        "same_symbol_positions": same_symbol_count,
+        "correlated_positions": correlated_positions,
+        "warning": warning_msg,
+    }
+
+    if warning_msg:
+        if "warnings" not in result:
+            result["warnings"] = []
+        result["warnings"].append(warning_msg)
+
     return {
         "symbol": req.symbol,
         "bid": bid,
         "ask": ask,
         "required_margin": margin_estimate.required_margin,
+        "correlation_warning": correlation_warning,
         **result,
     }
 
 
 @app.post("/tools/trail_position", response_model=dict)
 def tool_trail_position(req: TrailPositionRequest) -> dict:
-    positions = resource_positions_open()
+    positions_data = resource_positions_open()
+    positions = [Position(**p) for p in positions_data.get("positions", [])]
     position = next(
         (item for item in positions if item.position_id == req.position_id), None
     )
@@ -2947,6 +3287,25 @@ def tool_place_bracket_order(req: BracketOrderRequest) -> BracketOrderResult:
         sell_sl = req.sell_trigger + sl_distance
         sell_tp = req.sell_trigger - tp_distance
 
+        # Pre-flight validation for BUY STOP leg
+        buy_validation = tool_validate_trade_setup(
+            ValidateTradeSetupRequest(
+                symbol=req.symbol,
+                side="buy",
+                order_kind="stop",
+                volume_lots=req.volume_lots,
+                entry_price=req.buy_trigger,
+                sl=buy_sl,
+                tp=buy_tp,
+            )
+        )
+        if isinstance(buy_validation, dict) and not buy_validation.get("valid", True):
+            errors = buy_validation.get("errors", [])
+            return BracketOrderResult(
+                status="error",
+                message=f"BUY STOP leg validation failed: {', '.join(errors)}",
+            )
+
         # Submit BUY STOP
         buy_req = SubmitPendingOrderRequest(
             symbol=req.symbol,
@@ -2956,6 +3315,11 @@ def tool_place_bracket_order(req: BracketOrderRequest) -> BracketOrderResult:
             volume_lots=req.volume_lots,
             sl=buy_sl,
             tp=buy_tp,
+            session_id=getattr(req, "session_id", None),
+            strategy_id=getattr(req, "strategy_id", None),
+            intent_id=getattr(req, "intent_id", None),
+            idempotency_key=f"bracket_buy_{getattr(req, 'intent_id', 'none')}_{uuid.uuid4().hex[:6]}",
+            magic_number=getattr(req, "magic_number", None),
         )
         buy_result = tool_submit_pending_order(buy_req)
 
@@ -2982,6 +3346,11 @@ def tool_place_bracket_order(req: BracketOrderRequest) -> BracketOrderResult:
             volume_lots=req.volume_lots,
             sl=sell_sl,
             tp=sell_tp,
+            session_id=getattr(req, "session_id", None),
+            strategy_id=getattr(req, "strategy_id", None),
+            intent_id=getattr(req, "intent_id", None),
+            idempotency_key=f"bracket_sell_{getattr(req, 'intent_id', 'none')}_{uuid.uuid4().hex[:6]}",
+            magic_number=getattr(req, "magic_number", None),
         )
         sell_result = tool_submit_pending_order(sell_req)
 
@@ -3040,6 +3409,47 @@ def tool_place_bracket_order(req: BracketOrderRequest) -> BracketOrderResult:
 
             logger.warning(f"Bracket order journal failed (non-fatal): {e}")
 
+        # Register bracket with EA-native OCO manager (non-fatal if EA unavailable)
+        if buy_order_id and sell_order_id:
+            try:
+                import uuid as _bracket_uuid
+
+                bracket_id = f"bracket_{req.symbol}_{_bracket_uuid.uuid4().hex[:8]}"
+                ea_bracket_result = tool_ea_bracket_start(
+                    EABracketStartRequest(
+                        buy_order_ticket=str(buy_order_id),
+                        sell_order_ticket=str(sell_order_id),
+                        bracket_id=bracket_id,
+                        comment=f"bracket:{bracket_id} breakout",
+                        magic_filter=req.magic_number
+                        if hasattr(req, "magic_number") and req.magic_number
+                        else 0,
+                        session_id=getattr(req, "session_id", None),
+                        strategy_id=getattr(req, "strategy_id", None),
+                        intent_id=getattr(req, "intent_id", None),
+                    )
+                )
+                from mt5_mcp.observability.logging import logger
+
+                if (
+                    isinstance(ea_bracket_result, dict)
+                    and ea_bracket_result.get("status") == "error"
+                ):
+                    logger.warning(
+                        f"EA bracket registration failed for {bracket_id}: {ea_bracket_result.get('message', 'unknown')}. "
+                        f"Agent must manually cancel orphan leg on fill."
+                    )
+                else:
+                    logger.info(
+                        f"Bracket {bracket_id} registered with EA-native OCO manager"
+                    )
+            except Exception as bracket_exc:
+                from mt5_mcp.observability.logging import logger
+
+                logger.warning(
+                    f"EA bracket registration failed (non-fatal): {bracket_exc}"
+                )
+
         return BracketOrderResult(
             buy_order_id=str(buy_order_id) if buy_order_id else None,
             sell_order_id=str(sell_order_id) if sell_order_id else None,
@@ -3070,7 +3480,8 @@ def tool_set_trailing_stop(req: SetTrailingStopRequest) -> TrailingStopResult:
     The server will check price every check_interval_seconds and
     automatically trail the stop loss.
     """
-    positions = resource_positions_open()
+    positions_data = resource_positions_open()
+    positions = [Position(**p) for p in positions_data.get("positions", [])]
     position = next((p for p in positions if p.position_id == req.position_id), None)
     if position is None:
         return TrailingStopResult(
@@ -4521,7 +4932,8 @@ async def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorR
 
     while asyncio.get_event_loop().time() < end_time:
         try:
-            positions = resource_positions_open()
+            positions_data = resource_positions_open()
+            positions = [Position(**p) for p in positions_data.get("positions", [])]
             position = next(
                 (p for p in positions if p.position_id == req.position_id), None
             )
@@ -4576,7 +4988,8 @@ async def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorR
         await asyncio.sleep(2)
 
     try:
-        positions = resource_positions_open()
+        positions_data = resource_positions_open()
+        positions = [Position(**p) for p in positions_data.get("positions", [])]
         position = next(
             (p for p in positions if p.position_id == req.position_id), None
         )
@@ -4698,6 +5111,276 @@ async def tool_wait_for_indicator(
         triggered=False,
         timed_out=True,
     )
+
+
+# ============================================================
+# Trade Monitor — Long-Polling Price Condition Watch
+# ============================================================
+
+
+class TradeMonitorRequest(BaseModel):
+    symbol: str
+    side: Literal["buy", "sell"]
+    duration: str
+    expected: dict
+    invalidation: dict
+    check_interval_seconds: int = 5
+
+
+@app.post("/tools/wait/trade_monitor", response_model=dict)
+async def tool_wait_trade_monitor(req: TradeMonitorRequest) -> dict:
+    """Long-polling trade monitor: holds connection until target or invalidation is reached.
+
+    Computes target/invalidation prices from spec (price/pips/atr), then polls
+    the market at configurable intervals until a condition is met or duration expires.
+    """
+    import asyncio
+    import time as _time
+
+    from mt5_mcp.services.trade_monitor import (
+        parse_duration,
+        compute_price_bracket,
+        check_price_condition,
+    )
+
+    # Validate and clamp check_interval_seconds
+    check_interval = max(1, min(60, req.check_interval_seconds))
+
+    # Parse duration
+    try:
+        duration_seconds = parse_duration(req.duration)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid duration: {e}")
+
+    # Enforce max timeout of 3600 seconds (1 hour)
+    if duration_seconds > 3600:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Duration {duration_seconds}s exceeds maximum of 3600s (1 hour)",
+        )
+
+    if duration_seconds <= 0:
+        raise HTTPException(status_code=400, detail="Duration must be positive")
+
+    # Fetch symbol info for pip/point calculations
+    symbol_info_data = tool_get_symbol_info(req.symbol)
+    if "error" in symbol_info_data:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Symbol info unavailable for {req.symbol}: {symbol_info_data['error']}",
+        )
+
+    # Ensure point is available
+    point = symbol_info_data.get("point")
+    if not point or point <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not determine point value for {req.symbol}",
+        )
+
+    # Fetch ATR if needed for atr-type boundaries
+    expected_type = req.expected.get("type")
+    invalidation_type = req.invalidation.get("type")
+    atr_value = 0.0
+
+    if expected_type == "atr" or invalidation_type == "atr":
+        try:
+            atr_result = tool_get_indicator(
+                IndicatorRequest(
+                    symbol=req.symbol, timeframe="H1", indicator="atr", period=14
+                )
+            )
+            if atr_result.get("status") == "error":
+                from mt5_mcp.observability.logging import logger
+
+                logger.warning(
+                    f"ATR request failed for trade_monitor {req.symbol}: "
+                    f"{atr_result.get('message', 'unknown error')}"
+                )
+            elif "value" in atr_result and atr_result["value"]:
+                atr_value = float(atr_result["value"])
+            elif "data" in atr_result and atr_result["data"]:
+                atr_value = float(atr_result["data"][-1])
+        except Exception:
+            pass
+
+    # Inject atr_value into atr-type specs
+    if expected_type == "atr":
+        req.expected["atr_value"] = atr_value
+    if invalidation_type == "atr":
+        req.invalidation["atr_value"] = atr_value
+
+    # Get initial price for bracket computation
+    try:
+        book = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
+        bid, ask = _first_bid_ask(book)
+        if bid is None or ask is None:
+            raise ValueError("Order book returned no bid/ask")
+        current_price = (bid + ask) / 2
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not fetch current price for {req.symbol}: {e}",
+        )
+
+    # Compute target and invalidation prices
+    try:
+        bracket = compute_price_bracket(
+            current_price=current_price,
+            side=req.side,
+            spec={"expected": req.expected, "invalidation": req.invalidation},
+            symbol_info=symbol_info_data,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid price bracket: {e}")
+
+    target_price = bracket["target_price"]
+    invalidation_price = bracket["invalidation_price"]
+    target_pips = bracket["target_pips"]
+    invalidation_pips = bracket["invalidation_pips"]
+
+    # Gather initial market context
+    market_context = {
+        "regime": None,
+        "atr": atr_value,
+        "rsi": None,
+        "spread_points": None,
+    }
+    try:
+        regime_result = detect_regime(
+            bars=[], atr_value=atr_value if atr_value > 0 else None
+        )
+        market_context["regime"] = regime_result.get("regime", "unknown")
+    except Exception:
+        market_context["regime"] = "unknown"
+
+    try:
+        rsi_result = tool_get_indicator(
+            IndicatorRequest(
+                symbol=req.symbol, timeframe="H1", indicator="rsi", period=14
+            )
+        )
+        if "value" in rsi_result and rsi_result["value"]:
+            market_context["rsi"] = float(rsi_result["value"])
+    except Exception:
+        pass
+
+    if bid and ask:
+        point_val = float(point)
+        market_context["spread_points"] = (
+            int((ask - bid) / point_val) if point_val > 0 else 0
+        )
+
+    start_time = _time.monotonic()
+    end_time = _time.monotonic() + duration_seconds
+
+    while _time.monotonic() < end_time:
+        try:
+            # Fetch current price
+            book = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
+            bid, ask = _first_bid_ask(book)
+
+            if bid is not None and ask is not None:
+                current_price = (bid + ask) / 2
+            else:
+                # Price fetch failed — log and continue polling
+                from mt5_mcp.observability.logging import logger
+
+                logger.warning(
+                    f"Trade monitor: could not fetch price for {req.symbol}, continuing poll"
+                )
+                await asyncio.sleep(check_interval)
+                continue
+
+            # Check price conditions
+            condition = check_price_condition(
+                current_price=current_price,
+                bid=bid,
+                ask=ask,
+                target_price=target_price,
+                invalidation_price=invalidation_price,
+                side=req.side,
+            )
+
+            elapsed = int(_time.monotonic() - start_time)
+            distance_to_target = abs(target_price - current_price)
+            distance_to_invalidation = abs(invalidation_price - current_price)
+            pip = 10 * float(point)
+            dist_target_pips = distance_to_target / pip if pip > 0 else 0.0
+            dist_inval_pips = distance_to_invalidation / pip if pip > 0 else 0.0
+
+            if condition == "target_reached":
+                return {
+                    "symbol": req.symbol,
+                    "reason": "target_reached",
+                    "current_price": current_price,
+                    "bid": bid,
+                    "ask": ask,
+                    "target_price": target_price,
+                    "invalidation_price": invalidation_price,
+                    "distance_to_target_pips": round(dist_target_pips, 1),
+                    "distance_to_invalidation_pips": round(dist_inval_pips, 1),
+                    "elapsed_seconds": elapsed,
+                    "duration_seconds": duration_seconds,
+                    "market_context": dict(market_context),
+                }
+            elif condition == "invalidation_hit":
+                return {
+                    "symbol": req.symbol,
+                    "reason": "invalidation_hit",
+                    "current_price": current_price,
+                    "bid": bid,
+                    "ask": ask,
+                    "target_price": target_price,
+                    "invalidation_price": invalidation_price,
+                    "distance_to_target_pips": round(dist_target_pips, 1),
+                    "distance_to_invalidation_pips": round(dist_inval_pips, 1),
+                    "elapsed_seconds": elapsed,
+                    "duration_seconds": duration_seconds,
+                    "market_context": dict(market_context),
+                }
+
+        except Exception as e:
+            from mt5_mcp.observability.logging import logger
+
+            logger.warning(f"Trade monitor poll error for {req.symbol}: {e}")
+
+        await asyncio.sleep(check_interval)
+
+    # Timeout — return final state
+    try:
+        book = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
+        bid, ask = _first_bid_ask(book)
+        if bid is not None and ask is not None:
+            current_price = (bid + ask) / 2
+        else:
+            current_price = 0.0
+    except Exception:
+        current_price = 0.0
+        bid = 0.0
+        ask = 0.0
+
+    elapsed = int(_time.monotonic() - start_time)
+    distance_to_target = abs(target_price - current_price)
+    distance_to_invalidation = abs(invalidation_price - current_price)
+    pip = 10 * float(point)
+    dist_target_pips = distance_to_target / pip if pip > 0 else 0.0
+    dist_inval_pips = distance_to_invalidation / pip if pip > 0 else 0.0
+
+    return {
+        "symbol": req.symbol,
+        "reason": "timeout",
+        "current_price": current_price,
+        "bid": bid,
+        "ask": ask,
+        "target_price": target_price,
+        "invalidation_price": invalidation_price,
+        "distance_to_target_pips": round(dist_target_pips, 1),
+        "distance_to_invalidation_pips": round(dist_inval_pips, 1),
+        "elapsed_seconds": elapsed,
+        "duration_seconds": duration_seconds,
+        "market_context": dict(market_context),
+    }
 
 
 # ============================================================
@@ -5136,7 +5819,8 @@ def tool_reconcile(req: ReconcileRequest) -> dict:
 
 @app.post("/tools/portfolio/exposure", response_model=dict)
 def tool_portfolio_exposure(req: PortfolioExposureRequest) -> dict:
-    positions = resource_positions_open()
+    positions_data = resource_positions_open()
+    positions = positions_data.get("positions", [])
     orders = resource_orders_pending()
     account = resource_account_summary()
 
@@ -5148,9 +5832,115 @@ def tool_portfolio_exposure(req: PortfolioExposureRequest) -> dict:
     return svc.get_exposure()
 
 
+class PortfolioRiskRequest(BaseModel):
+    symbol: str | None = None
+    days: int = 7
+    limit: int = 100
+
+
+@app.post("/tools/portfolio/risk", response_model=dict)
+def tool_portfolio_risk(req: PortfolioRiskRequest) -> dict:
+    """Portfolio-wide risk analysis using PortfolioRiskService.
+
+    Returns exposure, concentration, and correlation metrics across all open positions.
+    """
+    positions_data = resource_positions_open()
+    positions = positions_data.get("positions", [])
+    if not positions:
+        return {
+            "total_exposure_usd": 0,
+            "net_exposure_usd": 0,
+            "exposure_by_symbol": [],
+            "risk_metrics": {
+                "concentration_ratio": 0,
+                "max_single_position_pct": 0,
+                "correlated_pairs": [],
+            },
+        }
+
+    orders = resource_orders_pending()
+    account = resource_account_summary()
+
+    svc = PortfolioRiskService(
+        get_positions_fn=lambda: positions,
+        get_orders_fn=lambda: orders,
+        get_account_fn=lambda: account,
+    )
+    exposure = svc.get_exposure()
+
+    # Build correlated pairs from correlation groups
+    correlated_pairs = []
+    seen = set()
+    sym_symbols = [p.get("symbol", "") for p in positions]
+    unique_symbols = list(
+        set(s.upper().replace("M", "").replace("m", "") for s in sym_symbols if s)
+    )
+    for i, sa in enumerate(unique_symbols):
+        for sb in unique_symbols[i + 1 :]:
+            key = tuple(sorted([sa, sb]))
+            if key in seen:
+                continue
+            seen.add(key)
+            corr = svc._correlation(sa, sb)
+            if abs(corr) > 0.5:
+                correlated_pairs.append(
+                    {"symbol_a": sa, "symbol_b": sb, "correlation": round(corr, 4)}
+                )
+
+    # Build exposure_by_symbol list
+    exposure_by_symbol = []
+    total_exposure = exposure.get("total_exposure_usd", 0)
+    equity = float(getattr(account, "equity", 0) or getattr(account, "balance", 0) or 0)
+    margin = float(getattr(account, "margin", 0) or 0)
+    exposure_map = exposure.get("exposure_by_symbol", {})
+    if hasattr(exposure_map, "items"):
+        for sym, data in exposure_map.items():
+            sym_exposure = data.get("notional_usd", 0) if isinstance(data, dict) else 0
+            # Determine net exposure direction
+            usd_dir = (
+                data.get("usd_direction", "usd_short")
+                if isinstance(data, dict)
+                else "usd_short"
+            )
+            net_exposure = sym_exposure if usd_dir == "usd_short" else -sym_exposure
+            exposure_by_symbol.append(
+                {
+                    "symbol": sym,
+                    "exposure_usd": round(abs(sym_exposure), 2),
+                    "net_exposure_usd": round(net_exposure, 2),
+                    "margin_usd": round(margin / len(exposure_map), 2)
+                    if exposure_map
+                    else 0,
+                }
+            )
+
+    # Concentration metrics
+    max_single = max(
+        (abs(e.get("exposure_usd", 0)) for e in exposure_by_symbol), default=0
+    )
+    concentration_ratio = round(max_single / equity, 4) if equity > 0 else 0
+    max_single_position_pct = round(max_single / equity * 100, 2) if equity > 0 else 0
+
+    net_exposure_usd = sum(e.get("net_exposure_usd", 0) for e in exposure_by_symbol)
+
+    return {
+        "total_exposure_usd": round(total_exposure, 2),
+        "net_exposure_usd": round(net_exposure_usd, 2),
+        "exposure_by_symbol": exposure_by_symbol,
+        "risk_metrics": {
+            "concentration_ratio": concentration_ratio,
+            "max_single_position_pct": max_single_position_pct,
+            "correlated_pairs": sorted(
+                correlated_pairs, key=lambda x: abs(x["correlation"]), reverse=True
+            ),
+        },
+    }
+
+
 @app.post("/tools/portfolio/pre_trade_gate", response_model=dict)
 def tool_portfolio_pre_trade_gate(req: PreTradeGateRequest) -> dict:
-    positions = resource_positions_open()
+    positions_data = resource_positions_open()
+    positions = positions_data.get("positions", [])
     orders = resource_orders_pending()
     account = resource_account_summary()
 
