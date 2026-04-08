@@ -65,20 +65,29 @@ class TestPortfolioExposureEndpoint:
         monkeypatch.setattr(
             mcp_main,
             "resource_positions_open",
-            lambda: [
-                SimpleNamespace(
-                    position_id="1",
-                    symbol="EURUSD",
-                    side="buy",
-                    volume=0.10,
-                    entry_price=1.0850,
-                    mark_price=1.0860,
-                    sl=1.0800,
-                    tp=1.0950,
-                    profit=10.0,
-                    magic=0,
-                ),
-            ],
+            lambda: {
+                "positions": [
+                    {
+                        "position_id": "1",
+                        "symbol": "EURUSD",
+                        "side": "buy",
+                        "volume": 0.10,
+                        "entry_price": 1.0850,
+                        "mark_price": 1.0860,
+                        "sl": 1.0800,
+                        "tp": 1.0950,
+                        "profit": 10.0,
+                        "magic": 0,
+                        "health": {},
+                    },
+                ],
+                "sync_status": {
+                    "positions_count": 1,
+                    "last_sync_age_ms": 0,
+                    "retry_count": 0,
+                    "stale_warning": False,
+                },
+            },
         )
         monkeypatch.setattr(
             mcp_main,
@@ -139,32 +148,42 @@ class TestPreTradeGateEndpoint:
         monkeypatch.setattr(
             mcp_main,
             "resource_positions_open",
-            lambda: [
-                SimpleNamespace(
-                    position_id="1",
-                    symbol="EURUSD",
-                    side="buy",
-                    volume=5.0,
-                    entry_price=1.0850,
-                    mark_price=1.0860,
-                    sl=1.0800,
-                    tp=1.0950,
-                    profit=50.0,
-                    magic=0,
-                ),
-                SimpleNamespace(
-                    position_id="2",
-                    symbol="GBPUSD",
-                    side="buy",
-                    volume=5.0,
-                    entry_price=1.2700,
-                    mark_price=1.2710,
-                    sl=1.2650,
-                    tp=1.2800,
-                    profit=50.0,
-                    magic=0,
-                ),
-            ],
+            lambda: {
+                "positions": [
+                    {
+                        "position_id": "1",
+                        "symbol": "EURUSD",
+                        "side": "buy",
+                        "volume": 5.0,
+                        "entry_price": 1.0850,
+                        "mark_price": 1.0860,
+                        "sl": 1.0800,
+                        "tp": 1.0950,
+                        "profit": 50.0,
+                        "magic": 0,
+                        "health": {},
+                    },
+                    {
+                        "position_id": "2",
+                        "symbol": "GBPUSD",
+                        "side": "buy",
+                        "volume": 5.0,
+                        "entry_price": 1.2700,
+                        "mark_price": 1.2710,
+                        "sl": 1.2650,
+                        "tp": 1.2800,
+                        "profit": 50.0,
+                        "magic": 0,
+                        "health": {},
+                    },
+                ],
+                "sync_status": {
+                    "positions_count": 2,
+                    "last_sync_age_ms": 0,
+                    "retry_count": 0,
+                    "stale_warning": False,
+                },
+            },
         )
         monkeypatch.setattr(
             mcp_main,

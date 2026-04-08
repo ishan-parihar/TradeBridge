@@ -218,6 +218,7 @@ class TradeIntent(OwnershipMixin):
         ]
     ] = "human_approval_required"
     requested_at: Optional[str] = None
+    trail_config: Optional[dict] = None
 
 
 class SimulationResult(BaseModel):

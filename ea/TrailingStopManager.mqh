@@ -30,22 +30,30 @@ private:
    datetime          m_last_check_time[];      // last check timestamp
    int               m_check_intervals[];      // check_interval_seconds
    long              m_magic_numbers[];        // magic number filter per entry
+   ENUM_TIMEFRAMES   m_atr_timeframes[];       // ATR timeframe per position
+   int               m_atr_periods[];          // ATR period per position
+   int               m_atr_handles_pos[];      // per-position ATR handle (-1 = use shared default)
    int               m_count;
 
    // Global settings
    int               m_filter_magic_number;    // 0 = no filter, >0 = only trail matching magic
 
-   // ATR cache (shared handle to avoid recreating per position)
+   // ATR cache (shared handle for default H1/14, plus per-position handles for non-default configs)
    int               m_atr_handles[];
    string            m_atr_handle_symbols[];
+   ENUM_TIMEFRAMES   m_atr_handle_timeframes[];
+   int               m_atr_handle_periods[];
 
    CTrade            m_trade;
 
    //--- Find index of ticket in array, -1 if not found
    int               FindIndex(const ulong ticket) const;
 
-   //--- Get ATR value for symbol (cached handles)
-   double            GetATR(const string symbol);
+   //--- Convert timeframe string to ENUM_TIMEFRAMES
+   ENUM_TIMEFRAMES   TimeframeFromString(string tf) const;
+
+   //--- Get ATR value for symbol with specific timeframe/period (cached handles)
+   double            GetATR(const string symbol, ENUM_TIMEFRAMES tf, int period);
 
    //--- Release ATR handle at index
    void              ReleaseATRHandle(const int idx);
@@ -55,11 +63,13 @@ public:
                     ~CTrailingStopManager();
 
    //--- Core API
-   bool              StartTrailing(ulong ticket, double atr_multiplier, int check_interval_seconds, double lock_in_profit_atr = 0.0, long magic_filter = 0);
+   bool              StartTrailing(ulong ticket, double atr_multiplier, int check_interval_seconds, double lock_in_profit_atr = 0.0, long magic_filter = 0, string atr_timeframe = "H1", int atr_period = 14);
    bool              StopTrailing(const ulong ticket);
    int               ProcessAll();              // returns count of positions processed
    int               GetActiveCount() const;
    bool              IsActive(const ulong ticket) const;
+   bool              IsTrailing(const ulong ticket) const;
+   double            GetCurrentTrailSL(const ulong ticket) const;
 
    //--- Get active list as JSON string
    string            GetActiveList() const;
@@ -85,9 +95,15 @@ CTrailingStopManager::CTrailingStopManager()
    ArrayResize(m_last_check_time, 64);
    ArrayResize(m_check_intervals, 64);
    ArrayResize(m_magic_numbers, 64);
+   ArrayResize(m_atr_timeframes, 64);
+   ArrayResize(m_atr_periods, 64);
+   ArrayResize(m_atr_handles_pos, 64);
    ArrayResize(m_atr_handles, 16);
    ArrayResize(m_atr_handle_symbols, 16);
+   ArrayResize(m_atr_handle_timeframes, 16);
+   ArrayResize(m_atr_handle_periods, 16);
    ArrayFill(m_atr_handles, 0, ArraySize(m_atr_handles), INVALID_HANDLE);
+   ArrayFill(m_atr_handles_pos, 0, ArraySize(m_atr_handles_pos), -1);
 }
 
 //+------------------------------------------------------------------+
@@ -95,11 +111,38 @@ CTrailingStopManager::CTrailingStopManager()
 //+------------------------------------------------------------------+
 CTrailingStopManager::~CTrailingStopManager()
 {
+   // Release shared ATR handles
    for(int i = 0; i < ArraySize(m_atr_handles); i++)
    {
       if(m_atr_handles[i] != INVALID_HANDLE)
          IndicatorRelease(m_atr_handles[i]);
    }
+   // Release per-position ATR handles
+   for(int i = 0; i < m_count; i++)
+   {
+      if(m_atr_handles_pos[i] != -1 && m_atr_handles_pos[i] != INVALID_HANDLE)
+         IndicatorRelease(m_atr_handles_pos[i]);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Convert timeframe string to ENUM_TIMEFRAMES                       |
+//+------------------------------------------------------------------+
+ENUM_TIMEFRAMES CTrailingStopManager::TimeframeFromString(string tf) const
+{
+   string s = tf;
+   StringToLower(s);
+   if(s == "m1")  return PERIOD_M1;
+   if(s == "m5")  return PERIOD_M5;
+   if(s == "m15") return PERIOD_M15;
+   if(s == "m30") return PERIOD_M30;
+   if(s == "h1")  return PERIOD_H1;
+   if(s == "h4")  return PERIOD_H4;
+   if(s == "d1")  return PERIOD_D1;
+   if(s == "w1")  return PERIOD_W1;
+   if(s == "mn")  return PERIOD_MN1;
+   if(s == "mn1") return PERIOD_MN1;
+   return PERIOD_H1; // default fallback
 }
 
 //+------------------------------------------------------------------+
@@ -116,15 +159,17 @@ int CTrailingStopManager::FindIndex(const ulong ticket) const
 }
 
 //+------------------------------------------------------------------+
-//| Get cached ATR handle or create new one                           |
+//| Get cached ATR handle or create new one (timeframe/period aware)  |
 //+------------------------------------------------------------------+
-double CTrailingStopManager::GetATR(const string symbol)
+double CTrailingStopManager::GetATR(const string symbol, ENUM_TIMEFRAMES tf, int period)
 {
-   // Find existing handle
+   // Find existing handle matching symbol+timeframe+period
    int handle_idx = -1;
    for(int i = 0; i < ArraySize(m_atr_handle_symbols); i++)
    {
-      if(m_atr_handle_symbols[i] == symbol)
+      if(m_atr_handle_symbols[i] == symbol &&
+         m_atr_handle_timeframes[i] == tf &&
+         m_atr_handle_periods[i] == period)
       {
          handle_idx = i;
          break;
@@ -149,17 +194,26 @@ double CTrailingStopManager::GetATR(const string symbol)
          int new_size = ArraySize(m_atr_handles) + 8;
          ArrayResize(m_atr_handles, new_size);
          ArrayResize(m_atr_handle_symbols, new_size);
+         ArrayResize(m_atr_handle_timeframes, new_size);
+         ArrayResize(m_atr_handle_periods, new_size);
          handle_idx = ArraySize(m_atr_handles) - 8;
          for(int i = handle_idx; i < new_size; i++)
+         {
             m_atr_handles[i] = INVALID_HANDLE;
+            m_atr_handle_timeframes[i] = PERIOD_CURRENT;
+            m_atr_handle_periods[i] = 0;
+         }
       }
 
-      m_atr_handles[handle_idx] = iATR(symbol, PERIOD_H1, 14);
+      m_atr_handles[handle_idx] = iATR(symbol, tf, period);
       m_atr_handle_symbols[handle_idx] = symbol;
+      m_atr_handle_timeframes[handle_idx] = tf;
+      m_atr_handle_periods[handle_idx] = period;
 
       if(m_atr_handles[handle_idx] == INVALID_HANDLE)
       {
-         Print("TrailingStopManager: Failed to create ATR handle for ", symbol);
+         Print("TrailingStopManager: Failed to create ATR handle for ", symbol,
+               " tf=", EnumToString(tf), " period=", period);
          return 0.0;
       }
    }
@@ -188,7 +242,7 @@ void CTrailingStopManager::ReleaseATRHandle(const int idx)
 //+------------------------------------------------------------------+
 //| Start trailing for a position                                     |
 //+------------------------------------------------------------------+
-bool CTrailingStopManager::StartTrailing(ulong ticket, double atr_multiplier, int check_interval_seconds, double lock_in_profit_atr = 0.0, long magic_filter = 0)
+bool CTrailingStopManager::StartTrailing(ulong ticket, double atr_multiplier, int check_interval_seconds, double lock_in_profit_atr = 0.0, long magic_filter = 0, string atr_timeframe = "H1", int atr_period = 14)
 {
    // Validate parameters
    if(atr_multiplier < 0.5 || atr_multiplier > 5.0)
@@ -198,6 +252,11 @@ bool CTrailingStopManager::StartTrailing(ulong ticket, double atr_multiplier, in
    }
    if(check_interval_seconds < 1)
       check_interval_seconds = 1;
+   if(atr_period < 2 || atr_period > 500)
+   {
+      Print("TrailingStopManager: ATR period out of range (2-500): ", atr_period);
+      return false;
+   }
 
    // Verify position exists
    if(!PositionSelectByTicket(ticket))
@@ -226,6 +285,9 @@ bool CTrailingStopManager::StartTrailing(ulong ticket, double atr_multiplier, in
       return false;
    }
 
+   // Convert timeframe string
+   ENUM_TIMEFRAMES tf = TimeframeFromString(atr_timeframe);
+
    // Expand arrays if needed
    if(m_count >= ArraySize(m_tickets))
    {
@@ -240,6 +302,9 @@ bool CTrailingStopManager::StartTrailing(ulong ticket, double atr_multiplier, in
       ArrayResize(m_last_check_time, new_size);
       ArrayResize(m_check_intervals, new_size);
       ArrayResize(m_magic_numbers, new_size);
+      ArrayResize(m_atr_timeframes, new_size);
+      ArrayResize(m_atr_periods, new_size);
+      ArrayResize(m_atr_handles_pos, new_size);
    }
 
    // Store position state
@@ -254,11 +319,33 @@ bool CTrailingStopManager::StartTrailing(ulong ticket, double atr_multiplier, in
    m_last_check_time[idx] = TimeCurrent();
    m_check_intervals[idx] = check_interval_seconds;
    m_magic_numbers[idx] = magic_filter;
+   m_atr_timeframes[idx] = tf;
+   m_atr_periods[idx] = atr_period;
+
+   // Create per-position ATR handle if non-default config
+   bool is_default = (tf == PERIOD_H1 && atr_period == 14);
+   if(!is_default)
+   {
+      m_atr_handles_pos[idx] = iATR(m_symbols[idx], tf, atr_period);
+      if(m_atr_handles_pos[idx] == INVALID_HANDLE)
+      {
+         Print("TrailingStopManager: Failed to create per-position ATR handle for ticket ", ticket,
+               " symbol=", m_symbols[idx], " tf=", EnumToString(tf), " period=", atr_period);
+         return false;
+      }
+   }
+   else
+   {
+      m_atr_handles_pos[idx] = -1; // use shared default cache
+   }
+
    m_count++;
 
    Print("TrailingStopManager: Started trailing ticket ", ticket,
          " symbol=", m_symbols[idx],
          " atr_mult=", atr_multiplier,
+         " atr_tf=", atr_timeframe,
+         " atr_period=", atr_period,
          " lock_in=", lock_in_profit_atr,
          " interval=", check_interval_seconds, "s",
          " entry=", m_entry_price[idx],
@@ -279,6 +366,12 @@ bool CTrailingStopManager::StopTrailing(const ulong ticket)
       return false;
    }
 
+   // Release per-position ATR handle if present
+   if(m_atr_handles_pos[idx] != -1 && m_atr_handles_pos[idx] != INVALID_HANDLE)
+   {
+      IndicatorRelease(m_atr_handles_pos[idx]);
+   }
+
    // Remove by shifting remaining entries
    for(int i = idx; i < m_count - 1; i++)
    {
@@ -292,6 +385,9 @@ bool CTrailingStopManager::StopTrailing(const ulong ticket)
       m_last_check_time[i] = m_last_check_time[i + 1];
       m_check_intervals[i] = m_check_intervals[i + 1];
       m_magic_numbers[i] = m_magic_numbers[i + 1];
+      m_atr_timeframes[i] = m_atr_timeframes[i + 1];
+      m_atr_periods[i] = m_atr_periods[i + 1];
+      m_atr_handles_pos[i] = m_atr_handles_pos[i + 1];
    }
    m_count--;
 
@@ -330,9 +426,22 @@ int CTrailingStopManager::ProcessAll()
       m_last_check_time[i] = now;
       processed++;
 
-      string symbol = m_symbols[i];
-      int pos_type = m_position_types[i];
-      double atr = GetATR(symbol);
+       string symbol = m_symbols[i];
+       int pos_type = m_position_types[i];
+       double atr = 0.0;
+
+       // Use per-position ATR handle if non-default, otherwise use shared cache
+       if(m_atr_handles_pos[i] != -1 && m_atr_handles_pos[i] != INVALID_HANDLE)
+       {
+          double atr_buf[];
+          ArraySetAsSeries(atr_buf, true);
+          if(CopyBuffer(m_atr_handles_pos[i], 0, 0, 1, atr_buf) > 0)
+             atr = atr_buf[0];
+       }
+       else
+       {
+          atr = GetATR(symbol, m_atr_timeframes[i], m_atr_periods[i]);
+       }
 
       if(atr <= 0)
       {
@@ -456,6 +565,24 @@ bool CTrailingStopManager::IsActive(const ulong ticket) const
 }
 
 //+------------------------------------------------------------------+
+//| Check if ticket is actively trailed (alias for IsActive)          |
+//+------------------------------------------------------------------+
+bool CTrailingStopManager::IsTrailing(const ulong ticket) const
+{
+   return FindIndex(ticket) >= 0;
+}
+
+//+------------------------------------------------------------------+
+//| Get current trailing SL for a ticket (0.0 if not trailing)        |
+//+------------------------------------------------------------------+
+double CTrailingStopManager::GetCurrentTrailSL(const ulong ticket) const
+{
+   int idx = FindIndex(ticket);
+   if(idx < 0) return 0.0;
+   return m_last_sl[idx];
+}
+
+//+------------------------------------------------------------------+
 //| Get active trailing stops as JSON                                 |
 //+------------------------------------------------------------------+
 string CTrailingStopManager::GetActiveList() const
@@ -464,11 +591,27 @@ string CTrailingStopManager::GetActiveList() const
    for(int i = 0; i < m_count; i++)
    {
       if(i > 0) out += ",";
+      string tf_str = "";
+      switch(m_atr_timeframes[i])
+      {
+         case PERIOD_M1:  tf_str = "M1";  break;
+         case PERIOD_M5:  tf_str = "M5";  break;
+         case PERIOD_M15: tf_str = "M15"; break;
+         case PERIOD_M30: tf_str = "M30"; break;
+         case PERIOD_H1:  tf_str = "H1";  break;
+         case PERIOD_H4:  tf_str = "H4";  break;
+         case PERIOD_D1:  tf_str = "D1";  break;
+         case PERIOD_W1:  tf_str = "W1";  break;
+         case PERIOD_MN1: tf_str = "MN1"; break;
+         default:         tf_str = "H1";  break;
+      }
       out += StringFormat(
-         "{\"ticket\":\"%I64d\",\"symbol\":\"%s\",\"atr_multiplier\":%G,\"lock_in_atr\":%G,\"last_sl\":%G,\"entry_price\":%G,\"check_interval\":%d}",
+         "{\"ticket\":\"%I64d\",\"symbol\":\"%s\",\"atr_multiplier\":%G,\"atr_timeframe\":\"%s\",\"atr_period\":%d,\"lock_in_atr\":%G,\"last_sl\":%G,\"entry_price\":%G,\"check_interval\":%d}",
          m_tickets[i],
          m_symbols[i],
          m_atr_multipliers[i],
+         tf_str,
+         m_atr_periods[i],
          m_lock_in_values[i],
          m_last_sl[i],
          m_entry_price[i],

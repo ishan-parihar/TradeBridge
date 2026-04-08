@@ -9,6 +9,7 @@
 #include <Trade\Trade.mqh>
 #include "TrailingStopManager.mqh"
 #include "BracketManager.mqh"
+#include "PositionTimeManager.mqh"
 
 // Inputs
 input string GatewayBaseURL = "http://127.0.0.1:8020";
@@ -44,6 +45,9 @@ CTrailingStopManager g_trailing_manager;
 
 // Global bracket order manager
 CBracketManager g_bracket_manager;
+
+// Global position time manager
+CPositionTimeManager g_position_time_manager;
 
 // Custom indicator handle cache (generic iCustom wrapper)
 int g_custom_handles[32];
@@ -492,10 +496,27 @@ int OnInit()
     g_heartbeat_interval = (HeartbeatSeconds * 1000) / poll_ms;
     if(g_heartbeat_interval < 1) g_heartbeat_interval = 1;
      EventSetMillisecondTimer(poll_ms);
-     g_trailing_manager.SetMagicFilter(TrailingMagicFilter);
-     g_bracket_manager.SetMagicFilter(BracketMagicFilter);
-     g_bracket_manager.RecoverFromOrders();
-     return(INIT_SUCCEEDED);
+      g_trailing_manager.SetMagicFilter(TrailingMagicFilter);
+      g_bracket_manager.SetMagicFilter(BracketMagicFilter);
+      g_bracket_manager.RecoverFromOrders();
+
+      // Recover position time exits from position comments
+      ::PositionsTotal();
+      int pos_total = PositionsTotal();
+      for(int i = 0; i < pos_total; i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket))
+         {
+            string cmt = PositionGetString(POSITION_COMMENT);
+            if(StringFind(cmt, "time:") >= 0)
+            {
+               g_position_time_manager.RecoverFromComment(ticket, cmt);
+            }
+         }
+      }
+
+      return(INIT_SUCCEEDED);
   }
 
 void OnDeinit(const int reason)
@@ -577,11 +598,15 @@ void OnTimer()
     // Process commands every tick — this is the low-latency path
     ProcessAllPendingCommands();
     
-   // Process trailing stops
-   if(g_trailing_manager.GetActiveCount() > 0)
-      g_trailing_manager.ProcessAll();
+    // Process trailing stops
+    if(g_trailing_manager.GetActiveCount() > 0)
+       g_trailing_manager.ProcessAll();
 
-   // Process bracket orders
+    // Process position time exits
+    if(g_position_time_manager.GetActiveCount() > 0)
+       g_position_time_manager.CheckAll();
+
+    // Process bracket orders
    if(g_bracket_manager.GetBracketCount() > 0)
       g_bracket_manager.ProcessAll();
 }
@@ -1108,29 +1133,34 @@ string ScreenshotBase64(const string symbol, const string timeframe, const int w
 
 string JsonPositions()
 {
-   int total = PositionsTotal();
-   string out = "{\"positions\":[";
-   for(int i=0;i<total;i++){
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket)){
-         string sym = PositionGetString(POSITION_SYMBOL);
-         int type = (int)PositionGetInteger(POSITION_TYPE);
-         double vol = PositionGetDouble(POSITION_VOLUME);
-         double po = PositionGetDouble(POSITION_PRICE_OPEN);
-         double pc = PositionGetDouble(POSITION_PRICE_CURRENT);
-         double sl = PositionGetDouble(POSITION_SL);
-         double tp = PositionGetDouble(POSITION_TP);
-          double pr = PositionGetDouble(POSITION_PROFIT);
-          long t = (long)PositionGetInteger(POSITION_TIME);
-          long magic = PositionGetInteger(POSITION_MAGIC);
-          string cmt = PositionGetString(POSITION_COMMENT);
-          string item = StringFormat("{\"position_id\":\"%I64d\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":%G,\"entry_price\":%G,\"mark_price\":%G,\"sl\":%G,\"tp\":%G,\"unrealized_pnl\":%G,\"opened_at\":%I64d,\"magic\":%I64d,\"comment\":\"%s\"}",
-             ticket, sym, (type==POSITION_TYPE_BUY?"buy":"sell"), vol, po, pc, sl, tp, pr, t, magic, JsonEscape(cmt));
-         out += item; if(i<total-1) out += ",";
-      }
-   }
-   out += "]}";
-   return out;
+    // Force MT5 to refresh its position cache before iterating
+    ::PositionsTotal();
+    int total = PositionsTotal();
+    string out = "{\"positions\":[";
+    for(int i=0;i<total;i++){
+       ulong ticket = PositionGetTicket(i);
+       if(PositionSelectByTicket(ticket)){
+          string sym = PositionGetString(POSITION_SYMBOL);
+          int type = (int)PositionGetInteger(POSITION_TYPE);
+          double vol = PositionGetDouble(POSITION_VOLUME);
+          double po = PositionGetDouble(POSITION_PRICE_OPEN);
+          double pc = PositionGetDouble(POSITION_PRICE_CURRENT);
+          double sl = PositionGetDouble(POSITION_SL);
+          double tp = PositionGetDouble(POSITION_TP);
+           double pr = PositionGetDouble(POSITION_PROFIT);
+           long t = (long)PositionGetInteger(POSITION_TIME);
+           long magic = PositionGetInteger(POSITION_MAGIC);
+            string cmt = PositionGetString(POSITION_COMMENT);
+            bool trail_active = g_trailing_manager.IsTrailing(ticket);
+            double trail_sl = trail_active ? g_trailing_manager.GetCurrentTrailSL(ticket) : 0.0;
+            string time_health = g_position_time_manager.GetTimeHealth(ticket);
+            string item = StringFormat("{\"position_id\":\"%I64d\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":%G,\"entry_price\":%G,\"mark_price\":%G,\"sl\":%G,\"tp\":%G,\"unrealized_pnl\":%G,\"opened_at\":%I64d,\"magic\":%I64d,\"comment\":\"%s\",\"trail_active\":%s,\"trail_current_sl\":%G,\"time_health\":%s}",
+               ticket, sym, (type==POSITION_TYPE_BUY?"buy":"sell"), vol, po, pc, sl, tp, pr, t, magic, JsonEscape(cmt), (trail_active?"true":"false"), trail_sl, time_health);
+          out += item; if(i<total-1) out += ",";
+       }
+    }
+    out += "]}";
+    return out;
 }
 
 string JsonOrders()
@@ -1866,62 +1896,124 @@ void ProcessCommand(const string cmd)
        if(ParseKV(cmd, "tp", tps)) tp = StringToDouble(tps);
        if(ParseKV(cmd, "deviation", devs)) dev = (int)StringToInteger(devs);
        
-       // Ownership fields (optional, default 0 / "")
-       string mns; long magic_number = 0;
-       if(ParseKV(cmd, "magic_number", mns)) magic_number = (long)StringToInteger(mns);
-       string order_comment = "";
-       ParseKV(cmd, "comment", order_comment);
-      
-      // Get current prices for SL/TP validation
-      double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-      double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-      if(ask==0 || bid==0) { Fail(rid, "invalid_prices"); return; }
-      
-      // Validate SL/TP distances (minimum 10 points)
-      double min_distance = 10.0 * point;
-      if(sl > 0) {
-         double sl_distance = MathAbs((side=="buy" ? bid - sl : sl - ask));
-         if(sl_distance < min_distance) { Fail(rid, "sl_too_close"); return; }
-      }
-      if(tp > 0) {
-         double tp_distance = MathAbs((side=="buy" ? tp - ask : bid - tp));
-         if(tp_distance < min_distance) { Fail(rid, "tp_too_close"); return; }
-      }
-      
-      string side_lower = side;
-      StringToLower(side_lower);
-      ENUM_ORDER_TYPE ot = (side_lower=="buy" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-      
-      // Detect supported filling mode
-      int filling_mask = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-      ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_FOK;
-       if((filling_mask & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) filling = ORDER_FILLING_FOK;
-       else if((filling_mask & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) filling = ORDER_FILLING_IOC;
-      
-       MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
-       req.action = TRADE_ACTION_DEAL;
-       req.symbol = sym;
-       req.volume = vol;
-       req.type = ot;
-       req.type_filling = filling;
-       req.deviation = dev;
-        req.magic = (ulong)magic_number;
-       req.comment = order_comment;
-       if(sl>0) req.sl = sl; if(tp>0) req.tp = tp;
-       bool ok = OrderSend(req, res);
-       // MANUAL VERIFICATION CHECKLIST (submit_order ownership fields):
-       // 1. Verify req.magic_number matches the value sent from gateway
-       // 2. Verify req.comment matches the comment string from gateway
-       // 3. Confirm deal history shows correct magic_number (HistoryDealGetInteger DEAL_MAGIC)
-       // 4. Confirm deal history shows correct comment (HistoryDealGetString DEAL_COMMENT)
-       // 5. Test with magic_number=0 and comment="" (defaults should work)
-       // 6. Test with non-zero magic_number and non-empty comment
-       string payload = StringFormat("{\"retcode\":%d,\"order\":%I64d,\"deal\":%I64d,\"ask\":%G,\"bid\":%G,\"filling\":\"%s\"}", res.retcode, res.order, res.deal, ask, bid, EnumToString(filling));
-      if(ok && res.retcode==10009 /*TRADE_RETCODE_DONE*/)
-         Complete(rid, payload);
-      else
-         Fail(rid, payload);
+        // Ownership fields (optional, default 0 / "")
+        string mns; long magic_number = 0;
+        if(ParseKV(cmd, "magic_number", mns)) magic_number = (long)StringToInteger(mns);
+        string order_comment = "";
+        ParseKV(cmd, "comment", order_comment);
+
+        // Trail config fields (optional, only activate when explicitly provided)
+        string trail_atr_s, trail_lock_s, trail_interval_s, trail_tf_s, trail_period_s;
+        bool has_trail_config = false;
+        double trail_atr_multiplier = 2.0;
+        double trail_lock_profit_atr = 1.0;
+        int trail_check_interval = 10;
+        string trail_timeframe = "H1";
+        int trail_atr_period = 14;
+        if(ParseKV(cmd, "trail_atr_multiplier", trail_atr_s)) { trail_atr_multiplier = StringToDouble(trail_atr_s); has_trail_config = true; }
+        if(ParseKV(cmd, "trail_lock_profit_atr", trail_lock_s)) { trail_lock_profit_atr = StringToDouble(trail_lock_s); has_trail_config = true; }
+        if(ParseKV(cmd, "trail_check_interval", trail_interval_s)) { trail_check_interval = (int)StringToInteger(trail_interval_s); has_trail_config = true; }
+        if(ParseKV(cmd, "trail_timeframe", trail_tf_s)) { trail_timeframe = trail_tf_s; has_trail_config = true; }
+         if(ParseKV(cmd, "trail_atr_period", trail_period_s)) { trail_atr_period = (int)StringToInteger(trail_period_s); has_trail_config = true; }
+
+         // Time-based exit config fields (optional, only activate when explicitly provided)
+         string max_hold_bars_s, min_profit_pts_s, hold_timeframe_s;
+         bool has_time_config = false;
+         int max_hold_bars = 0;
+         double min_profit_points = 0.0;
+         string hold_timeframe = "H1";
+         if(ParseKV(cmd, "max_hold_bars", max_hold_bars_s)) { max_hold_bars = (int)StringToInteger(max_hold_bars_s); has_time_config = true; }
+         if(ParseKV(cmd, "min_profit_points", min_profit_pts_s)) { min_profit_points = StringToDouble(min_profit_pts_s); has_time_config = true; }
+         if(ParseKV(cmd, "hold_timeframe", hold_timeframe_s)) { hold_timeframe = hold_timeframe_s; has_time_config = true; }
+
+        // Get current prices for SL/TP validation
+       double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+       double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+       double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+       if(ask==0 || bid==0) { Fail(rid, "invalid_prices"); return; }
+
+       // Validate SL/TP distances (minimum 10 points)
+       double min_distance = 10.0 * point;
+       if(sl > 0) {
+          double sl_distance = MathAbs((side=="buy" ? bid - sl : sl - ask));
+          if(sl_distance < min_distance) { Fail(rid, "sl_too_close"); return; }
+       }
+       if(tp > 0) {
+          double tp_distance = MathAbs((side=="buy" ? tp - ask : bid - tp));
+          if(tp_distance < min_distance) { Fail(rid, "tp_too_close"); return; }
+       }
+
+       string side_lower = side;
+       StringToLower(side_lower);
+       ENUM_ORDER_TYPE ot = (side_lower=="buy" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+
+       // Detect supported filling mode
+       int filling_mask = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+       ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_FOK;
+        if((filling_mask & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) filling = ORDER_FILLING_FOK;
+        else if((filling_mask & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) filling = ORDER_FILLING_IOC;
+
+         // Build comment with trail and time config for recovery
+         string final_comment = order_comment;
+         if(has_trail_config) {
+            string trail_tag = StringFormat("trail:atr=%.1f|lock=%.1f|int=%d|tf=%s|per=%d",
+               trail_atr_multiplier, trail_lock_profit_atr, trail_check_interval, trail_timeframe, trail_atr_period);
+            if(final_comment != "") {
+               final_comment = final_comment + ";" + trail_tag;
+            } else {
+               final_comment = trail_tag;
+            }
+         }
+         if(has_time_config && max_hold_bars > 0) {
+            string time_tag = StringFormat("time:bars=%d|tf=%s|minprof=%.0f",
+               max_hold_bars, hold_timeframe, min_profit_points);
+            if(final_comment != "") {
+               final_comment = final_comment + ";" + time_tag;
+            } else {
+               final_comment = time_tag;
+            }
+         }
+
+        MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+        req.action = TRADE_ACTION_DEAL;
+        req.symbol = sym;
+        req.volume = vol;
+        req.type = ot;
+        req.type_filling = filling;
+        req.deviation = dev;
+         req.magic = (ulong)magic_number;
+        req.comment = final_comment;
+        if(sl>0) req.sl = sl; if(tp>0) req.tp = tp;
+        bool ok = OrderSend(req, res);
+        // MANUAL VERIFICATION CHECKLIST (submit_order ownership fields):
+        // 1. Verify req.magic_number matches the value sent from gateway
+        // 2. Verify req.comment matches the comment string from gateway
+        // 3. Confirm deal history shows correct magic_number (HistoryDealGetInteger DEAL_MAGIC)
+        // 4. Confirm deal history shows correct comment (HistoryDealGetString DEAL_COMMENT)
+        // 5. Test with magic_number=0 and comment="" (defaults should work)
+        // 6. Test with non-zero magic_number and non-empty comment
+        string payload = StringFormat("{\"retcode\":%d,\"order\":%I64d,\"deal\":%I64d,\"ask\":%G,\"bid\":%G,\"filling\":\"%s\"}", res.retcode, res.order, res.deal, ask, bid, EnumToString(filling));
+       if(ok && res.retcode==10009 /*TRADE_RETCODE_DONE*/)
+       {
+           // Auto-start trailing if config was provided
+           if(has_trail_config && res.order > 0) {
+              ulong position_ticket = res.order;
+              if(PositionSelectByTicket(position_ticket)) {
+                 g_trailing_manager.StartTrailing(position_ticket, trail_atr_multiplier, trail_check_interval, trail_lock_profit_atr, magic_number, trail_timeframe, trail_atr_period);
+              }
+           }
+           // Auto-register time-based exit if config was provided
+           if(has_time_config && max_hold_bars > 0 && res.order > 0) {
+              ulong position_ticket = res.order;
+              if(PositionSelectByTicket(position_ticket)) {
+                 ENUM_TIMEFRAMES ht_tf = TfFromString(hold_timeframe);
+                 g_position_time_manager.RegisterPosition(position_ticket, sym, max_hold_bars, ht_tf, min_profit_points);
+              }
+           }
+           Complete(rid, payload);
+       }
+       else
+          Fail(rid, payload);
    } else if(type=="get_positions"){
       Complete(rid, JsonPositions());
    } else if(type=="get_orders"){
@@ -2025,21 +2117,27 @@ void ProcessCommand(const string cmd)
         int ha = (int)StringToInteger(has);
         if(ha < 1) ha = 24;
         Complete(rid, JsonCalendar(cur, ha, mi));
-     } else if(type=="trailing_start"){
-        string tk; string amps; string cis; string lps; string mns;
-        if(!ParseKV(cmd, "ticket", tk) || !ParseKV(cmd, "atr_multiplier", amps) || !ParseKV(cmd, "check_interval", cis)) { Fail(rid, "bad_args"); return; }
-        ulong ticket = (ulong)StringToInteger(tk);
-        double atr_mult = StringToDouble(amps);
-        int check_interval = (int)StringToInteger(cis);
-        double lock_in = 0.0;
-        if(ParseKV(cmd, "lock_in_profit_atr", lps)) lock_in = StringToDouble(lps);
-        long magic_filter = 0;
-        if(ParseKV(cmd, "magic_filter", mns)) magic_filter = (long)StringToInteger(mns);
-        bool ok = g_trailing_manager.StartTrailing(ticket, atr_mult, check_interval, lock_in, magic_filter);
-        if(ok)
-           Complete(rid, StringFormat("{\"status\":\"ok\",\"ticket\":\"%I64d\",\"atr_multiplier\":%G,\"lock_in_profit_atr\":%G}", ticket, atr_mult, lock_in));
-        else
-           Fail(rid, StringFormat("{\"error\":\"trailing_start_failed\",\"ticket\":\"%I64d\"}", ticket));
+      } else if(type=="trailing_start"){
+         string tk; string amps; string cis; string lps; string mns;
+         if(!ParseKV(cmd, "ticket", tk) || !ParseKV(cmd, "atr_multiplier", amps) || !ParseKV(cmd, "check_interval", cis)) { Fail(rid, "bad_args"); return; }
+         ulong ticket = (ulong)StringToInteger(tk);
+         double atr_mult = StringToDouble(amps);
+         int check_interval = (int)StringToInteger(cis);
+         double lock_in = 0.0;
+         if(ParseKV(cmd, "lock_in_profit_atr", lps)) lock_in = StringToDouble(lps);
+         long magic_filter = 0;
+         if(ParseKV(cmd, "magic_filter", mns)) magic_filter = (long)StringToInteger(mns);
+         string atr_timeframe = "H1";
+         string atfs;
+         if(ParseKV(cmd, "atr_timeframe", atfs)) atr_timeframe = atfs;
+         int atr_period = 14;
+         string aps;
+         if(ParseKV(cmd, "atr_period", aps)) atr_period = (int)StringToInteger(aps);
+         bool ok = g_trailing_manager.StartTrailing(ticket, atr_mult, check_interval, lock_in, magic_filter, atr_timeframe, atr_period);
+         if(ok)
+            Complete(rid, StringFormat("{\"status\":\"ok\",\"ticket\":\"%I64d\",\"atr_multiplier\":%G,\"atr_timeframe\":\"%s\",\"atr_period\":%d,\"lock_in_profit_atr\":%G}", ticket, atr_mult, atr_timeframe, atr_period, lock_in));
+         else
+            Fail(rid, StringFormat("{\"error\":\"trailing_start_failed\",\"ticket\":\"%I64d\"}", ticket));
      } else if(type=="trailing_stop"){
         string tk;
         if(!ParseKV(cmd, "ticket", tk)) { Fail(rid, "bad_args"); return; }

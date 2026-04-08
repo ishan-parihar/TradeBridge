@@ -169,9 +169,13 @@ def test_resource_positions_open_falls_back_to_bridge_data(monkeypatch) -> None:
 
     result = mcp_main.resource_positions_open()
 
-    assert len(result) == 1
-    assert result[0].position_id == "1"
-    assert result[0].symbol == "BTCUSDm"
+    assert "positions" in result
+    assert "sync_status" in result
+    positions = result["positions"]
+    assert len(positions) == 1
+    assert positions[0]["position_id"] == "1"
+    assert positions[0]["symbol"] == "BTCUSDm"
+    assert "health" in positions[0]
 
 
 def test_resource_orders_pending_falls_back_to_bridge_data(monkeypatch) -> None:
