@@ -665,9 +665,10 @@ class DataStore:
         """Close the SQLite connection."""
         if self._conn:
             self._conn.close()
+            self._conn = None
 
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
+    def __enter__(self) -> "DataStore":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()

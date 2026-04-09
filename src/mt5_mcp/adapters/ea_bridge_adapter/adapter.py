@@ -52,7 +52,10 @@ class EABridgeAdapter(ExecutionPort):
         self._last_heartbeat: dict[str, Any] = {}
         self._last_heartbeat_time: float = 0.0
         # Persistent HTTP client with Keep-Alive (connection pooling)
-        self._client = httpx.Client(
+        self._client = self._create_client()
+
+    def _create_client(self) -> httpx.Client:
+        return httpx.Client(
             base_url=self.gateway_url,
             timeout=10.0,
             http2=False,
@@ -67,11 +70,22 @@ class EABridgeAdapter(ExecutionPort):
         """Close the persistent HTTP client."""
         if self._client:
             self._client.close()
+            self._client = None
+
+    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        if self._client is None or self._client.is_closed:
+            self._client = self._create_client()
+        try:
+            return getattr(self._client, method)(url, **kwargs)
+        except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadTimeout):
+            logger.warning("HTTP client connection failed, recreating and retrying")
+            self._client = self._create_client()
+            return getattr(self._client, method)(url, **kwargs)
 
     def _check_ea_connected(self) -> bool:
         """Check if EA is connected by checking bridge terminal status."""
         try:
-            r = self._client.get("/bridge/terminal/status")
+            r = self._request("get", "/bridge/terminal/status")
             if r.status_code == 200:
                 data = r.json()
                 connected = data.get("connected", False)
@@ -84,7 +98,8 @@ class EABridgeAdapter(ExecutionPort):
         """Enqueue a command and return the request ID."""
         try:
             params = {"type": cmd_type, **payload}
-            r = self._client.post(
+            r = self._request(
+                "post",
                 "/bridge/commands/enqueue",
                 params=params,
             )
@@ -107,7 +122,7 @@ class EABridgeAdapter(ExecutionPort):
         end = _t.time() + timeout_s
         while _t.time() < end:
             try:
-                r = self._client.get(f"/bridge/results/{request_id}")
+                r = self._request("get", f"/bridge/results/{request_id}")
                 if r.status_code == 200:
                     data = r.json()
                     status = data.get("status")
@@ -136,7 +151,7 @@ class EABridgeAdapter(ExecutionPort):
 
     def terminal_status(self) -> TerminalStatus:
         try:
-            r = self._client.get("/bridge/terminal/status")
+            r = self._request("get", "/bridge/terminal/status")
             if r.status_code == 200:
                 data = r.json()
                 return TerminalStatus(**data)

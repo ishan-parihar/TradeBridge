@@ -38,7 +38,10 @@ class InMemoryQueue:
                 existing = self._idem.get(idempotency_key)
                 if existing:
                     cmd_id, timestamp = existing
-                    if time.time() - timestamp < self._idempotency_ttl:
+                    ttl = getattr(self, "_idempotency_ttl", None)
+                    if ttl is None:
+                        ttl = float(get_settings().idempotency_ttl_seconds)
+                    if time.time() - timestamp < ttl:
                         return cmd_id
                     else:
                         del self._idem[idempotency_key]
@@ -125,14 +128,28 @@ class RedisQueue:
         return cmd_id
 
     def next(self) -> Optional[Command]:
-        # Pop from the right to process FIFO (lpush + rpop)
-        cmd_id = self._r.rpop(self._list_key)
-        if not cmd_id:
+        lua_script = """
+        local cmd_id = redis.call('RPOP', KEYS[1])
+        if not cmd_id then return nil end
+        local hash_key = ARGV[1] .. cmd_id
+        local h = redis.call('HGETALL', hash_key)
+        if #h == 0 then return nil end
+        redis.call('HSET', hash_key, 'status', 'assigned')
+        local result = {cmd_id}
+        for i = 1, #h do table.insert(result, h[i]) end
+        return result
+        """
+        result = self._r.eval(lua_script, 1, self._list_key, self._hash_prefix)
+        if not result:
             return None
-        h = self._r.hgetall(self._hash_prefix + cmd_id)
+        cmd_id = result[0] if isinstance(result, list) else result
+        h = {}
+        if isinstance(result, list) and len(result) > 1:
+            for i in range(1, len(result), 2):
+                if i + 1 < len(result):
+                    h[result[i]] = result[i + 1]
         if not h:
             return None
-        self._r.hset(self._hash_prefix + cmd_id, "status", "assigned")
         payload = json.loads(h.get("payload", "{}"))
         return Command(
             id=cmd_id,
@@ -143,12 +160,14 @@ class RedisQueue:
         )
 
     def complete(self, id_: str, result: dict[str, Any]) -> bool:
-        if not self._r.hset(
-            self._hash_prefix + id_,
-            mapping={"status": "completed", "result": json.dumps(result)},
-        ):
+        try:
+            self._r.hset(
+                self._hash_prefix + id_,
+                mapping={"status": "completed", "result": json.dumps(result)},
+            )
+            return True
+        except Exception:
             return False
-        return True
 
     def fail(self, id_: str, error: str) -> bool:
         if not self._r.hset(
@@ -206,4 +225,4 @@ def get_queue():
 
 
 # Keep old name for backwards compatibility but use lazy init
-queue_singleton = get_queue()
+queue_singleton = None

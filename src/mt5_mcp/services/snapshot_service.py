@@ -85,10 +85,20 @@ class SymbolSnapshotService:
         coaching advice, and current exposure.
         """
         symbol_upper = symbol.upper()
+        warnings = self._validate_inputs(
+            symbol_upper=symbol_upper,
+            bars_data=bars_data,
+            atr_value=atr_value,
+            rsi=rsi,
+            bid=bid,
+            ask=ask,
+        )
+
         result: dict[str, Any] = {
             "symbol": symbol_upper,
             "timeframe": timeframe,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data_quality": warnings if warnings else None,
         }
 
         # ====== 1. PRICE DATA ======
@@ -209,6 +219,47 @@ class SymbolSnapshotService:
         )
 
         return result
+
+    # ----------------------------------------------------------------
+    # Data validation
+    # ----------------------------------------------------------------
+
+    def _validate_inputs(
+        self,
+        *,
+        symbol_upper: str,
+        bars_data: list[dict] | None,
+        atr_value: float | None,
+        rsi: float | None,
+        bid: float | None,
+        ask: float | None,
+    ) -> list[str]:
+        warnings: list[str] = []
+
+        if bars_data:
+            required = {"open", "high", "low", "close"}
+            bad_bars = [
+                i for i, b in enumerate(bars_data) if not required.issubset(b.keys())
+            ]
+            if bad_bars:
+                warnings.append(
+                    f"{len(bad_bars)} bar(s) missing OHLC fields — indicators may be inaccurate"
+                )
+            if len(bars_data) < 50:
+                warnings.append(
+                    f"Only {len(bars_data)} bars provided — indicators (EMA, MACD) need 50+ for accuracy"
+                )
+
+        if atr_value is not None and atr_value <= 0:
+            warnings.append(f"ATR value non-positive: {atr_value}")
+
+        if rsi is not None and (rsi < 0 or rsi > 100):
+            warnings.append(f"RSI out of range [0,100]: {rsi}")
+
+        if bid is not None and ask is not None and bid > ask:
+            warnings.append(f"Bid ({bid}) exceeds ask ({ask}) — possible stale data")
+
+        return warnings
 
     # ----------------------------------------------------------------
     # Private helpers
