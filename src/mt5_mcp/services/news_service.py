@@ -350,13 +350,11 @@ def _filter_by_time(items: list[NewsItem], hours_back: int) -> list[NewsItem]:
         if not item.pub_date:
             continue
         try:
-            # Try various date formats
             pub_dt = _parse_date(item.pub_date)
-            if pub_dt and pub_dt >= cutoff:
+            if pub_dt is not None and pub_dt >= cutoff:
                 filtered.append(item)
         except (ValueError, TypeError):
-            # Keep items with unparseable dates (might be recent)
-            filtered.append(item)
+            continue
 
     return filtered
 

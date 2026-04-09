@@ -174,6 +174,40 @@ class VolatilityProfileRequest(BaseModel):
     atr_period: int = 14
 
 
+class DivergenceRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    lookback: int = 50
+    count: int = 200
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal_period: int = 9
+    rsi_period: int = 14
+    swing_window: int = 5
+
+
+class VolumeProfileRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    lookback: int = 20
+
+
+class MultiBarPatternsRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    lookback: int = 50
+    period: int = 20
+    fib_lookback: int = 50
+
+
+class MomentumCheckRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    lookback: int = 50
+    rsi: float | None = None
+    atr: float | None = None
+
+
 class MultiTimeframeIndicatorRequest(BaseModel):
     symbol: str
     indicator: Literal[
@@ -415,11 +449,13 @@ class WaitDelayRequest(BaseModel):
     """Simple time-based delay for AI agent trading loops."""
 
     duration_seconds: int = 60
+    symbol: str | None = None
 
 
 class WaitDelayResult(BaseModel):
     waited_seconds: int
     resumed_at: str
+    market_summary: dict | None = None
 
 
 class WaitForIndicatorRequest(BaseModel):
@@ -594,20 +630,6 @@ class TradingCoachRequest(BaseModel):
     daily_pnl: float = 0.0
     recent_consecutive_losses: int = 0
     position_in_range: float | None = None  # 0-100
-
-
-class AgentSystemPromptRequest(BaseModel):
-    """Get the system prompt that orients a new trading agent."""
-
-    include_market_context: bool = True
-    include_news_context: bool = True
-    include_workflow: bool = True
-    include_trading_rules: bool = True
-    include_tool_guide: bool = True
-    include_metacognition: bool = True
-    live_account_context: bool = False  # Fetch live account data and inject
-    live_symbol_context: list[str] | None = None  # Symbols to inject context for
-    include_recent_news: bool = False  # Fetch latest news and inject
 
 
 class TradingDecisionSupportRequest(BaseModel):

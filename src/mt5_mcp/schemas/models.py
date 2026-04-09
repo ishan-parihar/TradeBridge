@@ -196,7 +196,9 @@ class MarginEstimate(BaseModel):
 
 
 class TradeIntent(OwnershipMixin):
-    account_id: str
+    account_id: str = (
+        "demo"  # Optional — defaults to "demo" for MCP agent compatibility
+    )
     environment: Literal["paper", "demo", "live"] = "demo"
     symbol: str
     side: Literal["buy", "sell"]

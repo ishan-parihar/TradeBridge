@@ -27,6 +27,11 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
+try:
+    from mt5_mcp.services.multi_bar_patterns import detect_multi_bar_patterns
+except ImportError:
+    detect_multi_bar_patterns = None
+
 
 class ChartIntelligenceService:
     """Aggregates chart analysis into a single agent-friendly payload.
@@ -111,6 +116,9 @@ class ChartIntelligenceService:
 
         # ====== 7. RECENT KEY LEVELS ======
         result["key_levels"] = self._extract_key_levels(bars)
+
+        # ====== 8. MULTI-BAR PATTERNS ======
+        result["multi_bar_patterns"] = self._detect_multi_bar_patterns(bars, bbands)
 
         # ====== Meta ======
         result["meta"] = {
@@ -688,3 +696,24 @@ class ChartIntelligenceService:
             "last_swing_low": round(swing_low, 6) if swing_low else None,
             "range_points": round(highest - lowest, 6) if highest and lowest else None,
         }
+
+    def _detect_multi_bar_patterns(self, bars: list[dict], bbands: dict | None) -> dict:
+        """Detect multi-bar chart patterns (W-Bottom, M-Top, Squeeze, Breakout, Gap, Fibonacci)."""
+        if detect_multi_bar_patterns is None:
+            return {
+                "available": False,
+                "note": "multi_bar_patterns module not available",
+            }
+        if len(bars) < 20:
+            return {
+                "available": False,
+                "note": "insufficient_data",
+                "min_bars": 20,
+                "available_bars": len(bars),
+            }
+        try:
+            return detect_multi_bar_patterns(
+                bars, bbands=bbands, period=20, fib_lookback=50
+            )
+        except Exception as e:
+            return {"available": False, "error": str(e)}

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+import time
+from collections import OrderedDict
+from typing import Any
 
 from mt5_mcp.adapters.common.ports import ExecutionPort
 from mt5_mcp.adapters.pymt5_adapter.adapter import PyMT5Adapter
@@ -20,6 +22,37 @@ from mt5_mcp.settings.config import derive_magic_number, get_settings
 from mt5_mcp.observability.logging import logger
 
 
+class IdempotencyCache:
+    """Bounded LRU cache with TTL for idempotency keys."""
+
+    def __init__(self, max_size: int = 10000, ttl: float = 3600):
+        self._cache: OrderedDict[str, tuple[Any, float]] = OrderedDict()
+        self._max_size = max_size
+        self._ttl = ttl
+
+    def get(self, key: str) -> Any | None:
+        if key in self._cache:
+            result, timestamp = self._cache[key]
+            if time.time() - timestamp < self._ttl:
+                self._cache.move_to_end(key)
+                return result
+            else:
+                del self._cache[key]
+        self._cleanup()
+        return None
+
+    def set(self, key: str, result: Any) -> None:
+        while len(self._cache) >= self._max_size:
+            self._cache.popitem(last=False)
+        self._cache[key] = (result, time.time())
+
+    def _cleanup(self) -> None:
+        now = time.time()
+        expired = [k for k, (_, ts) in self._cache.items() if now - ts >= self._ttl]
+        for k in expired:
+            del self._cache[k]
+
+
 class ExecutionGateway:
     """Routes read/write calls to the active adapter.
 
@@ -31,7 +64,7 @@ class ExecutionGateway:
         self.adapter: ExecutionPort = adapter or self._load_adapter(
             self.settings.adapter
         )
-        self._idempotency_registry: dict[str, ExecutionResult] = {}
+        self._idempotency_registry = IdempotencyCache()
 
     def _load_adapter(self, name: str) -> ExecutionPort:
         # Try EA Bridge adapter first (preferred when EA is connected)
@@ -87,12 +120,15 @@ class ExecutionGateway:
 
     # Write-path (guard elsewhere)
     def submit_order(self, req: TradeIntent) -> ExecutionResult:
-        if req.idempotency_key and req.idempotency_key in self._idempotency_registry:
+        cached = req.idempotency_key and self._idempotency_registry.get(
+            req.idempotency_key
+        )
+        if cached:
             logger.info(f"Idempotent replay: {req.idempotency_key}")
-            return self._idempotency_registry[req.idempotency_key]
+            return cached
 
         result = self.adapter.submit_order(req)
 
         if req.idempotency_key:
-            self._idempotency_registry[req.idempotency_key] = result
+            self._idempotency_registry.set(req.idempotency_key, result)
         return result

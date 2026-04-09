@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import FastAPI, HTTPException, Request
 from datetime import datetime, timezone
 from typing import Optional
@@ -146,9 +148,6 @@ def bridge_account_summary() -> AccountSummary:
 @app.post("/bridge/market/bars", response_model=Bars)
 async def bridge_bars(symbol: str, timeframe: str, count: int = 100) -> Bars:
     """Fetch bars via EA bridge with fallback to pymt5"""
-    import asyncio
-    import json
-
     # Check if EA is connected
     if _last_heartbeat_at:
         from datetime import datetime, timezone
@@ -213,8 +212,6 @@ async def bridge_terminal_heartbeat(request: Request) -> dict[str, str]:
     logger.info(f"HEARTBEAT RAW BODY: {raw_body}")
 
     # Parse JSON directly from stripped body (avoid request.json() which re-reads)
-    import json
-
     try:
         if not raw_body:
             data = {}
@@ -466,8 +463,6 @@ async def bridge_results(request: Request) -> dict[str, str]:
 
     # Parse JSON
     data: dict[str, object] = {}
-    import json
-
     try:
         body_json = json.loads(raw_text) if raw_text else {}
         logger.info(f"RESULTS_JSON: parsed={body_json}")

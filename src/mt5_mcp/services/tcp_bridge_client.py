@@ -32,6 +32,7 @@ class TCPBridgeClient:
         "_running",
         "_reconnect_task",
         "_max_reconnect_delay",
+        "_connected_event",
     )
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8026):
@@ -44,6 +45,7 @@ class TCPBridgeClient:
         self._running: bool = False
         self._reconnect_task: asyncio.Task | None = None
         self._max_reconnect_delay: float = 30.0
+        self._connected_event: asyncio.Event | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -55,12 +57,17 @@ class TCPBridgeClient:
         )
 
     async def _reconnect_loop(self, max_reconnect_delay: float = 30.0) -> None:
+        if self._connected_event is None:
+            self._connected_event = asyncio.Event()
+        self._connected_event.clear()
         delay = 1.0
         while self._running:
             try:
                 self._reader, self._writer = await asyncio.open_connection(
                     self._host, self._port
                 )
+                if self._connected_event:
+                    self._connected_event.set()
                 delay = 1.0
                 await self._recv_loop()
             except Exception:
@@ -78,12 +85,9 @@ class TCPBridgeClient:
     async def connect(self, max_reconnect_delay: float = 30.0) -> None:
         self._max_reconnect_delay = max_reconnect_delay
         self._running = True
+        self._connected_event = asyncio.Event()
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
-        for _ in range(50):
-            if self._writer and self._writer.is_closing() is False:
-                return
-            await asyncio.sleep(0.1)
-        raise ConnectionError(f"Could not connect to {self._host}:{self._port}")
+        await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
 
     async def close(self) -> None:
         self._running = False
@@ -131,7 +135,11 @@ class TCPBridgeClient:
 
                 import json
 
-                frame = json.loads(json_bytes)
+                try:
+                    frame = json.loads(json_bytes)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Malformed JSON frame from EA: {e}")
+                    continue
                 request_id = frame.get("request_id", "")
                 fut = self._pending.pop(request_id, None)
                 if fut and not fut.done():

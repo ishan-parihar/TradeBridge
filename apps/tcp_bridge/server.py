@@ -175,6 +175,18 @@ class TCPBridgeServer:
             await self._forward_heartbeat_to_gateway(frame)
         else:
             logger.warning(f"Unsolicited frame from EA: {frame}")
+            if request_id and self._ea_writer and not self._ea_writer.is_closing():
+                try:
+                    ack_frame = {
+                        "request_id": request_id,
+                        "status": "ok",
+                        "type": "ack",
+                        "message": "result received but request already timed out",
+                    }
+                    self._ea_writer.write(encode_frame(ack_frame))
+                    await self._ea_writer.drain()
+                except Exception as e:
+                    logger.warning(f"Failed to send ACK for orphaned frame: {e}")
 
     async def _forward_heartbeat_to_gateway(self, frame: dict[str, Any]) -> None:
         """Relay TCP heartbeat to HTTP gateway so EABridgeAdapter sees EA as connected."""

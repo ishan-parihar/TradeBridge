@@ -163,6 +163,23 @@ _OWNERSHIP_PROPERTIES: dict[str, Any] = {
     "magic_number": {"type": ["number", "string"]},
 }
 
+_TOOL_NAME_ALIASES: dict[str, str] = {}
+
+
+def _build_tool_name_aliases() -> dict[str, str]:
+    if _TOOL_NAME_ALIASES:
+        return _TOOL_NAME_ALIASES
+    for canonical in TOOL_SPECS:
+        normalized = "mt5-mcp_" + canonical.replace("/", "_")
+        _TOOL_NAME_ALIASES[normalized] = canonical
+    return _TOOL_NAME_ALIASES
+
+
+def _normalize_tool_name(name: str) -> str:
+    aliases = _build_tool_name_aliases()
+    return aliases.get(name, name)
+
+
 _NUMERIC_FIELDS: dict[str, set[str]] = {
     "get_bars": {"count"},
     "deals_history": {"limit", "days"},
@@ -200,6 +217,18 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
     "portfolio/risk": {"days", "limit"},
     "trail_position": {"distance_points", "lock_in_points"},
     "volatility_profile": {"lookback", "atr_period"},
+    "analysis/divergence": {
+        "lookback",
+        "count",
+        "macd_fast",
+        "macd_slow",
+        "macd_signal_period",
+        "rsi_period",
+        "swing_window",
+    },
+    "analysis/multi_bar_patterns": {"lookback", "period", "fib_lookback"},
+    "analysis/volume_profile": {"lookback"},
+    "analysis/momentum": {"lookback", "rsi", "atr"},
     "correlation_matrix": {"lookback"},
     "multi_timeframe_indicators": {
         "period",
@@ -232,6 +261,15 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
         "position_in_range",
     },
     "trading/decision_support": {"sl_distance_points", "tp_distance_points"},
+    "market/snapshot": {"bar_count"},
+    "market/opportunity_rank": {"min_score"},
+    "market/chart_intelligence": {"bar_count"},
+    "portfolio/pre_trade_gate": {"volume_lots", "sl_distance"},
+    "market/structure": {"swing_lookback", "confirm_bos_pips"},
+    "strategy/selector": set(),
+    "vwap": {"bar_count", "std_dev_multiplier"},
+    "volume_at_price": {"bar_count", "num_bins"},
+    "setup_probability": {"min_samples"},
     "trading/log_decision": {
         "entry_price",
         "exit_price",
@@ -248,15 +286,6 @@ _NUMERIC_FIELDS: dict[str, set[str]] = {
     },
     "trading/reflect": {"limit"},
     "trading/insights": {"lookback_days"},
-    "trading/agent_prompt": {
-        "include_market_context",
-        "include_news_context",
-        "include_workflow",
-        "include_trading_rules",
-        "include_tool_guide",
-        "include_metacognition",
-        "live_account_context",
-    },
     # New: Market analysis
     "market/regime": {"lookback", "atr_period"},
     "market/scan": {"atr_period"},
@@ -610,6 +639,112 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["symbol", "timeframe"],
         },
     },
+    "analysis/divergence": {
+        "description": (
+            "What: Detects MACD-price and RSI-price divergence (bullish and bearish) to identify potential trend reversals.\n"
+            "\n"
+            "When: Use AFTER decision_support() signals a potential entry to confirm with divergence analysis. Use when checking for reversal signals, identifying hidden divergences indicating trend continuation, or avoiding entries into momentum exhaustion. Call as a supplementary signal before executing trades.\n"
+            "\n"
+            "Output: {bullish: [{type: 'macd_price'|'rsi_price'|'both', strength: 0.3-1.0, swing_low_idx: int, divergence_magnitude: float, description: str}, ...], bearish: [...], summary: {total_bullish: int, total_bearish: int, strongest_signal: str, divergence_score: -10 to +10}}\n"
+            "  - divergence_score: negative = bearish bias, positive = bullish bias, magnitude = combined strength\n"
+            "  - strength scoring: 0.3 (weak) to 1.0 (strong) based on geometric mean of price + indicator divergence magnitude\n"
+            "\n"
+            "Assumptions: Pure Python computation from OHLCV bars — computes MACD and RSI internally, zero EA/MQL5 changes needed. Uses swing detection with configurable window. Default: lookback=50, macd_fast=12, macd_slow=26, macd_signal_period=9, rsi_period=14, swing_window=5.\n"
+            "\n"
+            "Composition: Supplementary signal AFTER trading/decision_support(). Chain: decision_support() → analysis/divergence() → if divergence confirms, proceed with entry. Also useful with volatility_profile() to assess if divergence occurring during squeeze."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "lookback": {"type": ["number", "string"]},
+                "count": {"type": ["number", "string"]},
+                "macd_fast": {"type": ["number", "string"]},
+                "macd_slow": {"type": ["number", "string"]},
+                "macd_signal_period": {"type": ["number", "string"]},
+                "rsi_period": {"type": ["number", "string"]},
+                "swing_window": {"type": ["number", "string"]},
+            },
+            "required": ["symbol", "timeframe"],
+        },
+    },
+    "analysis/multi_bar_patterns": {
+        "description": (
+            "What: Detects structural chart patterns spanning multiple bars — W-Bottom, M-Top, Bollinger Squeeze, Breakout, Gap, and Fibonacci retracement/extension levels.\n"
+            "\n"
+            "When: Use to identify swing structures that single-bar candlestick patterns miss. Use before placing breakout trades (squeeze detection), reversal trades (W-Bottom/M-Top), or Fibonacci-based entries. Also available integrated in market/chart_intelligence under multi_bar_patterns key.\n"
+            "\n"
+            "Output: {w_bottom: {status: 'confirmed'|'forming'|'none', score: +5/-5}, m_top: {status: 'confirmed'|'forming'|'none', score: -5/-2}, bollinger_squeeze: {squeezing: bool, score: +3}, breakout: {direction: 'bullish'|'bearish'|'none', score: ±3}, gaps: [{type, pct}], fibonacci: {at_0618: bool, score: +6}, summary: {total_bullish_signals: int, total_bearish_signals: int, net_pattern_score: int}}\n"
+            "  - net_pattern_score: sum of all pattern scores. Positive = bullish structural bias, negative = bearish.\n"
+            "  - W-Bottom/M-Top confirmed = neckline break occurred. Forming = two legs detected but no break yet.\n"
+            "\n"
+            "Assumptions: Pure Python from OHLCV bars. Bollinger Bands computed internally if not passed. Fibonacci uses 50-bar swing high/low. Default: period=20 for breakout/squeeze, fib_lookback=50.\n"
+            "\n"
+            "Composition: Input for market/chart_intelligence (integrated), trading/decision_support() supplement. Chain: analysis/multi_bar_patterns() → if squeeze detected: place_bracket_order(). If W-Bottom confirmed + divergence bullish: high confidence LONG."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "lookback": {"type": ["number", "string"]},
+                "period": {"type": ["number", "string"]},
+                "fib_lookback": {"type": ["number", "string"]},
+            },
+            "required": ["symbol", "timeframe"],
+        },
+    },
+    "analysis/volume_profile": {
+        "description": (
+            "What: Detects volume anomalies — unusual activity beyond simple volume ratios. Identifies accumulation, distribution, weakness, and selling exhaustion patterns.\n"
+            "\n"
+            "When: Use to confirm breakouts (volume surge = valid), warn about weak moves (price up + declining volume = skepticism), detect distribution (price down + volume surge = danger), or identify drying-up conditions (low volume = consolidation).\n"
+            "\n"
+            "Output: {volume_ratio: float, volume_tier: 'extreme_surge'|'strong_surge'|'elevated'|'normal'|'drying_up', volume_trend: 'increasing'|'decreasing'|'stable', price_volume_signal: 'accumulation'|'distribution'|'weakness'|'selling_exhaustion'|'none', score: int, anomalies: [{bar_index, volume, ratio, price_change_pct}]}\n"
+            "  - score: positive = bullish volume, negative = bearish volume\n"
+            "  - anomalies: bars where volume exceeded 3x average\n"
+            "\n"
+            "Assumptions: MT5 tick volume (trade count). Thresholds adapted from legacy system for forex/CFD. Default: lookback=20.\n"
+            "\n"
+            "Composition: Input for trading/decision_support() to validate entry quality, breakout confirmation. Chain: analysis/volume_profile() → if score > 4 + breakout, high confidence entry. If score < -3 + entry signal, reduce size or wait."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "lookback": {"type": ["number", "string"]},
+            },
+            "required": ["symbol", "timeframe"],
+        },
+    },
+    "analysis/momentum": {
+        "description": (
+            "What: Computes momentum penalty to detect chase risk — prevents entering at exhaustion points (buying tops, selling bottoms).\n"
+            "\n"
+            "When: Use BEFORE executing any trade to check if current momentum suggests chasing. Use when price has made a large move, when RSI is extreme (>80 or <20), or when you want to validate entry quality. This is a risk filter, not a signal generator.\n"
+            "\n"
+            "Output: {chase_tier: 'extreme_chase'|'strong_chase'|'moderate_chase'|'normal', chase_penalty: 0 to -12, range_atr_ratio: float, exhaustion_risk: bool, exhaustion_penalty: 0 or -4, rsi_signal: 'overbought'|'elevated'|'neutral'|'approaching_oversold'|'oversold', rsi_penalty: -4 to +4, total_penalty: int, recommendation: 'avoid_entry'|'reduce_size'|'caution'|'normal'}\n"
+            "  - total_penalty: negative = chase risk, positive = contrarian opportunity\n"
+            "  - recommendation: 'avoid_entry' = do not enter, 'reduce_size' = enter with 50% size, 'caution' = verify with other signals\n"
+            "\n"
+            "Assumptions: Uses ATR-based thresholds adapted for forex/CFD (not A-share limits). Requires bars data. RSI and ATR optional but improve accuracy. Default: lookback=50.\n"
+            "\n"
+            "Composition: Final gate BEFORE trade execution. Chain: opportunity_rank() → analysis/divergence() → analysis/volume_profile() → analysis/momentum() → if recommendation != 'avoid_entry', proceed. If total_penalty <= -6, reduce position size by 50%."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "lookback": {"type": ["number", "string"]},
+                "rsi": {"type": ["number", "string"]},
+                "atr": {"type": ["number", "string"]},
+            },
+            "required": ["symbol", "timeframe"],
+        },
+    },
     "multi_timeframe_indicators": {
         "description": (
             "What: Computes a single indicator across multiple timeframes in one call.\n"
@@ -870,8 +1005,11 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "strategy_id": {"type": "string"},
                 "account_id": {"type": "string"},
                 "symbol": {"type": "string"},
-                "side": {"type": "string"},
-                "order_kind": {"type": "string"},
+                "side": {"type": "string", "enum": ["buy", "sell"]},
+                "order_kind": {
+                    "type": "string",
+                    "enum": ["market", "limit", "stop", "stop_limit"],
+                },
                 "volume_lots": {"type": ["number", "string"]},
                 "deviation_points": {"type": ["number", "string"]},
                 "sl": {"type": ["number", "string", "null"]},
@@ -917,8 +1055,11 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "strategy_id": {"type": "string"},
                 "account_id": {"type": "string"},
                 "symbol": {"type": "string"},
-                "side": {"type": "string"},
-                "order_kind": {"type": "string"},
+                "side": {"type": "string", "enum": ["buy", "sell"]},
+                "order_kind": {
+                    "type": "string",
+                    "enum": ["market", "limit", "stop", "stop_limit"],
+                },
                 "volume_lots": {"type": ["number", "string"]},
                 "deviation_points": {"type": ["number", "string"]},
                 "sl": {"type": ["number", "string", "null"]},
@@ -941,11 +1082,8 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
             "required": [
                 "intent_id",
-                "strategy_id",
-                "account_id",
                 "symbol",
                 "side",
-                "order_kind",
                 "volume_lots",
             ],
         },
@@ -967,8 +1105,8 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "type": "object",
             "properties": {
                 "symbol": {"type": "string"},
-                "side": {"type": "string"},
-                "kind": {"type": "string"},
+                "side": {"type": "string", "enum": ["buy", "sell"]},
+                "kind": {"type": "string", "enum": ["limit", "stop"]},
                 "price": {"type": ["number", "string"]},
                 "volume_lots": {"type": ["number", "string"]},
                 "sl": {"type": ["number", "string", "null"]},
@@ -1650,33 +1788,6 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["symbol", "side"],
         },
     },
-    "trading/agent_prompt": {
-        "description": (
-            "What: Generates a complete system prompt for orienting a new trading agent session.\n"
-            "\n"
-            "When: Use once at the start of a new agent session to initialize with market context, trading rules, tool guides, and metacognition guidelines. Regenerate for each new session.\n"
-            "\n"
-            "Output: {system_prompt: str, sections: [str], generated_at: str, context_summary: {account: object, symbols: [str], news_count: int, rules_count: int}}\n"
-            "\n"
-            "Assumptions: Prompt generated at call time with live data when live_* flags true. Stale if saved and reused later — regenerate per session. Does NOT include tool definitions (MCP protocol provides those separately). Default: all include_* flags true.\n"
-            "\n"
-            "Composition: Combines data from account_summary(), market/regime(), economic_calendar(), and trading policy. Chain → trading/agent_prompt() → use as system prompt for new agent session."
-        ),
-        "schema": {
-            "type": "object",
-            "properties": {
-                "include_market_context": {"type": "boolean"},
-                "include_news_context": {"type": "boolean"},
-                "include_workflow": {"type": "boolean"},
-                "include_trading_rules": {"type": "boolean"},
-                "include_tool_guide": {"type": "boolean"},
-                "include_metacognition": {"type": "boolean"},
-                "live_account_context": {"type": "boolean"},
-                "live_symbol_context": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": [],
-        },
-    },
     # === NEWS TOOLS ===
     "news_fetch": {
         "description": (
@@ -1792,6 +1903,183 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         ),
         "schema": {"type": "object"},
     },
+    # === MARKET ADVANCED TOOLS ===
+    "market/snapshot": {
+        "description": (
+            "What: One-call complete market context for a symbol.\n"
+            "Returns bars, regime, ATR, RSI, EMAs, S/R levels, session context, and coaching in a single call.\n"
+            "Output: {symbol, timeframe, bars, regime, atr, rsi, ema_20, ema_50, support, resistance, session_context, coaching}\n"
+            "When: Use as first-pass analysis before deep-diving into a candidate. Replaces 5+ individual calls.\n"
+            "Composition: market/snapshot() → if coaching indicates edge: deep-dive with analysis/* tools → decide."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "bar_count": {"type": ["number", "string"]},
+                "include_coaching": {"type": "boolean"},
+            },
+            "required": ["symbol"],
+        },
+    },
+    "market/opportunity_rank": {
+        "description": (
+            "What: Ranks multiple symbols by trade-readiness using 7 weighted factors.\n"
+            "Returns composite scores 0-100, regime alignment, RSI position, spread quality, calendar risk.\n"
+            "Output: {rankings: [{symbol, composite_score, factors: {...}}]}\n"
+            "When: Use to find the best candidate among a watchlist. Replaces manual scan + analysis per symbol.\n"
+            "Composition: market/opportunity_rank(symbols=[...]) → top candidate → analysis/divergence → execute/wait."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbols": {"type": "array", "items": {"type": "string"}},
+                "timeframe": {"type": "string"},
+                "min_score": {"type": ["number", "string"]},
+                "weights": {"type": "object"},
+            },
+            "required": ["symbols"],
+        },
+    },
+    "market/chart_intelligence": {
+        "description": (
+            "What: Unified chart analysis bundle — screenshot + S/R + patterns + indicators in one call.\n"
+            "Output: {patterns, support_resistance, indicators, screenshot_base64 (optional)}\n"
+            "When: Use for comprehensive structural analysis of a single symbol. Best for setup identification.\n"
+            "Composition: market/chart_intelligence() → pattern detected → analysis/divergence confirms → execute."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "include_screenshot": {"type": "boolean"},
+                "bar_count": {"type": ["number", "string"]},
+            },
+            "required": ["symbol"],
+        },
+    },
+    "portfolio/exposure": {
+        "description": (
+            "What: Portfolio exposure across all open positions.\n"
+            "Output: {total_exposure_usd, net_exposure_usd, by_symbol, by_side, margin_used, free_margin_pct}\n"
+            "When: Use before adding new positions to check portfolio-level risk.\n"
+            "Composition: portfolio/exposure() → if exposure < threshold → calculate_position_size → execute."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    "portfolio/pre_trade_gate": {
+        "description": (
+            "What: Pre-trade safety check — validates if a new trade would breach portfolio risk limits.\n"
+            "Output: {allowed: bool, reason: str, current_exposure, projected_exposure, risk_metrics}\n"
+            "When: Use as final gate before any order submission.\n"
+            "Composition: calculate_position_size() → portfolio/pre_trade_gate() → if allowed: submit_order()."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "side": {"type": "string", "enum": ["buy", "sell"]},
+                "volume_lots": {"type": ["number", "string"]},
+                "sl_distance": {"type": ["number", "string"]},
+            },
+            "required": ["symbol", "side"],
+        },
+    },
+    "market/structure": {
+        "description": (
+            "What: Detects market structure — BOS, ChoCh, HH/HL/LH/LL labeling, trend health.\n"
+            "Output: {structure: bullish|bearish|ranging|transitioning, trend_health: strong|weakening|exhausted,\n"
+            "  swing_points: [...], last_bos: {...}, last_choch: {...}, recent_structure: [HH,HL,...]}\n"
+            "When: Use to confirm trend health before entering. Essential for 'hunter' behavior — avoid entries on exhausted trends.\n"
+            "Composition: market/structure() → if structure=trending AND health=strong → execute; if health=exhausted → wait."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "swing_lookback": {"type": ["number", "string"]},
+                "confirm_bos_pips": {"type": ["number", "string"]},
+            },
+            "required": ["symbol"],
+        },
+    },
+    "strategy/selector": {
+        "description": (
+            "What: Returns the optimal strategy for current regime, with entry style, stop type, TP type, risk multiplier.\n"
+            "Output: {recommended: {...}, all_strategies: [{name, regime, entry_style, ...}]}\n"
+            "When: Use after regime detection to get specific execution parameters. 8 strategies: pullback_trend, bracket_range,\n"
+            "  breakout_compress, momentum_continuation, mean_reversion_fade, wide_volatility, patience_consolidation.\n"
+            "Composition: market/regime() → strategy/selector(regime) → use entry_style for order type → execute."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "regime": {"type": "string"},
+            },
+            "required": [],
+        },
+    },
+    "vwap": {
+        "description": (
+            "What: Computes VWAP with deviation bands from OHLCV bars using tick volume.\n"
+            "Output: {current_vwap, vwap_deviation_upper, vwap_deviation_lower, distance_from_vwap_pct, price_position}\n"
+            "When: Use to find institutional reference prices. Price at VWAP = fair value. Above/below = premium/discount.\n"
+            "Composition: vwap() → if price_at_vwap and regime=trending → enter; if price_far_from_vwap → wait for mean reversion."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "bar_count": {"type": ["number", "string"]},
+                "std_dev_multiplier": {"type": ["number", "string"]},
+            },
+            "required": ["symbol"],
+        },
+    },
+    "volume_at_price": {
+        "description": (
+            "What: Volume-at-Price profile — Point of Control (POC) and Value Area from tick volume.\n"
+            "Output: {poc, value_area_high, value_area_low, value_area_width, current_price_position, distribution}\n"
+            "When: Use to find high-volume nodes where institutions trade. POC = magnet. Value Area edges = support/resistance.\n"
+            "Composition: volume_at_price() → if price at POC → wait for breakout; if price at VA edge → enter toward POC."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "bar_count": {"type": ["number", "string"]},
+                "num_bins": {"type": ["number", "string"]},
+            },
+            "required": ["symbol"],
+        },
+    },
+    "setup_probability": {
+        "description": (
+            "What: Estimates win rate for current setup from historical journal data.\n"
+            "Output: {estimated_win_rate, sample_size, confidence, recommendation, win_rate_by_regime, common_mistakes}\n"
+            "When: Use before entering any trade to check if this setup has historically been profitable.\n"
+            "Composition: setup_probability(symbol=X, regime=Y) → if win_rate > 55% → execute; if < 45% → skip."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "regime": {"type": "string"},
+                "session": {"type": "string"},
+                "min_samples": {"type": ["number", "string"]},
+            },
+            "required": [],
+        },
+    },
 }
 
 
@@ -1814,6 +2102,8 @@ async def list_tools() -> list[types.Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+    # Normalize aliased tool names (e.g., mt5-mcp_tools_wait_delay → tools/wait/delay)
+    name = _normalize_tool_name(name)
     args = _coerce_numeric_args(name, arguments or {})
     try:
         if name == "get_bars":
@@ -1877,6 +2167,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             res = await _post_json("/tools/trail_position", args)
         elif name == "volatility_profile":
             res = await _post_json("/tools/volatility_profile", args)
+        elif name == "analysis/divergence":
+            res = await _post_json("/tools/analysis/divergence", args)
+        elif name == "analysis/multi_bar_patterns":
+            res = await _post_json("/tools/analysis/multi_bar_patterns", args)
+        elif name == "analysis/volume_profile":
+            res = await _post_json("/tools/analysis/volume_profile", args)
+        elif name == "analysis/momentum":
+            res = await _post_json("/tools/analysis/momentum", args)
         elif name == "multi_timeframe_indicators":
             res = await _post_json("/tools/multi_timeframe_indicators", args)
         elif name == "correlation_matrix":
@@ -1904,8 +2202,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             res = await _post_json(
                 f"/tools/trading/insights?lookback_days={lookback}", {}
             )
-        elif name == "trading/agent_prompt":
-            res = await _post_json("/tools/trading/agent_prompt", args)
         # Market analysis
         elif name == "market/regime":
             res = await _post_json("/tools/market/regime", args)
@@ -1963,17 +2259,36 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             res = await _get_json("/resources/orders/pending")
         elif name == "bridge_status":
             res = await _get_json("/resources/mt5/bridge/status")
+        elif name == "market/snapshot":
+            res = await _post_json("/tools/market/snapshot", args)
+        elif name == "market/opportunity_rank":
+            res = await _post_json("/tools/market/opportunity_rank", args)
+        elif name == "market/chart_intelligence":
+            res = await _post_json("/tools/market/chart_intelligence", args)
+        elif name == "portfolio/exposure":
+            res = await _post_json("/tools/portfolio/exposure", args)
+        elif name == "portfolio/pre_trade_gate":
+            res = await _post_json("/tools/portfolio/pre_trade_gate", args)
+        elif name == "market/structure":
+            res = await _post_json("/tools/market/structure", args)
+        elif name == "strategy/selector":
+            res = await _post_json("/tools/strategy/selector", args)
+        elif name == "vwap":
+            res = await _post_json("/tools/vwap", args)
+        elif name == "volume_at_price":
+            res = await _post_json("/tools/volume_at_price", args)
+        elif name == "setup_probability":
+            res = await _post_json("/tools/setup_probability", args)
         else:
             return types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Unknown tool: {name}")],
-                is_error=True,
+                content=[types.TextContent(type="text", text=f"Unknown tool: {name}")]
             )
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(res))]
         )
     except Exception as e:
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"Error: {e}")], is_error=True
+            content=[types.TextContent(type="text", text=f"Error: {e}")]
         )
 
 

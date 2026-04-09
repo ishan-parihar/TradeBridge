@@ -4,10 +4,11 @@ import json
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import Any, Literal
 import httpx
 import time
 import uuid
+from datetime import datetime, timezone
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
@@ -48,6 +49,10 @@ from mt5_mcp.schemas.tools import (
     OrderBookRequest,
     ValidateTradeSetupRequest,
     VolatilityProfileRequest,
+    DivergenceRequest,
+    VolumeProfileRequest,
+    MultiBarPatternsRequest,
+    MomentumCheckRequest,
     ModifyOrderRequest as ModOrderReq,
     CloseAllPositionsRequest,
     CancelAllOrdersRequest,
@@ -85,11 +90,9 @@ from mt5_mcp.services.agent_capabilities import (
     validate_trade_setup,
 )
 from mt5_mcp.services.market_regime import detect_regime
+from mt5_mcp.services.divergence import detect_divergence
+from mt5_mcp.services.multi_bar_patterns import detect_multi_bar_patterns
 from mt5_mcp.services.trade_journal_db import get_journal_db
-from mt5_mcp.services.agent_prompt import (
-    build_agent_system_prompt,
-    get_trading_agent_prompt,
-)
 from mt5_mcp.services.market_context import build_context
 from mt5_mcp.services.trading_coach import TradingCoach
 from mt5_mcp.services.reconciliation import ReconciliationService
@@ -129,7 +132,6 @@ from mt5_mcp.schemas.tools import (
     TradeJournalQueryRequest,
     MarketScanRequest,
     TradingDecisionSupportRequest,
-    AgentSystemPromptRequest,
     NewsFetchRequest,
     EconomicCalendarRequest,
     EATrailingStartRequest,
@@ -256,14 +258,42 @@ def get_settings_cached():
     return _settings
 
 
+_tcp_client: Any | None = None
+
+
+def _get_tcp_client() -> Any | None:
+    global _tcp_client
+    if _tcp_client is None:
+        try:
+            from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
+            import asyncio
+
+            _tcp_client = TCPBridgeClient()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_tcp_client.connect())
+            finally:
+                loop.close()
+            _logger = __import__(
+                "mt5_mcp.observability.logging", fromlist=["logger"]
+            ).logger
+            _logger.info("TCP bridge client connected (shared)")
+        except Exception as e:
+            _logger = __import__(
+                "mt5_mcp.observability.logging", fromlist=["logger"]
+            ).logger
+            _logger.warning(f"TCP bridge client connect failed: {e}")
+            _tcp_client = None
+    return _tcp_client
+
+
 # Resources (read-only)
 @app.get("/resources/mt5/terminal/status", response_model=TerminalStatus)
 def resource_terminal_status() -> TerminalStatus:
     return get_gateway().terminal_status()
 
 
-@app.get("/resources/account/summary", response_model=AccountSummary)
-def resource_account_summary() -> AccountSummary:
+def _resource_account_summary_raw() -> AccountSummary:
     summary = get_gateway().account_summary()
     if summary.account_id is not None:
         return summary
@@ -271,6 +301,21 @@ def resource_account_summary() -> AccountSummary:
         return AccountSummary(**tool_get_account_summary())
     except Exception:
         return summary
+
+
+@app.get("/resources/account/summary")
+def resource_account_summary() -> dict:
+    raw_summary = _resource_account_summary_raw()
+    return {
+        "account": raw_summary.model_dump()
+        if hasattr(raw_summary, "model_dump")
+        else raw_summary,
+        "snapshot_metadata": {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "next_recommended_check_seconds": 300,
+            "data_freshness": "live",
+        },
+    }
 
 
 @app.get("/resources/symbols/{symbol}/info", response_model=SymbolInfo)
@@ -483,6 +528,60 @@ def _compute_position_health(position: dict, symbol_info: dict) -> dict:
             f"{position.get('position_id', 'unknown')}: {e}"
         )
 
+    # --- action_required synthesis ---
+    # Priority order: stale_position > time_exit_approaching > invalidation_check > trail_to_breakeven > trail_stop_closer > none
+    trail_eligible = health.get("trail_eligible")
+    is_at_breakeven = health.get("is_at_breakeven")
+    is_winning = health.get("is_winning")
+    distance_to_sl_pips = health.get("distance_to_sl_pips")
+    pnl_percent_of_risk = health.get("pnl_percent_of_risk")
+    time_in_trade_bars_h1 = health.get("time_in_trade_bars_h1")
+
+    action_required = "none"
+    action_reason = "Position healthy — no action needed"
+
+    # 1. stale_position: 16+ bars with < 50% risk profit
+    if (
+        time_in_trade_bars_h1 is not None
+        and time_in_trade_bars_h1 >= 16
+        and pnl_percent_of_risk is not None
+        and pnl_percent_of_risk < 50
+    ):
+        action_required = "stale_position"
+        action_reason = (
+            "Position open 16+ bars with < 0.5x ATR profit — close and redeploy"
+        )
+    # 2. time_exit_approaching: 12+ bars, winning, but < 50% risk profit
+    elif (
+        time_in_trade_bars_h1 is not None
+        and time_in_trade_bars_h1 >= 12
+        and is_winning is True
+        and pnl_percent_of_risk is not None
+        and pnl_percent_of_risk < 50
+    ):
+        action_required = "time_exit_approaching"
+        action_reason = "Dead money — consider closing if no progress in 4 more bars"
+    # 3. invalidation_check: very close to SL (< 10 pips)
+    elif distance_to_sl_pips is not None and distance_to_sl_pips < 10:
+        action_required = "invalidation_check"
+        action_reason = "Price approaching stop loss — verify thesis still valid"
+    # 4. trail_to_breakeven: eligible and not yet at breakeven
+    elif trail_eligible is True and is_at_breakeven is False:
+        action_required = "trail_to_breakeven"
+        action_reason = "Profit > 2x spread — move SL to entry price"
+    # 5. trail_stop_closer: eligible, at breakeven, still room to trail
+    elif (
+        trail_eligible is True
+        and is_at_breakeven is True
+        and distance_to_sl_pips is not None
+        and distance_to_sl_pips > 0
+    ):
+        action_required = "trail_stop_closer"
+        action_reason = "Position in profit — trail SL 0.5x ATR in profit direction"
+
+    health["action_required"] = action_required
+    health["action_reason"] = action_reason
+
     return health
 
 
@@ -524,6 +623,11 @@ def resource_positions_open() -> dict:
         return {
             "positions": position_dicts,
             "sync_status": sync_status,
+            "snapshot_metadata": {
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "next_recommended_check_seconds": 600,
+                "data_freshness": "live",
+            },
         }
 
     try:
@@ -545,6 +649,11 @@ def resource_positions_open() -> dict:
             return {
                 "positions": position_dicts,
                 "sync_status": sync_status,
+                "snapshot_metadata": {
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "next_recommended_check_seconds": 600,
+                    "data_freshness": "live",
+                },
             }
     except Exception as e:
         logger.warning(f"positions_open bridge fallback failed: {e}")
@@ -599,11 +708,15 @@ def resource_positions_open() -> dict:
     return {
         "positions": position_dicts,
         "sync_status": sync_status,
+        "snapshot_metadata": {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "next_recommended_check_seconds": 600,
+            "data_freshness": "live",
+        },
     }
 
 
-@app.get("/resources/orders/pending", response_model=list[Order])
-def resource_orders_pending() -> list[Order]:
+def _resource_orders_pending_raw() -> list[Order]:
     orders = get_gateway().adapter.get_orders()
     if orders:
         return orders
@@ -611,6 +724,19 @@ def resource_orders_pending() -> list[Order]:
         return [Order(**item) for item in tool_get_orders().get("orders", [])]
     except Exception:
         return orders
+
+
+@app.get("/resources/orders/pending")
+def resource_orders_pending() -> dict:
+    raw_orders = _resource_orders_pending_raw()
+    return {
+        "orders": raw_orders,
+        "snapshot_metadata": {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "next_recommended_check_seconds": 120,
+            "data_freshness": "live",
+        },
+    }
 
 
 @app.get("/health")
@@ -706,6 +832,71 @@ def health() -> dict:
     }
 
 
+@app.get("/tools/health/tool_status")
+def tool_health_status() -> dict:
+    """Report which tool categories are operational for autonomous agents."""
+    reads_ok = True
+    writes_ok = True
+    waits_ok = True
+    analysis_ok = True
+    write_failing = []
+    analysis_failing = []
+
+    try:
+        get_gateway().terminal_status()
+    except Exception:
+        reads_ok = False
+
+    try:
+        get_gateway().account_summary()
+    except Exception:
+        reads_ok = False
+
+    try:
+        get_http_client().get(
+            f"{get_settings_cached().gateway_url}/health", timeout=2.0
+        )
+    except Exception:
+        writes_ok = False
+        write_failing.append("submit_*_order")
+
+    try:
+        get_journal_db()
+    except Exception:
+        writes_ok = False
+
+    try:
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(asyncio.sleep(0.1))
+        loop.close()
+    except Exception:
+        waits_ok = False
+
+    try:
+        detect_regime(bars=[], atr_value=None)
+    except Exception:
+        analysis_ok = False
+        analysis_failing.append("market_regime")
+
+    return {
+        "reads": {"status": "ok" if reads_ok else "degraded"},
+        "writes": {
+            "status": "ok" if writes_ok else "degraded",
+            "failing": write_failing,
+        },
+        "waits": {"status": "ok" if waits_ok else "degraded"},
+        "analysis": {
+            "status": "ok" if analysis_ok else "degraded",
+            "failing": analysis_failing,
+        },
+        "overall": "ok"
+        if (reads_ok and writes_ok and waits_ok and analysis_ok)
+        else "degraded",
+    }
+
+
 @app.get("/resources/mt5/bridge/status", response_model=TerminalStatus)
 def resource_bridge_terminal_status() -> TerminalStatus:
     # Proxy bridge heartbeat status into MCP for unified visibility
@@ -719,6 +910,42 @@ def resource_bridge_terminal_status() -> TerminalStatus:
         return TerminalStatus(connected=False, message="Bridge status unavailable")
 
 
+# ============================================================
+# Shared payload parsers — deduplicated from nested functions
+# ============================================================
+
+
+def _parse_indicator_value(result: dict) -> float | None:
+    """Extract a single indicator value from a batch result payload."""
+    if not result or result.get("status") != "completed":
+        return None
+    payload = result.get("result", {}).get("payload", {})
+    if isinstance(payload, str):
+        try:
+            return float(json.loads(payload).get("value", 0) or 0)
+        except Exception:
+            return None
+    elif isinstance(payload, dict):
+        v = payload.get("value")
+        return float(v) if v is not None else None
+    return None
+
+
+def _parse_payload_dict(result: dict) -> dict:
+    """Parse a dict result into its inner payload dict."""
+    if not result or result.get("status") != "completed":
+        return {}
+    payload = result.get("result", {}).get("payload", {})
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except Exception:
+            return {}
+    elif isinstance(payload, dict):
+        return payload
+    return {}
+
+
 # Bridge-backed tools (EA polling model)
 # TCP Bridge: low-latency push communication (port 8025)
 # HTTP Bridge: legacy polling fallback (port 8020)
@@ -730,7 +957,6 @@ _TCP_BRIDGE_ENABLED = _os.getenv("MT5_TCP_BRIDGE_ENABLED", "true").lower() == "t
 
 def _parse_payload(payload) -> dict:
     """Parse EA payload, handling both string and dict formats."""
-    import json
 
     if isinstance(payload, str):
         try:
@@ -761,31 +987,25 @@ def _await_result(req_id: str, timeout_s: float = 20.0, poll_s: float = 0.1) -> 
 
 def _tcp_send_and_await(
     type: str, payload: dict[str, Any], timeout_s: float = 20.0
-) -> dict[str, Any]:
-    """Send command via TCP bridge and await result.
-
-    Falls back to HTTP if TCP bridge is unavailable.
-    """
+) -> dict[str, Any] | None:
     if not _TCP_BRIDGE_ENABLED:
         return None
-
     try:
-        from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
+        client = _get_tcp_client()
+        if client is None:
+            return None
         import asyncio
 
-        tcp_client = TCPBridgeClient()
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(tcp_client.connect())
             result = loop.run_until_complete(
-                tcp_client.send_command(type, payload, timeout=timeout_s)
+                client.send_command(type, payload, timeout=timeout_s)
             )
             inner = result.get("payload", result)
             return {"status": "completed", "result": {"payload": inner}}
         except Exception:
             return None
         finally:
-            loop.run_until_complete(tcp_client.close())
             loop.close()
     except Exception:
         return None
@@ -1005,8 +1225,6 @@ def tool_get_bars(req: BarsRequest) -> Bars:
     if tcp_result and tcp_result.get("status") == "completed":
         payload = tcp_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
-            import json
-
             data = json.loads(payload)
         elif isinstance(payload, dict):
             data = payload
@@ -1041,8 +1259,6 @@ def tool_get_bars(req: BarsRequest) -> Bars:
     payload = res.get("result", {}).get("payload", {})
     if isinstance(payload, str):
         try:
-            import json
-
             data = json.loads(payload)
         except Exception:
             data = {"data": []}
@@ -1119,8 +1335,6 @@ def tool_get_indicator(req: IndicatorRequest) -> dict:
     if tcp_result and tcp_result.get("status") == "completed":
         payload = tcp_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
-            import json
-
             data = json.loads(payload)
         elif isinstance(payload, dict):
             data = payload
@@ -1634,7 +1848,7 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
         success_retcodes = {10009, 10008}
         try:
             retcode_int = int(retcode) if retcode else None
-        except:
+        except (ValueError, TypeError):
             retcode_int = None
         if retcode_int not in success_retcodes:
             return _build_trade_error_result(req.intent_id, data)
@@ -1699,7 +1913,7 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
     success_retcodes = {10009, 10008}
     try:
         retcode_int = int(retcode) if retcode else None
-    except:
+    except (ValueError, TypeError):
         retcode_int = None
 
     if retcode_int not in success_retcodes:
@@ -2315,6 +2529,92 @@ def tool_volatility_profile(req: VolatilityProfileRequest) -> dict:
     return result
 
 
+@app.post("/tools/analysis/divergence", response_model=dict)
+def tool_divergence_detection(req: DivergenceRequest) -> dict:
+    try:
+        # Fetch only as many bars as needed (lookback), not an arbitrary count=200
+        bars = tool_get_bars(
+            BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.lookback)
+        )
+        result = detect_divergence(
+            bars=[bar.model_dump() for bar in bars.data],
+            lookback=req.lookback,
+            macd_fast=req.macd_fast,
+            macd_slow=req.macd_slow,
+            macd_signal_period=req.macd_signal_period,
+            rsi_period=req.rsi_period,
+            swing_window=req.swing_window,
+        )
+        # Add symbol and timeframe context for consistency with other analysis tools
+        result["symbol"] = req.symbol
+        result["timeframe"] = req.timeframe
+        return result
+    except Exception as e:
+        logger.error(f"Divergence detection failed for {req.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/analysis/multi_bar_patterns", response_model=dict)
+def tool_multi_bar_patterns(req: MultiBarPatternsRequest) -> dict:
+    try:
+        bars = tool_get_bars(
+            BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.lookback)
+        )
+        result = detect_multi_bar_patterns(
+            bars=[bar.model_dump() for bar in bars.data],
+            period=req.period,
+            fib_lookback=req.fib_lookback,
+        )
+        result["symbol"] = req.symbol
+        result["timeframe"] = req.timeframe
+        return result
+    except Exception as e:
+        logger.error(f"Multi-bar pattern detection failed for {req.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/analysis/volume_profile", response_model=dict)
+def tool_volume_profile(req: VolumeProfileRequest) -> dict:
+    try:
+        bars = tool_get_bars(
+            BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.lookback)
+        )
+        from mt5_mcp.services.volume_analysis import detect_volume_anomalies
+
+        result = detect_volume_anomalies(
+            bars=[bar.model_dump() for bar in bars.data],
+            lookback=req.lookback,
+            symbol=req.symbol,
+        )
+        result["timeframe"] = req.timeframe
+        return result
+    except Exception as e:
+        logger.error(f"Volume analysis failed for {req.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/analysis/momentum", response_model=dict)
+def tool_momentum_check(req: MomentumCheckRequest) -> dict:
+    try:
+        bars = tool_get_bars(
+            BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.lookback)
+        )
+        from mt5_mcp.services.momentum import compute_momentum_penalty
+
+        result = compute_momentum_penalty(
+            bars=[bar.model_dump() for bar in bars.data],
+            rsi=req.rsi,
+            atr=req.atr,
+            lookback=req.lookback,
+        )
+        result["symbol"] = req.symbol
+        result["timeframe"] = req.timeframe
+        return result
+    except Exception as e:
+        logger.error(f"Momentum check failed for {req.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/tools/multi_timeframe_indicators", response_model=dict)
 def tool_multi_timeframe_indicators(req: MultiTimeframeIndicatorRequest) -> dict:
     readings: dict[str, dict] = {}
@@ -2357,6 +2657,188 @@ def tool_correlation_matrix(req: CorrelationMatrixRequest) -> dict:
     }
 
 
+class MarketStructureRequest(BaseModel):
+    symbol: str
+    timeframe: str = "H1"
+    swing_lookback: int = 5
+    confirm_bos_pips: float = 0.0
+
+
+@app.post("/tools/market/structure", response_model=dict)
+def tool_market_structure(req: MarketStructureRequest) -> dict:
+    try:
+        bars = tool_get_bars(
+            BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=100)
+        )
+        from mt5_mcp.services.market_structure import detect_market_structure
+
+        result = detect_market_structure(
+            bars=[
+                {"high": b.high, "low": b.low, "close": b.close, "open": b.open}
+                for b in bars.data
+            ],
+            swing_lookback=req.swing_lookback,
+            confirm_bos_pips=req.confirm_bos_pips,
+        )
+        return {
+            "symbol": req.symbol,
+            "timeframe": req.timeframe,
+            "structure": result.structure,
+            "trend_health": result.trend_health,
+            "swing_points": result.swing_points,
+            "last_bos": result.last_bos,
+            "last_choch": result.last_choch,
+            "recent_structure": result.recent_structure,
+        }
+    except Exception as e:
+        logger.error(f"Market structure failed for {req.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class StrategySelectorRequest(BaseModel):
+    regime: str | None = None
+
+
+@app.post("/tools/strategy/selector", response_model=dict)
+def tool_strategy_selector(req: StrategySelectorRequest | None = None) -> dict:
+    from mt5_mcp.services.strategy_selector import list_strategies, select_strategy
+
+    if req and req.regime:
+        strategy = select_strategy(req.regime)
+        return {
+            "recommended": {
+                "name": strategy.name,
+                "regime": strategy.regime,
+                "entry_style": strategy.entry_style,
+                "stop_type": strategy.stop_type,
+                "take_profit_type": strategy.take_profit_type,
+                "max_positions": strategy.max_positions,
+                "risk_multiplier": strategy.risk_multiplier,
+                "trailing": strategy.trailing,
+                "description": strategy.description,
+            },
+            "all_strategies": list_strategies(),
+        }
+    return {"all_strategies": list_strategies()}
+
+
+class VWAPRequest(BaseModel):
+    symbol: str
+    timeframe: str = "H1"
+    bar_count: int = 100
+    std_dev_multiplier: float = 2.0
+
+
+class VolumeAtPriceRequest(BaseModel):
+    symbol: str
+    timeframe: str = "H1"
+    bar_count: int = 100
+    num_bins: int = 20
+
+
+@app.post("/tools/vwap", response_model=dict)
+def tool_vwap(req: VWAPRequest) -> dict:
+    try:
+        bars = tool_get_bars(
+            BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.bar_count)
+        )
+        from mt5_mcp.services.vwap import compute_vwap
+
+        result = compute_vwap(
+            bars=[
+                {
+                    "high": b.high,
+                    "low": b.low,
+                    "close": b.close,
+                    "volume": b.tick_volume,
+                }
+                for b in bars.data
+            ],
+            std_dev_multiplier=req.std_dev_multiplier,
+        )
+        return {
+            "symbol": req.symbol,
+            "timeframe": req.timeframe,
+            "current_vwap": result.current_vwap,
+            "vwap_deviation_upper": result.vwap_deviation_upper,
+            "vwap_deviation_lower": result.vwap_deviation_lower,
+            "distance_from_vwap_pct": result.distance_from_vwap_pct,
+            "price_position": result.price_position,
+        }
+    except Exception as e:
+        logger.error(f"VWAP failed for {req.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tools/volume_at_price", response_model=dict)
+def tool_volume_at_price(req: VolumeAtPriceRequest) -> dict:
+    try:
+        bars = tool_get_bars(
+            BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.bar_count)
+        )
+        from mt5_mcp.services.vwap import compute_volume_at_price
+
+        result = compute_volume_at_price(
+            bars=[
+                {"high": b.high, "low": b.low, "volume": b.tick_volume}
+                for b in bars.data
+            ],
+            num_bins=req.num_bins,
+        )
+        return {
+            "symbol": req.symbol,
+            "timeframe": req.timeframe,
+            "poc": result.poc,
+            "value_area_high": result.value_area_high,
+            "value_area_low": result.value_area_low,
+            "value_area_width": result.value_area_width,
+            "current_price_position": result.current_price_position,
+            "distribution": result.price_distribution,
+        }
+    except Exception as e:
+        logger.error(f"Volume-at-Price failed for {req.symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SetupProbabilityRequest(BaseModel):
+    symbol: str | None = None
+    regime: str | None = None
+    session: str | None = None
+    min_samples: int = 5
+
+
+@app.post("/tools/setup_probability", response_model=dict)
+def tool_setup_probability(req: SetupProbabilityRequest) -> dict:
+    try:
+        journal = get_journal_db()
+        trades = journal.query(
+            symbol=req.symbol,
+            limit=500,
+        )
+        from mt5_mcp.services.setup_probability import estimate_setup_probability
+
+        result = estimate_setup_probability(
+            trades=trades,
+            current_regime=req.regime,
+            current_session=req.session,
+            current_symbol=req.symbol,
+            min_samples=req.min_samples,
+        )
+        return {
+            "estimated_win_rate": result.estimated_win_rate,
+            "sample_size": result.sample_size,
+            "confidence": result.confidence,
+            "recommendation": result.recommendation,
+            "win_rate_by_regime": result.win_rate_by_regime,
+            "win_rate_by_session": result.win_rate_by_session,
+            "common_mistakes": result.common_mistakes,
+            "recent_similar_trades": result.similar_trades,
+        }
+    except Exception as e:
+        logger.error(f"Setup probability failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class SupportResistanceRequest(BaseModel):
     symbol: str
     timeframe: str = "H1"
@@ -2397,8 +2879,7 @@ def tool_support_resistance(req: SupportResistanceRequest) -> dict:
 
 @app.post("/tools/submit_market_order", response_model=ExecutionResult)
 def tool_submit_market_order(req: TradeIntent) -> ExecutionResult:
-    # In scaffold, writes are disabled
-    raise HTTPException(status_code=501, detail="Execution disabled in scaffold")
+    return tool_submit_market_order_via_bridge(req)
 
 
 # ============================================================
@@ -2512,8 +2993,6 @@ def tool_market_scan(req: MarketScanRequest) -> dict:
                 payload = atr_result.get("result", {}).get("payload", {})
                 if isinstance(payload, str):
                     try:
-                        import json
-
                         parsed = json.loads(payload)
                         atr_value = float(parsed.get("value", 0) or 0)
                         if atr_value == 0 and "data" in parsed and parsed["data"]:
@@ -2531,8 +3010,6 @@ def tool_market_scan(req: MarketScanRequest) -> dict:
                 payload = book_result.get("result", {}).get("payload", {})
                 if isinstance(payload, str):
                     try:
-                        import json
-
                         book_data = json.loads(payload)
                     except Exception:
                         book_data = {}
@@ -2546,8 +3023,6 @@ def tool_market_scan(req: MarketScanRequest) -> dict:
                 payload = bars_result.get("result", {}).get("payload", {})
                 if isinstance(payload, str):
                     try:
-                        import json
-
                         bars_data = json.loads(payload).get("data", [])
                     except Exception:
                         pass
@@ -2567,7 +3042,69 @@ def tool_market_scan(req: MarketScanRequest) -> dict:
         except Exception as e:
             results[sym] = {"error": str(e)}
 
-    return {"symbols": results, "timeframe": req.timeframe}
+    # Synthesize next_action_guidance from all scanned symbols
+    if results:
+        bullish_count = sum(
+            1 for s in results.values() if s.get("regime") == "trending_up"
+        )
+        bearish_count = sum(
+            1 for s in results.values() if s.get("regime") == "trending_down"
+        )
+        ranging_count = sum(1 for s in results.values() if s.get("regime") == "ranging")
+        compressing_count = sum(
+            1 for s in results.values() if s.get("regime") == "compressing"
+        )
+        total = len(results)
+
+        # Determine overall bias
+        if bullish_count > total * 0.5:
+            bias = "broadly_bullish"
+        elif bearish_count > total * 0.5:
+            bias = "broadly_bearish"
+        elif compressing_count > total * 0.4:
+            bias = "consolidation_phase"
+        elif ranging_count > total * 0.5:
+            bias = "range_bound"
+        else:
+            bias = "mixed"
+
+        # Find symbols worth alert-level monitoring (compressing = potential breakout)
+        alert_symbols = [
+            sym for sym, data in results.items() if data.get("regime") == "compressing"
+        ]
+
+        # Recommend next scan time based on market state
+        if compressing_count > 0:
+            next_scan_seconds = 600  # 10 min — breakouts can happen fast
+        elif bias in ("broadly_bullish", "broadly_bearish"):
+            next_scan_seconds = 900  # 15 min — trending, stable
+        else:
+            next_scan_seconds = 600  # 10 min default
+
+        guidance = {
+            "market_bias": bias,
+            "regime_distribution": {
+                "trending_up": bullish_count,
+                "trending_down": bearish_count,
+                "ranging": ranging_count,
+                "compressing": compressing_count,
+            },
+            "next_scan_recommended_seconds": next_scan_seconds,
+            "alert_symbols": alert_symbols,
+            "action_hint": "set_bracket_orders"
+            if compressing_count > 0
+            else "wait_for_pullback"
+            if bias in ("broadly_bullish", "broadly_bearish")
+            else "scan_again_later",
+        }
+    else:
+        guidance = None
+
+    return {
+        "symbols": results,
+        "timeframe": req.timeframe,
+        "next_action_guidance": guidance,
+    }
 
 
 # ============================================================
@@ -2652,37 +3189,6 @@ def tool_market_snapshot(req: SnapshotRequest) -> dict:
     symbol_info_result = batch_results[7]
     positions_result = batch_results[8]
 
-    def _parse_indicator_value(result: dict) -> float | None:
-        if result.get("status") != "completed":
-            return None
-        payload = result.get("result", {}).get("payload", {})
-        if isinstance(payload, str):
-            try:
-                import json
-
-                return float(json.loads(payload).get("value", 0) or 0)
-            except Exception:
-                return None
-        elif isinstance(payload, dict):
-            v = payload.get("value")
-            return float(v) if v is not None else None
-        return None
-
-    def _parse_payload_dict(result: dict) -> dict:
-        if result.get("status") != "completed":
-            return {}
-        payload = result.get("result", {}).get("payload", {})
-        if isinstance(payload, str):
-            try:
-                import json
-
-                return json.loads(payload)
-            except Exception:
-                return {}
-        elif isinstance(payload, dict):
-            return payload
-        return {}
-
     atr_value = _parse_indicator_value(atr_result)
     rsi = _parse_indicator_value(rsi_result)
     ema_fast = _parse_indicator_value(ema20_result)
@@ -2693,8 +3199,6 @@ def tool_market_snapshot(req: SnapshotRequest) -> dict:
         payload = macd_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 macd_data = json.loads(payload)
             except Exception:
                 pass
@@ -2715,8 +3219,6 @@ def tool_market_snapshot(req: SnapshotRequest) -> dict:
         payload = bars_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 bars_data = json.loads(payload).get("data", [])
             except Exception:
                 pass
@@ -2728,8 +3230,6 @@ def tool_market_snapshot(req: SnapshotRequest) -> dict:
         payload = positions_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 payload = json.loads(payload)
             except Exception:
                 payload = {}
@@ -2887,37 +3387,6 @@ def tool_market_opportunity_rank(req: OpportunityRankRequest) -> dict:
                 batch_results[base + 7] if base + 7 < len(batch_results) else {}
             )
 
-            def _parse_indicator_value(result: dict) -> float | None:
-                if result.get("status") != "completed":
-                    return None
-                payload = result.get("result", {}).get("payload", {})
-                if isinstance(payload, str):
-                    try:
-                        import json
-
-                        return float(json.loads(payload).get("value", 0) or 0)
-                    except Exception:
-                        return None
-                elif isinstance(payload, dict):
-                    v = payload.get("value")
-                    return float(v) if v is not None else None
-                return None
-
-            def _parse_payload_dict(result: dict) -> dict:
-                if result.get("status") != "completed":
-                    return {}
-                payload = result.get("result", {}).get("payload", {})
-                if isinstance(payload, str):
-                    try:
-                        import json
-
-                        return json.loads(payload)
-                    except Exception:
-                        return {}
-                elif isinstance(payload, dict):
-                    return payload
-                return {}
-
             atr_value = _parse_indicator_value(atr_result)
             rsi = _parse_indicator_value(rsi_result)
             ema_fast = _parse_indicator_value(ema20_result)
@@ -2928,8 +3397,6 @@ def tool_market_opportunity_rank(req: OpportunityRankRequest) -> dict:
                 payload = macd_result.get("result", {}).get("payload", {})
                 if isinstance(payload, str):
                     try:
-                        import json
-
                         macd_data = json.loads(payload)
                     except Exception:
                         pass
@@ -2946,8 +3413,6 @@ def tool_market_opportunity_rank(req: OpportunityRankRequest) -> dict:
                 payload = bars_result.get("result", {}).get("payload", {})
                 if isinstance(payload, str):
                     try:
-                        import json
-
                         bars_data = json.loads(payload).get("data", [])
                     except Exception:
                         pass
@@ -2959,8 +3424,6 @@ def tool_market_opportunity_rank(req: OpportunityRankRequest) -> dict:
                 payload = positions_result.get("result", {}).get("payload", {})
                 if isinstance(payload, str):
                     try:
-                        import json
-
                         payload = json.loads(payload)
                     except Exception:
                         payload = {}
@@ -3136,37 +3599,6 @@ def tool_chart_intelligence(req: ChartIntelligenceRequest) -> dict:
     idx += 1
     screenshot_result = batch_results[idx] if req.include_screenshot else None
 
-    def _parse_indicator_value(result: dict) -> float | None:
-        if not result or result.get("status") != "completed":
-            return None
-        payload = result.get("result", {}).get("payload", {})
-        if isinstance(payload, str):
-            try:
-                import json
-
-                return float(json.loads(payload).get("value", 0) or 0)
-            except Exception:
-                return None
-        elif isinstance(payload, dict):
-            v = payload.get("value")
-            return float(v) if v is not None else None
-        return None
-
-    def _parse_payload_dict(result: dict) -> dict:
-        if not result or result.get("status") != "completed":
-            return {}
-        payload = result.get("result", {}).get("payload", {})
-        if isinstance(payload, str):
-            try:
-                import json
-
-                return json.loads(payload)
-            except Exception:
-                return {}
-        elif isinstance(payload, dict):
-            return payload
-        return {}
-
     atr_value = _parse_indicator_value(atr_result)
     rsi = _parse_indicator_value(rsi_result)
     ema_fast = _parse_indicator_value(ema20_result)
@@ -3180,8 +3612,6 @@ def tool_chart_intelligence(req: ChartIntelligenceRequest) -> dict:
         payload = bars_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 bars_data = json.loads(payload).get("data", [])
             except Exception:
                 pass
@@ -4176,8 +4606,6 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
         payload = atr_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 parsed = json.loads(payload)
                 current_atr = float(parsed.get("value", 0) or 0)
                 if current_atr == 0 and "data" in parsed and parsed["data"]:
@@ -4194,8 +4622,6 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
         payload = book_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 book_data = json.loads(payload)
             except Exception:
                 book_data = {}
@@ -4211,8 +4637,6 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
         payload = rsi_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 rsi = float(json.loads(payload).get("value", 0) or 0)
             except Exception:
                 pass
@@ -4224,8 +4648,6 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
         payload = ema20_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 ema_fast = json.loads(payload).get("value")
             except Exception:
                 pass
@@ -4235,8 +4657,6 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
         payload = ema50_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 ema_slow = json.loads(payload).get("value")
             except Exception:
                 pass
@@ -4248,8 +4668,6 @@ def tool_trading_context(req: TradingContextRequest) -> dict:
         payload = bars_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 bars_data = json.loads(payload).get("data", [])
             except Exception:
                 bars_data = []
@@ -4376,8 +4794,6 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
         payload = atr_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 parsed = json.loads(payload)
                 current_atr = float(parsed.get("value", 0) or 0)
                 if current_atr == 0 and "data" in parsed and parsed["data"]:
@@ -4398,8 +4814,6 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
         payload = rsi_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 rsi = float(json.loads(payload).get("value", 0) or 0)
             except Exception:
                 pass
@@ -4411,8 +4825,6 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
         payload = ema20_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 ema_fast = json.loads(payload).get("value")
             except Exception:
                 pass
@@ -4422,8 +4834,6 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
         payload = ema50_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 ema_slow = json.loads(payload).get("value")
             except Exception:
                 pass
@@ -4435,8 +4845,6 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
         payload = book_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 book_data = json.loads(payload)
             except Exception:
                 book_data = {}
@@ -4453,8 +4861,6 @@ def tool_trading_coach(req: TradingCoachRequest) -> dict:
         payload = bars_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 bars_data = json.loads(payload).get("data", [])
             except Exception:
                 bars_data = []
@@ -4629,8 +5035,6 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         payload = bars_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 bars_data = json.loads(payload).get("data", [])
             except Exception:
                 pass
@@ -4644,8 +5048,6 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         payload = atr_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 parsed = json.loads(payload)
                 atr_value = float(parsed.get("value", 0) or 0)
                 if atr_value == 0 and "data" in parsed and parsed["data"]:
@@ -4673,8 +5075,6 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         payload = rsi_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 rsi = float(json.loads(payload).get("value", 0) or 0)
             except Exception:
                 pass
@@ -4689,8 +5089,6 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         payload = ema20_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 ema_fast = json.loads(payload).get("value")
             except Exception:
                 pass
@@ -4700,8 +5098,6 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         payload = ema50_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 ema_slow = json.loads(payload).get("value")
             except Exception:
                 pass
@@ -4716,8 +5112,6 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         payload = book_result.get("result", {}).get("payload", {})
         if isinstance(payload, str):
             try:
-                import json
-
                 book_data = json.loads(payload)
             except Exception:
                 book_data = {}
@@ -4807,9 +5201,7 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
             if cal_result.get("status") == "completed":
                 cal_payload = cal_result.get("result", {}).get("payload", {})
                 if isinstance(cal_payload, str):
-                    import json as _json
-
-                    cal_payload = _json.loads(cal_payload)
+                    cal_payload = json.loads(cal_payload)
 
                 if "events" in cal_payload and "error" not in cal_payload:
                     mt5_calendar_ok = True
@@ -4850,72 +5242,6 @@ def tool_decision_support(req: TradingDecisionSupportRequest) -> dict:
         result["calendar_context"] = {"error": "unavailable"}
 
     return result
-
-
-# ============================================================
-# Agent System Prompt Injection
-# ============================================================
-
-
-@app.post("/tools/trading/agent_prompt", response_model=dict)
-def tool_agent_prompt(req: AgentSystemPromptRequest) -> dict:
-    """Generate the complete system prompt that orients a new trading agent.
-
-    Call this at session start to get a context-rich prompt including:
-    - Available tools and when to use them
-    - Complete trading workflow
-    - Market context with LIVE data (optional)
-    - News integration guide
-    - Metacognition loop instructions
-    """
-    account_data = None
-    symbol_contexts = None
-
-    if req.live_account_context:
-        try:
-            acct = resource_account_summary()
-            account_data = {
-                "equity": float(acct.equity or 0),
-                "balance": float(acct.balance or 0),
-                "free_margin": float(acct.free_margin or 0),
-                "account_id": acct.account_id or "N/A",
-                "environment": get_settings_cached().environment,
-            }
-        except Exception:
-            pass
-
-    if req.live_symbol_context:
-        symbol_contexts = {}
-        for sym in req.live_symbol_context:
-            try:
-                ctx = tool_trading_context(TradingContextRequest(symbol=sym))
-                symbol_contexts[sym] = ctx
-            except Exception:
-                symbol_contexts[sym] = {"error": "context unavailable"}
-
-    prompt = build_agent_system_prompt(
-        include_market_context=req.include_market_context,
-        include_news_context=req.include_news_context,
-        include_workflow=req.include_workflow,
-        include_trading_rules=req.include_trading_rules,
-        include_tool_guide=req.include_tool_guide,
-        include_metacognition=req.include_metacognition,
-        live_account_context=account_data,
-        live_symbol_context=symbol_contexts,
-    )
-
-    return {
-        "prompt": prompt,
-        "sections_included": {
-            "market_context": req.include_market_context,
-            "news_context": req.include_news_context,
-            "workflow": req.include_workflow,
-            "trading_rules": req.include_trading_rules,
-            "tool_guide": req.include_tool_guide,
-            "metacognition": req.include_metacognition,
-        },
-        "live_context_injected": bool(account_data or symbol_contexts),
-    }
 
 
 # ============================================================
@@ -5014,14 +5340,84 @@ async def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorR
 
 
 @app.post("/tools/wait/delay", response_model=WaitDelayResult)
-def tool_wait_delay(req: WaitDelayRequest) -> WaitDelayResult:
-    import time as _time
+async def tool_wait_delay(req: WaitDelayRequest) -> WaitDelayResult:
+    import asyncio
     from datetime import datetime, timezone
 
-    _time.sleep(req.duration_seconds)
+    market_summary = None
+
+    if req.symbol:
+        try:
+            sym = normalize_symbol(req.symbol)
+
+            # Capture pre-sleep state
+            book_before = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
+            bid_before = float(book_before.get("bid", 0))
+            ask_before = float(book_before.get("ask", 0))
+            mid_before = (
+                (bid_before + ask_before) / 2 if bid_before and ask_before else 0
+            )
+
+            rsi_before_req = IndicatorRequest(
+                symbol=req.symbol, timeframe="H1", indicator="rsi", period=14
+            )
+            rsi_before_resp = tool_get_indicator(rsi_before_req)
+            rsi_before = rsi_before_resp.get("value")
+
+            regime_before = detect_regime(bars=[], atr_value=None)
+            regime_before_label = regime_before.get("regime", "unknown")
+
+            # Get symbol info for pip calculation
+            sym_info = tool_get_symbol_info(req.symbol)
+            point = float(sym_info.get("point", 0))
+            digits = int(sym_info.get("digits", 5))
+            # Pip is typically 10 * point for most symbols, or point for JPY pairs
+            pip_size = point * 10 if digits in (3, 5) else point
+
+            # Async sleep (non-blocking)
+            await asyncio.sleep(req.duration_seconds)
+
+            # Capture post-sleep state
+            book_after = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
+            bid_after = float(book_after.get("bid", 0))
+            ask_after = float(book_after.get("ask", 0))
+            mid_after = (bid_after + ask_after) / 2 if bid_after and ask_after else 0
+
+            rsi_after_req = IndicatorRequest(
+                symbol=req.symbol, timeframe="H1", indicator="rsi", period=14
+            )
+            rsi_after_resp = tool_get_indicator(rsi_after_req)
+            rsi_after = rsi_after_resp.get("value")
+
+            regime_after = detect_regime(bars=[], atr_value=None)
+            regime_after_label = regime_after.get("regime", "unknown")
+
+            # Compute price change in pips
+            if mid_before > 0 and mid_after > 0 and pip_size > 0:
+                price_change_pips = round((mid_after - mid_before) / pip_size, 1)
+            else:
+                price_change_pips = None
+
+            market_summary = {
+                "symbol": req.symbol,
+                "price_before": round(mid_before, digits) if mid_before else None,
+                "price_after": round(mid_after, digits) if mid_after else None,
+                "price_change_pips": price_change_pips,
+                "regime_before": regime_before_label,
+                "regime_after": regime_after_label,
+                "rsi_before": rsi_before,
+                "rsi_after": rsi_after,
+            }
+        except Exception:
+            market_summary = None
+    else:
+        # No symbol provided — just sleep
+        await asyncio.sleep(req.duration_seconds)
+
     return WaitDelayResult(
         waited_seconds=req.duration_seconds,
         resumed_at=datetime.now(timezone.utc).isoformat(),
+        market_summary=market_summary,
     )
 
 
@@ -5032,6 +5428,8 @@ async def tool_wait_for_indicator(
     import asyncio
 
     end_time = asyncio.get_event_loop().time() + req.timeout_seconds
+
+    previous_value: float | None = None
 
     while asyncio.get_event_loop().time() < end_time:
         try:
@@ -5077,17 +5475,23 @@ async def tool_wait_for_indicator(
                         triggered=True,
                     )
             elif req.condition == "crosses":
-                return WaitForIndicatorResult(
-                    symbol=req.symbol,
-                    indicator=req.indicator,
-                    condition=req.condition,
-                    target_value=req.value,
-                    actual_value=current_value,
-                    triggered=True,
-                )
+                if previous_value is not None:
+                    crossed = (
+                        previous_value < req.value and current_value >= req.value
+                    ) or (previous_value >= req.value and current_value < req.value)
+                    if crossed:
+                        return WaitForIndicatorResult(
+                            symbol=req.symbol,
+                            indicator=req.indicator,
+                            condition=req.condition,
+                            target_value=req.value,
+                            actual_value=current_value,
+                            triggered=True,
+                        )
         except Exception:
             pass
 
+        previous_value = current_value
         await asyncio.sleep(req.check_interval_seconds)
 
     try:
@@ -5271,6 +5675,46 @@ async def tool_wait_trade_monitor(req: TradeMonitorRequest) -> dict:
             int((ask - bid) / point_val) if point_val > 0 else 0
         )
 
+    def _refresh_market_context(
+        symbol: str, point: str, bid: float | None, ask: float | None
+    ) -> dict:
+        """Re-fetch market context (regime, ATR, RSI, spread) at resolution time."""
+        ctx = {
+            "regime": "unknown",
+            "atr": atr_value,
+            "rsi": None,
+            "spread_points": None,
+        }
+        try:
+            regime_result = detect_regime(
+                bars=[], atr_value=atr_value if atr_value > 0 else None
+            )
+            ctx["regime"] = regime_result.get("regime", "unknown")
+        except Exception:
+            pass
+
+        try:
+            rsi_result = tool_get_indicator(
+                IndicatorRequest(
+                    symbol=symbol, timeframe="H1", indicator="rsi", period=14
+                )
+            )
+            if "value" in rsi_result and rsi_result["value"]:
+                ctx["rsi"] = float(rsi_result["value"])
+        except Exception:
+            pass
+
+        try:
+            if bid and ask:
+                point_val = float(point)
+                ctx["spread_points"] = (
+                    int((ask - bid) / point_val) if point_val > 0 else 0
+                )
+        except Exception:
+            pass
+
+        return ctx
+
     start_time = _time.monotonic()
     end_time = _time.monotonic() + duration_seconds
 
@@ -5310,6 +5754,12 @@ async def tool_wait_trade_monitor(req: TradeMonitorRequest) -> dict:
             dist_inval_pips = distance_to_invalidation / pip if pip > 0 else 0.0
 
             if condition == "target_reached":
+                try:
+                    market_context.update(
+                        _refresh_market_context(req.symbol, point, bid, ask)
+                    )
+                except Exception:
+                    pass
                 return {
                     "symbol": req.symbol,
                     "reason": "target_reached",
@@ -5325,6 +5775,12 @@ async def tool_wait_trade_monitor(req: TradeMonitorRequest) -> dict:
                     "market_context": dict(market_context),
                 }
             elif condition == "invalidation_hit":
+                try:
+                    market_context.update(
+                        _refresh_market_context(req.symbol, point, bid, ask)
+                    )
+                except Exception:
+                    pass
                 return {
                     "symbol": req.symbol,
                     "reason": "invalidation_hit",
@@ -5366,6 +5822,11 @@ async def tool_wait_trade_monitor(req: TradeMonitorRequest) -> dict:
     pip = 10 * float(point)
     dist_target_pips = distance_to_target / pip if pip > 0 else 0.0
     dist_inval_pips = distance_to_invalidation / pip if pip > 0 else 0.0
+
+    try:
+        market_context.update(_refresh_market_context(req.symbol, point, bid, ask))
+    except Exception:
+        pass
 
     return {
         "symbol": req.symbol,
@@ -5466,8 +5927,6 @@ def tool_economic_calendar(req: EconomicCalendarRequest) -> dict:
         if result.get("status") == "completed":
             payload = result.get("result", {}).get("payload", {})
             if isinstance(payload, str):
-                import json
-
                 payload = json.loads(payload)
 
             if "error" not in payload:

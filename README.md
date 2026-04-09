@@ -2,9 +2,19 @@
 
 A production-ready bridge between MetaTrader 5 and Model Context Protocol (MCP), enabling AI-driven trading analysis and execution on Linux systems.
 
-## Architecture
+## For AI Agents
 
-### TCP Bridge (Low-Latency, Recommended)
+**Start here:** `~/.agents/skills/mt5-trading/SKILL.md` — Complete trading workflow, tool usage guide, polling protocol, and decision framework.
+
+The SKILL.md contains everything an AI trading agent needs:
+- 12-phase trading cycle (State Triage → Continuous Cycling)
+- Tool availability and usage patterns
+- Polling tiers and wait protocols
+- Risk management and position sizing
+- Analysis pipeline with fallback behavior
+- Metacognition and decision journaling
+
+## Architecture
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────┐     ┌──────────┐
@@ -12,333 +22,95 @@ A production-ready bridge between MetaTrader 5 and Model Context Protocol (MCP),
 │  (Port 8010)│     │  (Port 8025)     │     │  (Wine)     │     │ Terminal │
 │             │◀────│  (asyncio TCP)   │◀────│  (sockets)  │◀────│          │
 └─────────────┘     └──────────────────┘     └─────────────┘     └──────────┘
-     ▲                                                                                    │
-     │                                                                                    │
-     └──────────────────── AI Agents / CLI ──────────────────────────────────────────────┘
 ```
 
-**Latency**: ~15-25ms end-to-end (vs ~600ms with HTTP polling)
+**Latency:** ~15-25ms end-to-end via TCP (vs ~600ms HTTP fallback)
 
-**Protocol**: Length-prefixed JSON frames over raw TCP sockets (MQL5 `SocketCreate()`/`SocketConnect()`).
-
-### HTTP Bridge (Legacy Fallback)
-
-The original HTTP polling model remains functional. Set `EnableTCPBridge=false` in EA parameters or `MT5_TCP_BRIDGE_ENABLED=false` to use it.
-
-**Key Design Decisions:**
-- **Linux-Compatible**: Uses MQL5 EA bridge instead of Python MT5 module (which doesn't work on Linux)
-- **TCP Push Model** (default): EA maintains persistent TCP connection to bridge server — commands pushed instantly, no polling
-- **HTTP Fallback**: Automatic fallback to HTTP polling if TCP unavailable
-- **In-Memory Queue**: Falls back to in-memory if Redis unavailable
-- **Demo-First Policy**: Execution tools gated for demo accounts in R&D
+**Key Design:**
+- **Linux-Compatible**: MQL5 EA bridge (no Python MT5 module)
+- **TCP Push Model**: Persistent TCP connection, instant command delivery
+- **HTTP Fallback**: Automatic if TCP unavailable
+- **Demo-First**: Execution tools gated for demo accounts in R&D mode
 
 ## Quick Start
 
-### Prerequisites
-
 ```bash
-# Python 3.11+
-python --version
-
-# Poetry for dependency management
-curl -sSL https://install.python-poetry.org | python3 -
-
-# MT5 running under Wine/Bottles (Linux) or native (Windows)
-```
-
-### Installation
-
-```bash
-# Clone and install
+# Prerequisites: Python 3.11+, Poetry, MT5 under Wine/Bottles
 git clone https://github.com/ishanp321/MT5-mcp.git
 cd MT5-mcp
 poetry install
 
-# Set environment variables (optional)
-export MT5_GATEWAY_URL="http://127.0.0.1:8020"
-export MT5_REDIS_URL="redis://localhost:6379/0"  # Optional
+# Start services (3 terminals):
+poetry run python -m apps.tcp_bridge.main           # TCP Bridge (port 8025)
+poetry run uvicorn apps.bridge_gateway.main:app --host 127.0.0.1 --port 8020  # Gateway
+poetry run uvicorn apps.mcp_server.main:app --host 127.0.0.1 --port 8010      # MCP Server
 ```
 
-### Start Services
+### EA Setup
 
-```bash
-# Terminal 1: TCP Bridge Server (recommended, port 8025)
-poetry run python -m apps.tcp_bridge.main
-
-# Terminal 2: Bridge Gateway (HTTP fallback, port 8020)
-poetry run uvicorn apps.bridge_gateway.main:app --host 127.0.0.1 --port 8020
-
-# Terminal 3: MCP Server (port 8010)
-poetry run uvicorn apps.mcp_server.main:app --host 127.0.0.1 --port 8010
-```
-
-### EA Setup (MT5 under Wine/Bottles)
-
-1. **Compile EA**: Open `ea/BridgeConnectorEA.mq5` in MetaEditor, press F7
-2. **Attach to Chart**: Drag EA onto any chart (e.g., XAUUSDm M1)
-3. **Configure TCP Bridge** (recommended):
-   - In EA inputs, ensure `EnableTCPBridge = true` (default)
-   - `TCPBridgeHost = 127.0.0.1`
-   - `TCPBridgePort = 8025`
-4. **Enable WebRequest**: 
-   - Tools → Options → Expert Advisors
-   - ✓ Allow WebRequest for listed URL
-   - Add: `http://127.0.0.1:8020` (for HTTP fallback)
-5. **Verify Connection**:
-   ```bash
-   # TCP Bridge status
-   curl -s http://127.0.0.1:8025/status 2>/dev/null || echo "TCP Bridge not running"
-   
-   # HTTP Gateway status (fallback)
-   curl -s http://127.0.0.1:8020/bridge/terminal/status | jq .
-   # Expected: {"connected": true, "login": 123456, ...}
-   ```
-
-## API Reference
-
-### MCP Server (Port 8010)
-
-#### Market Data
-
-```bash
-# Get OHLCV bars
-curl -X POST http://127.0.0.1:8010/tools/get_bars \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"XAUUSD","timeframe":"M1","count":100}'
-
-# Get indicator value
-curl -X POST http://127.0.0.1:8010/tools/get_indicator \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"XAUUSD","timeframe":"H1","indicator":"rsi","period":14}'
-
-# Get indicator series
-curl -X POST http://127.0.0.1:8010/tools/get_indicator \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"XAUUSD","timeframe":"H1","indicator":"macd","fast":12,"slow":26,"signal":9,"window":100}'
-
-# Get recent ticks
-curl -X POST http://127.0.0.1:8010/tools/get_ticks \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"XAUUSD","count":50}'
-
-# Get order book (DOM)
-curl -X POST http://127.0.0.1:8010/tools/get_order_book \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"XAUUSD"}'
-```
-
-#### Supported Indicators
-
-- **Moving Averages**: `sma`, `ema`, `wma`, `smma`
-- **Oscillators**: `rsi`, `stoch`, `cci`, `atr`
-- **Trend**: `macd`, `adx`, `dmi`, `ichimoku`
-- **Volatility**: `bbands` (Bollinger Bands)
-- **Volume**: `obv` (On-Balance Volume)
-
-#### Trading Operations
-
-```bash
-# Get account summary
-curl http://127.0.0.1:8010/tools/get_account_summary
-
-# Get open positions
-curl http://127.0.0.1:8010/tools/get_positions
-
-# Get pending orders
-curl http://127.0.0.1:8010/tools/get_orders
-
-# Submit market order (demo only)
-curl -X POST http://127.0.0.1:8010/tools/submit_market_order_via_bridge \
-  -H "Content-Type: application/json" \
-  -d '{"intent_id":"demo-1","strategy_id":"scalp","account_id":"demo","symbol":"XAUUSD","side":"buy","order_kind":"market","volume_lots":0.10,"deviation_points":20}'
-
-# Submit pending order
-curl -X POST http://127.0.0.1:8010/tools/submit_pending_order \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"XAUUSD","side":"buy","volume_lots":0.10,"price":2650.00,"order_kind":"buy_limit"}'
-
-# Modify position SL/TP
-curl -X POST http://127.0.0.1:8010/tools/modify_position_sl_tp \
-  -H "Content-Type: application/json" \
-  -d '{"position_id":12345,"sl":2640.00,"tp":2680.00}'
-
-# Close position
-curl -X POST http://127.0.0.1:8010/tools/close_position \
-  -H "Content-Type: application/json" \
-  -d '{"position_id":12345,"volume_lots":0.05}'
-
-# Close all positions
-curl -X POST http://127.0.0.1:8010/tools/close_all_positions \
-  -H "Content-Type: application/json" \
-  -d '{"scope":"all"}'
-
-# Cancel pending order
-curl -X POST http://127.0.0.1:8010/tools/cancel_order \
-  -H "Content-Type: application/json" \
-  -d '{"order_id":67890}'
-
-# Cancel all pending orders
-curl -X POST http://127.0.0.1:8010/tools/cancel_all_orders \
-  -H "Content-Type: application/json" \
-  -d '{"scope":"all"}'
-```
-
-#### Chart Analysis
-
-```bash
-# Get chart screenshot (base64 PNG)
-curl -X POST http://127.0.0.1:8010/tools/get_chart_screenshot \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"XAUUSD","timeframe":"H1","width":1920,"height":1080}'
-```
-
-### Bridge Gateway (Port 8020)
-
-#### Health & Status
-
-```bash
-# Terminal status (from EA heartbeat)
-curl http://127.0.0.1:8020/bridge/terminal/status
-
-# Health check
-curl http://127.0.0.1:8020/bridge/health
-
-# Prometheus metrics
-curl http://127.0.0.1:8020/metrics
-```
-
-#### Direct Command Queue Access
-
-```bash
-# Enqueue command
-curl -X POST "http://127.0.0.1:8020/bridge/commands/enqueue?type=get_bars&symbol=XAUUSD&timeframe=M1&count=10"
-
-# Get command result
-curl http://127.0.0.1:8020/bridge/results/{request_id}
-```
+1. Compile `ea/BridgeConnectorEA.mq5` in MetaEditor (F7)
+2. Attach to any chart (e.g., XAUUSDm M1)
+3. Ensure `EnableTCPBridge = true`, `TCPBridgeHost = 127.0.0.1`, `TCPBridgePort = 8025`
+4. Verify: `curl -s http://127.0.0.1:8025/status`
 
 ## Project Structure
 
 ```
 MT5-mcp/
 ├── apps/
-│   ├── mcp_server/          # MCP server (port 8010)
-│   │   └── main.py
-│   ├── bridge_gateway/      # Bridge gateway (port 8020)
-│   │   └── main.py
-│   └── tcp_bridge/          # TCP bridge (port 8025)
-│       └── main.py
-├── ea/
-│   └── BridgeConnectorEA.mq5  # MQL5 EA for MT5
-├── src/
-│   └── mt5_mcp/
-│       ├── schemas/         # Pydantic models
-│       ├── services/        # Business logic
-│       ├── adapters/        # MT5 adapter layer
-│       ├── policy/          # Trade policy enforcement
-│       ├── observability/   # Logging & metrics
-│       └── settings/        # Configuration
-├── tests/                   # Test suite
-├── deploy/                  # Docker & systemd deployment
-├── pyproject.toml           # Poetry dependencies
-└── README.md
+│   ├── mcp_server/main.py          # MCP server (port 8010) — ALL tool endpoints
+│   ├── bridge_gateway/main.py      # Bridge gateway (port 8020)
+│   └── tcp_bridge/main.py          # TCP bridge (port 8025)
+├── ea/BridgeConnectorEA.mq5        # MQL5 EA for MT5
+├── src/mt5_mcp/
+│   ├── schemas/                    # Pydantic models
+│   ├── services/                   # Business logic (regime detection, momentum, etc.)
+│   ├── policy/                     # Trade policy enforcement
+│   └── observability/              # Logging & metrics
+├── skills/mt5-trading/             # AI agent skill (SKILL.md + references)
+└── tests/                          # Test suite
 ```
 
-## Configuration
+## API Reference
 
-### Environment Variables
+**For humans:** See `mcp_server/main.py` for all endpoint definitions (~100 endpoints across market data, trading, analysis, wait tools, and management).
+
+**For agents:** The SKILL.md (`~/.agents/skills/mt5-trading/SKILL.md`) provides complete tool documentation with usage context, trading workflow, and decision frameworks.
+
+## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MT5_GATEWAY_URL` | `http://127.0.0.1:8020` | Bridge gateway endpoint |
-| `MT5_REDIS_URL` | - | Redis URL (optional, falls back to in-memory) |
-| `MT5_COMMAND_SECRET` | - | Secret for command authorization (optional) |
+| `MT5_REDIS_URL` | - | Redis (optional, falls back to in-memory) |
 
-### EA Parameters
+## Monitoring
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `GatewayBaseURL` | `http://127.0.0.1:8020` | Gateway base URL |
-| `HeartbeatSeconds` | `5` | Heartbeat interval |
+```bash
+curl http://127.0.0.1:8020/bridge/terminal/status  # EA connection
+curl http://127.0.0.1:8020/bridge/health             # Gateway
+curl http://127.0.0.1:8010/health                    # MCP server
+```
 
 ## Testing
 
 ```bash
-# Run test suite
 poetry run pytest
-
-# Test specific module
-poetry run pytest tests/test_bridge_gateway.py -v
 ```
 
-## Monitoring
+## Security
 
-### Prometheus Metrics
-
-```bash
-# Queue depth
-curl http://127.0.0.1:8020/metrics | grep mt5_queue_depth
-
-# Heartbeat age
-curl http://127.0.0.1:8020/metrics | grep mt5_heartbeat_age_seconds
-```
-
-### Health Checks
-
-```bash
-# Gateway health
-curl http://127.0.0.1:8020/bridge/terminal/status | jq '.connected'
-
-# MCP health
-curl http://127.0.0.1:8010/health
-```
-
-## Troubleshooting
-
-### EA Not Connecting
-
-1. Check WebRequest permissions in MT5 (Tools → Options → Expert Advisors)
-2. Verify gateway is running: `curl http://127.0.0.1:8020/bridge/terminal/status`
-3. Check MT5 Experts tab for connection errors
-4. Ensure no firewall blocking port 8020
-
-### Commands Not Processing
-
-1. Check queue: `curl http://127.0.0.1:8020/bridge/commands/next`
-2. Verify EA is attached to chart and running
-3. Check gateway logs for `missing_type` errors
-4. Restart MT5 terminal if EA appears frozen
-
-### Python Import Errors
-
-```bash
-# Reinstall dependencies
-poetry install --no-cache
-
-# Verify installation
-poetry run python -c "from mt5_mcp.schemas.models import Bars; print('OK')"
-```
-
-## Security Notes
-
-- **Demo-First**: Execution tools are gated for demo accounts in R&D mode
-- **Secret Enforcement**: Optional `MT5_COMMAND_SECRET` for command authorization
-- **No External Exposure**: Services bind to `127.0.0.1` by default
-- **Policy Layer**: MCP enforces account-level execution policies
+- Services bind to `127.0.0.1` only — no external exposure
+- Execution tools gated for demo accounts in R&D mode
+- Optional `MT5_COMMAND_SECRET` for command authorization
+- Policy layer enforces account-level execution policies
 
 ---
 
 ## Related Projects
 
-- **[Jesse](https://github.com/ishanp321/jesse)** — Autonomous AI Trading Agent (LangChain ReAct) that consumes MT5-MCP as its trading backend.
+- **[Jesse](https://github.com/ishanp321/jesse)** — Autonomous AI Trading Agent (LangChain ReAct) consuming MT5-MCP as trading backend
 
 ## License
 
 MIT
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Run tests: `poetry run pytest`
-4. Submit a pull request
