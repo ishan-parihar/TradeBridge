@@ -17,6 +17,7 @@ class VWAPResult:
     vwap_deviation_lower: float
     distance_from_vwap_pct: float
     price_position: str
+    volume_type: str = "tick_volume"
     vwap_series: list[dict] = field(default_factory=list)
 
 
@@ -28,6 +29,7 @@ class VolumeAtPriceResult:
     value_area_width: float
     price_distribution: list[dict] = field(default_factory=list)
     current_price_position: str = "unknown"
+    volume_type: str = "tick_volume"
 
 
 def compute_vwap(
