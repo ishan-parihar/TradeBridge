@@ -242,12 +242,18 @@ def _register_wait_delay(mcp: FastMCP) -> None:
     ) -> dict:
         """Wait for specified duration, optionally capturing market state.
 
+        For durations <= 60s: blocks and returns market summary after waiting.
+        For durations > 60s: returns immediately with scheduled completion time
+        to avoid MCP client request timeouts (~60s). Agent should poll market
+        data tools after the scheduled resume time.
+
         Args:
             duration_seconds: Seconds to wait. Range: 1-3600 (1 hour max). Default: 60.
             symbol: Optional MT5 symbol for market state capture (e.g., 'XAUUSDm').
 
         Returns:
-            Dict with waited_seconds, resumed_at, market_summary (if symbol provided).
+            Dict with waited_seconds, resumed_at, market_summary (if symbol provided),
+            and scheduled (bool) indicating if the wait was deferred.
         """
         _init_helpers()
 
@@ -256,87 +262,102 @@ def _register_wait_delay(mcp: FastMCP) -> None:
         if duration_seconds > 3600:
             raise ValueError("duration_seconds must not exceed 3600 (1 hour)")
 
+        _capture_market_state = symbol is not None
         market_summary: dict | None = None
         capture_error: str | None = None
 
         if symbol:
             try:
                 _normalize_symbol(symbol)
+            except Exception as e:
+                capture_error = str(e)
+                symbol = None
 
-                book_before = tool_get_order_book(OrderBookRequest(symbol=symbol))
-                bid_before = float(book_before.get("bid", 0))
-                ask_before = float(book_before.get("ask", 0))
-                mid_before = (
-                    (bid_before + ask_before) / 2 if bid_before and ask_before else 0
-                )
+        def _capture_before() -> dict | None:
+            if not symbol:
+                return None
+            try:
+                book = tool_get_order_book(OrderBookRequest(symbol=symbol))
+                bid = float(book.get("bid", 0))
+                ask = float(book.get("ask", 0))
+                mid = (bid + ask) / 2 if bid and ask else 0
 
-                rsi_before_resp = tool_get_indicator(
+                rsi_resp = tool_get_indicator(
                     IndicatorRequest(
                         symbol=symbol, timeframe="H1", indicator="rsi", period=14
                     )
                 )
-                rsi_before = rsi_before_resp.get("value")
+                rsi = rsi_resp.get("value")
 
-                bars_before = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
-                regime_before = _detect_regime(
-                    bars=bars_before.get("bars", []), atr_value=None
-                )
-                regime_before_label = regime_before.get("regime", "unknown")
+                bars = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
+                regime = _detect_regime(bars=bars.get("bars", []), atr_value=None)
+                regime_label = regime.get("regime", "unknown")
 
                 sym_info = tool_get_symbol_info(symbol)
                 point = float(sym_info.get("point", 0))
                 digits = int(sym_info.get("digits", 5))
                 pip_size = point * 10 if digits in (3, 5) else point
 
-                elapsed = 0
-                while elapsed < duration_seconds:
-                    remaining = duration_seconds - elapsed
-                    sleep_time = min(30, remaining)
-                    await asyncio.sleep(sleep_time)
-                    elapsed += sleep_time
+                return {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "rsi": rsi,
+                    "regime": regime_label,
+                    "point": point,
+                    "digits": digits,
+                    "pip_size": pip_size,
+                }
+            except Exception as e:
+                logger.warning("wait/delay: pre-capture failed for %s: %s", symbol, e)
+                return None
 
-                book_after = tool_get_order_book(OrderBookRequest(symbol=symbol))
-                bid_after = float(book_after.get("bid", 0))
-                ask_after = float(book_after.get("ask", 0))
-                mid_after = (
-                    (bid_after + ask_after) / 2 if bid_after and ask_after else 0
-                )
+        def _build_summary(before: dict) -> dict | None:
+            if not symbol:
+                return None
+            try:
+                book = tool_get_order_book(OrderBookRequest(symbol=symbol))
+                bid = float(book.get("bid", 0))
+                ask = float(book.get("ask", 0))
+                mid = (bid + ask) / 2 if bid and ask else 0
 
-                rsi_after_resp = tool_get_indicator(
+                rsi_resp = tool_get_indicator(
                     IndicatorRequest(
                         symbol=symbol, timeframe="H1", indicator="rsi", period=14
                     )
                 )
-                rsi_after = rsi_after_resp.get("value")
+                rsi = rsi_resp.get("value")
 
-                bars_after = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
-                regime_after = _detect_regime(
-                    bars=bars_after.get("bars", []), atr_value=None
-                )
-                regime_after_label = regime_after.get("regime", "unknown")
+                bars = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
+                regime = _detect_regime(bars=bars.get("bars", []), atr_value=None)
+                regime_label = regime.get("regime", "unknown")
 
-                if mid_before > 0 and mid_after > 0 and pip_size > 0:
-                    price_change_pips = round((mid_after - mid_before) / pip_size, 1)
+                pip_size = before.get("pip_size", 0)
+                digits = before.get("digits", 5)
+                mid_before = before.get("mid", 0)
+
+                if mid_before > 0 and mid > 0 and pip_size > 0:
+                    price_change_pips = round((mid - mid_before) / pip_size, 1)
                 else:
                     price_change_pips = None
 
-                market_summary = {
+                return {
                     "symbol": symbol,
                     "price_before": round(mid_before, digits) if mid_before else None,
-                    "price_after": round(mid_after, digits) if mid_after else None,
+                    "price_after": round(mid, digits) if mid else None,
                     "price_change_pips": price_change_pips,
-                    "regime_before": regime_before_label,
-                    "regime_after": regime_after_label,
-                    "rsi_before": rsi_before,
-                    "rsi_after": rsi_after,
+                    "regime_before": before.get("regime", "unknown"),
+                    "regime_after": regime_label,
+                    "rsi_before": before.get("rsi"),
+                    "rsi_after": rsi,
                 }
             except Exception as e:
-                logger.warning(
-                    "wait/delay: market state capture failed for %s: %s", symbol, e
-                )
-                capture_error = str(e)
-                market_summary = None
-        else:
+                logger.warning("wait/delay: post-capture failed for %s: %s", symbol, e)
+                return None
+
+        if duration_seconds <= 60:
+            before_data = _capture_before() if _capture_market_state else None
+
             elapsed = 0
             while elapsed < duration_seconds:
                 remaining = duration_seconds - elapsed
@@ -344,14 +365,55 @@ def _register_wait_delay(mcp: FastMCP) -> None:
                 await asyncio.sleep(sleep_time)
                 elapsed += sleep_time
 
-        result: dict[str, Any] = {
-            "waited_seconds": duration_seconds,
-            "resumed_at": datetime.now(timezone.utc).isoformat(),
-            "market_summary": market_summary,
-        }
-        if capture_error:
-            result["capture_error"] = capture_error
-        return result
+            if _capture_market_state and before_data:
+                market_summary = _build_summary(before_data)
+
+            result: dict[str, Any] = {
+                "waited_seconds": duration_seconds,
+                "resumed_at": datetime.now(timezone.utc).isoformat(),
+                "scheduled": False,
+                "market_summary": market_summary,
+            }
+            if capture_error:
+                result["capture_error"] = capture_error
+            return result
+        else:
+            before_data = _capture_before() if _capture_market_state else None
+            resumed_at = datetime.now(timezone.utc)
+            resumed_at_iso = resumed_at.isoformat()
+            expected_completion = resumed_at.timestamp() + duration_seconds
+            expected_completion_iso = datetime.fromtimestamp(
+                expected_completion, tz=timezone.utc
+            ).isoformat()
+
+            market_summary = None
+            if _capture_market_state and before_data:
+                market_summary = {
+                    "symbol": symbol,
+                    "price_before": round(
+                        before_data.get("mid", 0), before_data.get("digits", 5)
+                    ),
+                    "price_after": None,
+                    "price_change_pips": None,
+                    "regime_before": before_data.get("regime", "unknown"),
+                    "regime_after": None,
+                    "rsi_before": before_data.get("rsi"),
+                    "rsi_after": None,
+                    "note": "Post-wait market state unavailable (scheduled wait). "
+                    f"Poll mt5_get_order_book and mt5_get_bars after {expected_completion_iso}.",
+                }
+
+            return {
+                "waited_seconds": 0,
+                "scheduled": True,
+                "scheduled_duration_seconds": duration_seconds,
+                "scheduled_at": resumed_at_iso,
+                "expected_completion": expected_completion_iso,
+                "expected_completion_epoch": expected_completion,
+                "market_summary": market_summary,
+                "action": f"Wait {duration_seconds}s then poll market data tools "
+                f"(mt5_get_order_book, mt5_get_bars) to check conditions.",
+            }
 
 
 # Tool 2: mt5_wait_indicator
