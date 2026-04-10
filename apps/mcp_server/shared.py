@@ -322,6 +322,10 @@ def _first_bid_ask(book: dict) -> tuple[float | None, float | None]:
     asks = book.get("asks") or []
     bid = bids[0].get("price") if bids and isinstance(bids[0], dict) else None
     ask = asks[0].get("price") if asks and isinstance(asks[0], dict) else None
+    if bid is None:
+        bid = book.get("bid")
+    if ask is None:
+        ask = book.get("ask")
     return (
         float(bid) if bid is not None else None,
         float(ask) if ask is not None else None,

@@ -34,12 +34,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from mt5_mcp.schemas.tools import (
-    IndicatorRequest,
-    OrderBookRequest,
     WaitDelayRequest,
     WaitDelayResult,
-    WaitForIndicatorRequest,
-    WaitForIndicatorResult,
 )
 from mt5_mcp.services.trade_monitor import (
     check_price_condition,
@@ -277,23 +273,30 @@ def _register_wait_delay(mcp: FastMCP) -> None:
             if not symbol:
                 return None
             try:
-                book = tool_get_order_book(OrderBookRequest(symbol=symbol))
-                bid = float(book.get("bid", 0))
-                ask = float(book.get("ask", 0))
-                mid = (bid + ask) / 2 if bid and ask else 0
+                book = tool_get_order_book(symbol=symbol)
+                if "error" in book:
+                    return None
+                bid, ask = _first_bid_ask(book)
+                if bid is None or ask is None:
+                    return None
+                mid = (bid + ask) / 2
 
                 rsi_resp = tool_get_indicator(
-                    IndicatorRequest(
-                        symbol=symbol, timeframe="H1", indicator="rsi", period=14
-                    )
+                    symbol=symbol, timeframe="H1", indicator="rsi", period=14
                 )
-                rsi = rsi_resp.get("value")
+                rsi = rsi_resp.get("value") if "error" not in rsi_resp else None
 
-                bars = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
-                regime = _detect_regime(bars=bars.get("bars", []), atr_value=None)
+                bars_resp = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
+                bars_data = (
+                    bars_resp.get("data", []) if "error" not in bars_resp else []
+                )
+                regime = _detect_regime(bars=bars_data, atr_value=0)
                 regime_label = regime.get("regime", "unknown")
 
-                sym_info = tool_get_symbol_info(symbol)
+                sym_info_resp = tool_get_symbol_info(symbol=symbol)
+                if "error" in sym_info_resp:
+                    return None
+                sym_info = sym_info_resp.get("info", sym_info_resp)
                 point = float(sym_info.get("point", 0))
                 digits = int(sym_info.get("digits", 5))
                 pip_size = point * 10 if digits in (3, 5) else point
@@ -316,20 +319,24 @@ def _register_wait_delay(mcp: FastMCP) -> None:
             if not symbol:
                 return None
             try:
-                book = tool_get_order_book(OrderBookRequest(symbol=symbol))
-                bid = float(book.get("bid", 0))
-                ask = float(book.get("ask", 0))
-                mid = (bid + ask) / 2 if bid and ask else 0
+                book = tool_get_order_book(symbol=symbol)
+                if "error" in book:
+                    return None
+                bid, ask = _first_bid_ask(book)
+                if bid is None or ask is None:
+                    return None
+                mid = (bid + ask) / 2
 
                 rsi_resp = tool_get_indicator(
-                    IndicatorRequest(
-                        symbol=symbol, timeframe="H1", indicator="rsi", period=14
-                    )
+                    symbol=symbol, timeframe="H1", indicator="rsi", period=14
                 )
-                rsi = rsi_resp.get("value")
+                rsi = rsi_resp.get("value") if "error" not in rsi_resp else None
 
-                bars = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
-                regime = _detect_regime(bars=bars.get("bars", []), atr_value=None)
+                bars_resp = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
+                bars_data = (
+                    bars_resp.get("data", []) if "error" not in bars_resp else []
+                )
+                regime = _detect_regime(bars=bars_data, atr_value=0)
                 regime_label = regime.get("regime", "unknown")
 
                 pip_size = before.get("pip_size", 0)
@@ -352,7 +359,7 @@ def _register_wait_delay(mcp: FastMCP) -> None:
                     "rsi_after": rsi,
                 }
             except Exception as e:
-                logger.warning("wait/delay: post-capture failed for %s: %s", symbol, e)
+                logger.warning("wait/delay: pre-capture failed for %s: %s", symbol, e)
                 return None
 
         if duration_seconds <= 60:
@@ -471,24 +478,12 @@ def _register_wait_indicator(mcp: FastMCP) -> None:
                 - indicator: The indicator name
                 - condition: The condition that was checked
                 - target_value: The target value
-                - actual_value: Indicator value at trigger (or last sampled on timeout)
+                - actual_value: Indicator value at trigger (or last valid on timeout)
                 - triggered: True if condition met, False if timed out
                 - timed_out: True if timeout was reached
                 - poll_count: Number of polls performed
                 - previous_value: Previous indicator value (for crosses, optional)
                 - crossing_direction: 'upward' or 'downward' (for crosses, optional)
-
-        Error Handling:
-            - Poll failures are logged as warnings; polling continues until timeout.
-            - Final value fetch failure: actual_value set to None.
-            - Invalid condition: rejected by Pydantic Literal type.
-
-        Examples:
-            # Wait for RSI to drop below 30
-            mt5_wait_indicator(symbol="XAUUSDm", indicator="rsi", condition="below", value=30)
-
-            # Wait for MACD to cross zero
-            mt5_wait_indicator(symbol="EURUSD", indicator="macd", condition="crosses", value=0)
         """
         _init_helpers()
 
@@ -498,10 +493,11 @@ def _register_wait_indicator(mcp: FastMCP) -> None:
         end_time = asyncio.get_event_loop().time() + timeout
         poll_count = 0
         previous_value: Optional[float] = None
+        last_valid_value: Optional[float] = None
 
         while asyncio.get_event_loop().time() < end_time:
             try:
-                indicator_req = IndicatorRequest(
+                result = tool_get_indicator(
                     symbol=symbol,
                     timeframe=timeframe,
                     indicator=indicator,
@@ -510,9 +506,21 @@ def _register_wait_indicator(mcp: FastMCP) -> None:
                     slow=slow,
                     signal=signal,
                 )
-                result = tool_get_indicator(indicator_req)
-                current_value = result.get("value", 0.0) or 0.0
+
+                if "error" in result or result.get("value") is None:
+                    poll_count += 1
+                    logger.warning(
+                        "wait/indicator: poll returned no value for %s %s: %s",
+                        indicator,
+                        symbol,
+                        result.get("error", "value is None"),
+                    )
+                    await asyncio.sleep(check_interval)
+                    continue
+
+                current_value = float(result["value"])
                 poll_count += 1
+                last_valid_value = current_value
 
                 if condition == "above" and current_value >= value:
                     return {
@@ -585,28 +593,12 @@ def _register_wait_indicator(mcp: FastMCP) -> None:
 
             await asyncio.sleep(check_interval)
 
-        try:
-            final_result = tool_get_indicator(
-                IndicatorRequest(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    indicator=indicator,
-                    period=period,
-                )
-            )
-            current_value = final_result.get("value", 0.0) or 0.0
-        except Exception as e:
-            logger.warning(
-                "wait/indicator: error fetching final value for %s: %s", symbol, e
-            )
-            current_value = None
-
         return {
             "symbol": symbol,
             "indicator": indicator,
             "condition": condition,
             "target_value": value,
-            "actual_value": current_value,
+            "actual_value": last_valid_value,
             "triggered": False,
             "timed_out": True,
             "poll_count": poll_count,
@@ -711,12 +703,13 @@ def _register_wait_trade_monitor(mcp: FastMCP) -> None:
         if duration_seconds <= 0:
             raise ValueError("Duration must be positive")
 
-        symbol_info_data = tool_get_symbol_info(symbol)
-        if "error" in symbol_info_data:
+        symbol_info_response = tool_get_symbol_info(symbol)
+        if "error" in symbol_info_response:
             raise ValueError(
-                f"Symbol info unavailable for {symbol}: {symbol_info_data['error']}"
+                f"Symbol info unavailable for {symbol}: {symbol_info_response['error']}"
             )
 
+        symbol_info_data = symbol_info_response.get("info", symbol_info_response)
         point = symbol_info_data.get("point")
         if not point or point <= 0:
             raise ValueError(f"Could not determine point value for {symbol}")
@@ -728,15 +721,13 @@ def _register_wait_trade_monitor(mcp: FastMCP) -> None:
         if expected_type == "atr" or invalidation_type == "atr":
             try:
                 atr_result = tool_get_indicator(
-                    IndicatorRequest(
-                        symbol=symbol, timeframe="H1", indicator="atr", period=14
-                    )
+                    symbol=symbol, timeframe="H1", indicator="atr", period=14
                 )
-                if atr_result.get("status") == "error":
+                if "error" in atr_result or atr_result.get("status") == "error":
                     logger.warning(
                         "Trade monitor: ATR request failed for %s: %s",
                         symbol,
-                        atr_result.get("message", "unknown error"),
+                        atr_result.get("error", atr_result.get("message", "unknown")),
                     )
                 elif "value" in atr_result and atr_result["value"]:
                     atr_value = float(atr_result["value"])
@@ -751,7 +742,7 @@ def _register_wait_trade_monitor(mcp: FastMCP) -> None:
             invalidation["atr_value"] = atr_value
 
         try:
-            book = tool_get_order_book(OrderBookRequest(symbol=symbol))
+            book = tool_get_order_book(symbol=symbol)
             bid, ask = _first_bid_ask(book)
             if bid is None or ask is None:
                 raise ValueError("Order book returned no bid/ask")
@@ -779,7 +770,7 @@ def _register_wait_trade_monitor(mcp: FastMCP) -> None:
 
         while time.monotonic() < end_time:
             try:
-                book = tool_get_order_book(OrderBookRequest(symbol=symbol))
+                book = tool_get_order_book(symbol=symbol)
                 bid, ask = _first_bid_ask(book)
 
                 if bid is not None and ask is not None:
@@ -860,7 +851,7 @@ def _register_wait_trade_monitor(mcp: FastMCP) -> None:
             await asyncio.sleep(check_interval)
 
         try:
-            book = tool_get_order_book(OrderBookRequest(symbol=symbol))
+            book = tool_get_order_book(symbol=symbol)
             bid, ask = _first_bid_ask(book)
             if bid is not None and ask is not None:
                 current_price = (bid + ask) / 2
@@ -964,7 +955,7 @@ def _register_wait_for_price(mcp: FastMCP) -> None:
 
         while asyncio.get_event_loop().time() < end_time:
             try:
-                book = tool_get_order_book(OrderBookRequest(symbol=symbol))
+                book = tool_get_order_book(symbol=symbol)
                 bid, ask = _first_bid_ask(book)
 
                 if bid is None or ask is None:
@@ -1007,7 +998,7 @@ def _register_wait_for_price(mcp: FastMCP) -> None:
             await asyncio.sleep(1)
 
         try:
-            book = tool_get_order_book(OrderBookRequest(symbol=symbol))
+            book = tool_get_order_book(symbol=symbol)
             bid, ask = _first_bid_ask(book)
             current = (bid + ask) / 2 if bid and ask else 0
         except Exception:
@@ -1041,8 +1032,9 @@ def _get_market_context(
     }
     try:
         bars = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
+        bars_data = bars.get("data", []) if "error" not in bars else []
         regime_result = _detect_regime(
-            bars=bars.get("bars", []), atr_value=atr_value if atr_value > 0 else None
+            bars=bars_data, atr_value=atr_value if atr_value and atr_value > 0 else 0
         )
         ctx["regime"] = regime_result.get("regime", "unknown")
     except Exception as e:
@@ -1050,9 +1042,9 @@ def _get_market_context(
 
     try:
         rsi_result = tool_get_indicator(
-            IndicatorRequest(symbol=symbol, timeframe="H1", indicator="rsi", period=14)
+            symbol=symbol, timeframe="H1", indicator="rsi", period=14
         )
-        if "value" in rsi_result and rsi_result["value"]:
+        if "error" not in rsi_result and rsi_result.get("value"):
             ctx["rsi"] = float(rsi_result["value"])
     except Exception as e:
         logger.warning("Market context: RSI fetch error for %s: %s", symbol, e)
