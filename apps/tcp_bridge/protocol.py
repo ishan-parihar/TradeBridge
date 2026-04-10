@@ -116,3 +116,12 @@ class FrameParser:
         """Clear the buffer and reset state."""
         self._buffer.clear()
         self._expected = None
+
+    def _peek_header(self) -> bytes | None:
+        if len(self._buffer) < 4:
+            return None
+        return bytes(self._buffer[:4])
+
+    def clear(self) -> None:
+        self._buffer.clear()
+        self._expected = None

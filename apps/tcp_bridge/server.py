@@ -21,6 +21,34 @@ _MAX_PAYLOAD = 16 * 1024 * 1024
 _HEADER_FORMAT = "!I"
 _HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)
 
+# Wine socket bug: Wine may inject HTTP data into raw TCP socket buffers.
+# Detect common HTTP method prefixes to discard garbage before frame parsing.
+_HTTP_METHODS = (
+    b"GET ",
+    b"POST",
+    b"PUT ",
+    b"HEAD",
+    b"DEL",
+    b"OPTI",
+    b"PATC",
+    b"CONN",
+    b"TRAC",
+)
+
+
+def _discard_http_garbage(buffer: bytearray) -> bool:
+    if len(buffer) < 4:
+        return False
+    prefix = bytes(buffer[:4])
+    if prefix.startswith(_HTTP_METHODS):
+        try:
+            body_start = buffer.index(b"\r\n\r\n")
+            del buffer[: body_start + 4]
+        except ValueError:
+            buffer.clear()
+        return True
+    return False
+
 
 class PendingCommand:
     __slots__ = ("request_id", "type", "payload", "future", "enqueued_at")
@@ -107,7 +135,17 @@ class TCPBridgeServer:
                     logger.info(f"EA closed connection")
                     break
                 self._ea_parser.feed(data)
-                while self._ea_parser.has_frame():
+                while True:
+                    header = self._ea_parser._peek_header()
+                    if header and _discard_http_garbage(self._ea_parser._buffer):
+                        logger.warning(
+                            f"Discarded Wine HTTP garbage from EA connection: "
+                            f"{header!r}"
+                        )
+                        self._ea_parser.clear()
+                        continue
+                    if not self._ea_parser.has_frame():
+                        break
                     frame = self._ea_parser.pop_frame()
                     await self._handle_frame(frame)
         except ConnectionResetError:
