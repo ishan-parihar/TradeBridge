@@ -151,7 +151,7 @@ class TCPBridgeClient:
         request_id = str(uuid.uuid4())
         frame = {"type": type, "request_id": request_id, **payload}
 
-        fut: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = fut
 
         json_bytes = json_dumps(frame).encode("utf-8")

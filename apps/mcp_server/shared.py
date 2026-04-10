@@ -1,0 +1,361 @@
+"""Shared infrastructure for the TradeBridge FastMCP server.
+
+Provides lazy-loaded singletons (TCP client, gateway, HTTP client, settings),
+bridge communication helpers, payload parsers, and freeze state management.
+All tool modules import from here — no direct imports from main.py.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+
+from mt5_mcp.observability.logging import logger
+from mt5_mcp.settings.config import get_settings
+
+
+# ---------------------------------------------------------------------------
+# Singletons
+# ---------------------------------------------------------------------------
+
+_http_client: httpx.Client | None = None
+_gw: Any | None = None
+_settings: Any | None = None
+
+_TCP_BRIDGE_ENABLED = os.getenv("MT5_TCP_BRIDGE_ENABLED", "true").lower() == "true"
+
+
+def get_http_client() -> httpx.Client:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.Client(
+            timeout=10.0,
+            http2=False,
+            limits=httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=20,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _http_client
+
+
+def get_gateway():
+    global _gw
+    if _gw is None:
+        from mt5_mcp.services.execution_gateway.service import ExecutionGateway
+
+        _gw = ExecutionGateway()
+    return _gw
+
+
+def get_settings_cached():
+    global _settings
+    if _settings is None:
+        _settings = get_settings()
+    return _settings
+
+
+# ---------------------------------------------------------------------------
+# TCP bridge: persistent client on dedicated background thread
+# ---------------------------------------------------------------------------
+
+_tcp_client: Any | None = None
+_tcp_loop: asyncio.AbstractEventLoop | None = None
+_tcp_thread: threading.Thread | None = None
+_tcp_ready = threading.Event()
+_tcp_lock = threading.RLock()
+
+
+def _run_tcp_event_loop() -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    global _tcp_loop
+    _tcp_loop = loop
+    _tcp_ready.set()
+    try:
+        loop.run_forever()
+    finally:
+        loop.close()
+
+
+def _get_tcp_loop() -> asyncio.AbstractEventLoop | None:
+    global _tcp_loop, _tcp_thread
+    if _tcp_loop is not None and _tcp_loop.is_running():
+        return _tcp_loop
+    with _tcp_lock:
+        if _tcp_loop is not None and _tcp_loop.is_running():
+            return _tcp_loop
+        _tcp_ready.clear()
+        _tcp_thread = threading.Thread(target=_run_tcp_event_loop, daemon=True)
+        _tcp_thread.start()
+        _tcp_ready.wait(timeout=5.0)
+        return _tcp_loop
+
+
+def _get_tcp_client() -> Any | None:
+    global _tcp_client
+    if _tcp_client is not None:
+        return _tcp_client
+
+    with _tcp_lock:
+        if _tcp_client is not None:
+            return _tcp_client
+
+        loop = _get_tcp_loop()
+        if loop is None:
+            logger.warning("Could not start TCP event loop")
+            return None
+
+        try:
+            from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
+
+            _tcp_client = TCPBridgeClient()
+            future = asyncio.run_coroutine_threadsafe(_tcp_client.connect(), loop)
+            future.result(timeout=10.0)
+            logger.info("TCP bridge client connected (shared, persistent)")
+        except Exception as e:
+            logger.warning(f"TCP bridge client connect failed: {e}")
+            _tcp_client = None
+    return _tcp_client
+
+
+# ---------------------------------------------------------------------------
+# Bridge communication helpers
+# ---------------------------------------------------------------------------
+
+
+def _await_result(req_id: str, timeout_s: float = 20.0, poll_s: float = 0.1) -> dict:
+    loop = _get_tcp_loop()
+    if loop is not None and loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(
+            _await_result_async(req_id, timeout_s, poll_s), loop
+        )
+        try:
+            return future.result(timeout=timeout_s + 10.0)
+        except TimeoutError as e:
+            logger.warning(
+                f"_await_result({req_id}): async timeout after {timeout_s}s — {e}"
+            )
+            return {"status": "timeout", "error": "timeout"}
+        except Exception as e:
+            logger.warning(f"_await_result({req_id}): async failed — {e}")
+            return {"status": "timeout", "error": "timeout"}
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    end = time.time() + timeout_s
+    try:
+        while time.time() < end:
+            r = client.get(f"{gw_url}/bridge/results/{req_id}")
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") in {"completed", "error"}:
+                    return data
+            time.sleep(poll_s)
+    except Exception as e:
+        logger.warning(f"_await_result({req_id}): HTTP poll failed — {e}")
+    return {"status": "timeout", "error": "timeout"}
+
+
+async def _await_result_async(req_id: str, timeout_s: float, poll_s: float) -> dict:
+    gw_url = get_settings_cached().gateway_url
+    end = time.time() + timeout_s
+    while time.time() < end:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"{gw_url}/bridge/results/{req_id}")
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("status") in {"completed", "error"}:
+                        return data
+        except Exception:
+            pass
+        await asyncio.sleep(poll_s)
+    return {"status": "timeout", "error": "timeout"}
+
+
+def _tcp_send_and_await(
+    type: str, payload: dict[str, Any], timeout_s: float = 20.0
+) -> dict[str, Any] | None:
+    if not _TCP_BRIDGE_ENABLED:
+        return None
+    try:
+        client = _get_tcp_client()
+        if client is None:
+            logger.debug(f"_tcp_send_and_await({type}): TCP client unavailable")
+            return None
+        loop = _get_tcp_loop()
+        if loop is None:
+            logger.debug(f"_tcp_send_and_await({type}): TCP event loop unavailable")
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            client.send_command(type, payload, timeout=timeout_s), loop
+        )
+        result = future.result(timeout=timeout_s + 5.0)
+        inner = result.get("payload", result)
+        return {"status": "completed", "result": {"payload": inner}}
+    except TimeoutError as e:
+        logger.warning(f"_tcp_send_and_await({type}): timeout after {timeout_s}s — {e}")
+    except Exception as e:
+        logger.warning(f"_tcp_send_and_await({type}): failed — {e}")
+    return None
+
+
+def _batch_enqueue_and_await(
+    commands: list[dict[str, Any]], timeout_s: float = 20.0
+) -> list[dict]:
+    tcp_ok = False
+    if _TCP_BRIDGE_ENABLED:
+        try:
+            client = _get_tcp_client()
+            if client is not None:
+                loop = _get_tcp_loop()
+                if loop is not None:
+
+                    async def _run_all():
+                        results = [None] * len(commands)
+                        tasks = []
+                        for i, cmd in enumerate(commands):
+                            task = asyncio.create_task(
+                                client.send_command(
+                                    type=cmd["type"],
+                                    payload={
+                                        k: v for k, v in cmd.items() if k != "type"
+                                    },
+                                    timeout=timeout_s,
+                                )
+                            )
+                            tasks.append((i, task))
+                        for i, task in tasks:
+                            try:
+                                results[i] = await task
+                            except Exception:
+                                results[i] = None
+                        return results
+
+                    future = asyncio.run_coroutine_threadsafe(_run_all(), loop)
+                    results = future.result(timeout=timeout_s + 10.0)
+                    tcp_ok = True
+
+                    if all(r is not None for r in results):
+                        return [
+                            {
+                                "status": "completed",
+                                "result": {"payload": r.get("payload", r)},
+                            }
+                            for r in results
+                        ]
+        except Exception:
+            pass
+
+    gw_url = get_settings_cached().gateway_url
+    client = get_http_client()
+    r = client.post(
+        f"{gw_url}/bridge/commands/batch",
+        json={"commands": commands},
+        timeout=timeout_s,
+    )
+    r.raise_for_status()
+    batch = r.json()
+    req_ids = batch.get("ids", [])
+    results = []
+    for rid in req_ids:
+        results.append(_await_result(rid, timeout_s=timeout_s))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Payload parsers
+# ---------------------------------------------------------------------------
+
+
+def _parse_payload(payload) -> dict:
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except Exception:
+            return {}
+    elif isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _parse_payload_dict(result: dict) -> dict:
+    if not result or result.get("status") != "completed":
+        return {}
+    payload = result.get("result", {}).get("payload", {})
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except Exception:
+            return {}
+    elif isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _parse_indicator_value(result: dict) -> float | None:
+    if not result or result.get("status") != "completed":
+        return None
+    payload = result.get("result", {}).get("payload", {})
+    if isinstance(payload, str):
+        try:
+            return float(json.loads(payload).get("value", 0) or 0)
+        except Exception:
+            return None
+    elif isinstance(payload, dict):
+        v = payload.get("value")
+        return float(v) if v is not None else None
+    return None
+
+
+def _first_bid_ask(book: dict) -> tuple[float | None, float | None]:
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    bid = bids[0].get("price") if bids and isinstance(bids[0], dict) else None
+    ask = asks[0].get("price") if asks and isinstance(asks[0], dict) else None
+    return (
+        float(bid) if bid is not None else None,
+        float(ask) if ask is not None else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Freeze state management
+# ---------------------------------------------------------------------------
+
+_shutdown_state = {"frozen": False, "frozen_at": None, "frozen_by": None}
+
+
+def is_frozen() -> bool:
+    return _shutdown_state["frozen"]
+
+
+def set_frozen(frozen: bool, by: str | None = None):
+    _shutdown_state["frozen"] = frozen
+    _shutdown_state["frozen_at"] = (
+        datetime.now(timezone.utc).isoformat() if frozen else None
+    )
+    _shutdown_state["frozen_by"] = by
+
+
+def thaw():
+    set_frozen(False)
+
+
+def _check_frozen_response() -> dict | None:
+    if is_frozen():
+        return {
+            "error": "Trading is frozen",
+            "frozen_at": _shutdown_state["frozen_at"],
+            "frozen_by": _shutdown_state["frozen_by"],
+        }
+    return None
