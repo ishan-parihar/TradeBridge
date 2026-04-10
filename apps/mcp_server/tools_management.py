@@ -102,9 +102,9 @@ def mt5_tool_status() -> dict:
         # Writes check
         failing_writes: list[str] = []
         try:
-            result = _tcp_send_and_await("get_account_summary", {}, timeout_s=5.0)
+            result = _tcp_send_and_await("get_account", {}, timeout_s=5.0)
             if not result or result.get("status") != "completed":
-                failing_writes.append("get_account_summary")
+                failing_writes.append("get_account")
             writes_ok = len(failing_writes) == 0
         except Exception:
             writes_ok = False

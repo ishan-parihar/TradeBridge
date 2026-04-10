@@ -61,7 +61,7 @@ def mt5_account_summary() -> dict:
 
     # Path 2: TCP bridge
     try:
-        result = _tcp_send_and_await("get_account_summary", {}, timeout_s=10.0)
+        result = _tcp_send_and_await("get_account", {}, timeout_s=10.0)
         data = _parse_payload_dict(result)
         if data:
             return {
