@@ -30,7 +30,7 @@ class PendingCommand:
         self.type = type
         self.payload = payload
         self.future: asyncio.Future[dict[str, Any]] = (
-            asyncio.get_event_loop().create_future()
+            asyncio.get_running_loop().create_future()
         )
         self.enqueued_at = time.monotonic()
 
