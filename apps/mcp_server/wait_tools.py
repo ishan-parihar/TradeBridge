@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP Wait Tools for MT5-MCP.
+"""MCP Wait Tools for TradeBridge.
 
 Implements the waiting/timer tools using the official MCP Python SDK (FastMCP):
 - mt5_wait_delay: Non-blocking delay with optional market state capture
@@ -22,23 +22,16 @@ Bug fixes applied (see BUG_REPORT_WAIT_TOOLS.md):
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import logging
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-
-_project_root = Path(__file__).parent.parent.parent
-_src_path = str(_project_root / "src")
-if _src_path not in sys.path:
-    sys.path.insert(0, _src_path)
 
 from mt5_mcp.schemas.tools import (
     IndicatorRequest,
@@ -56,35 +49,40 @@ from mt5_mcp.services.trade_monitor import (
 
 logger = logging.getLogger("mt5_mcp.wait_tools")
 
-# Lazy-loaded helpers from main.py (avoids circular imports)
+# Lazy-loaded helpers from modular tool files (avoids circular imports)
 _first_bid_ask: Any = None
 tool_get_order_book: Any = None
 tool_get_indicator: Any = None
 tool_get_symbol_info: Any = None
+tool_get_bars: Any = None
 _normalize_symbol: Any = None
 _detect_regime: Any = None
 
 
 def _init_helpers() -> None:
-    """Lazily import helpers from main.py to avoid circular imports."""
+    """Lazily import helpers from modular tool files to avoid circular imports."""
     global _first_bid_ask, tool_get_order_book, tool_get_indicator
-    global tool_get_symbol_info, _normalize_symbol, _detect_regime
+    global tool_get_symbol_info, tool_get_bars, _normalize_symbol, _detect_regime
     if _first_bid_ask is not None:
         return
 
-    main_path = Path(__file__).parent / "main.py"
-    spec = importlib.util.spec_from_file_location("mcp_main", str(main_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load main.py from {main_path}")
-    main_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(main_module)
+    from .shared import _first_bid_ask as _fba
+    from .tools_market_data import (
+        mt5_get_order_book,
+        mt5_get_indicator,
+        mt5_get_symbol_info,
+        mt5_get_bars,
+    )
+    from mt5_mcp.adapters.common.symbol_utils import normalize_symbol
+    from mt5_mcp.services.market_regime import detect_regime
 
-    _first_bid_ask = main_module._first_bid_ask
-    tool_get_order_book = main_module.tool_get_order_book
-    tool_get_indicator = main_module.tool_get_indicator
-    tool_get_symbol_info = main_module.tool_get_symbol_info
-    _normalize_symbol = main_module.normalize_symbol
-    _detect_regime = main_module.detect_regime
+    _first_bid_ask = _fba
+    tool_get_order_book = mt5_get_order_book
+    tool_get_indicator = mt5_get_indicator
+    tool_get_symbol_info = mt5_get_symbol_info
+    tool_get_bars = mt5_get_bars
+    _normalize_symbol = normalize_symbol
+    _detect_regime = detect_regime
 
 
 # Pydantic input models
@@ -218,13 +216,16 @@ _WAIT_ANNOTATIONS = ToolAnnotations(
 
 
 def create_wait_mcp_server() -> FastMCP:
-    """Create an MCP server with all 4 wait tools registered."""
     mcp = FastMCP("mt5-wait-tools")
+    register_tools(mcp)
+    return mcp
+
+
+def register_tools(mcp: FastMCP) -> None:
     _register_wait_delay(mcp)
     _register_wait_indicator(mcp)
     _register_wait_trade_monitor(mcp)
     _register_wait_for_price(mcp)
-    return mcp
 
 
 # Tool 1: mt5_wait_delay
@@ -239,41 +240,17 @@ def _register_wait_delay(mcp: FastMCP) -> None:
         duration_seconds: int = 60,
         symbol: Optional[str] = None,
     ) -> dict:
-        """Wait for a specified duration, optionally capturing market state.
-
-        Waits asynchronously without blocking the event loop. When a symbol is
-        provided, captures market conditions (bid/ask, RSI, market regime) before
-        and after the wait, returning a summary of changes.
+        """Wait for specified duration, optionally capturing market state.
 
         Args:
             duration_seconds: Seconds to wait. Range: 1-3600 (1 hour max). Default: 60.
             symbol: Optional MT5 symbol for market state capture (e.g., 'XAUUSDm').
-                    When provided, captures bid/ask, RSI(14), and regime before
-                    and after the wait.
 
         Returns:
-            Dictionary with keys:
-                - waited_seconds: Actual seconds waited (int)
-                - resumed_at: ISO 8601 timestamp when wait ended (UTC)
-                - market_summary: Dict with before/after market data, or None.
-                  Keys: symbol, price_before, price_after, price_change_pips,
-                  regime_before, regime_after, rsi_before, rsi_after.
-                - capture_error: Error message if state capture failed (optional).
-
-        Error Handling:
-            - duration_seconds < 1 or > 3600: ValueError raised
-            - Market state capture failure: Logged as warning, returns None summary
-
-        Examples:
-            # Simple 5-minute wait
-            mt5_wait_delay(duration_seconds=300)
-
-            # Wait with market state capture
-            mt5_wait_delay(duration_seconds=60, symbol="XAUUSDm")
+            Dict with waited_seconds, resumed_at, market_summary (if symbol provided).
         """
         _init_helpers()
 
-        # Enforce bounds (Pydantic should catch these, but defense-in-depth)
         if duration_seconds < 1:
             raise ValueError("duration_seconds must be at least 1")
         if duration_seconds > 3600:
@@ -300,7 +277,10 @@ def _register_wait_delay(mcp: FastMCP) -> None:
                 )
                 rsi_before = rsi_before_resp.get("value")
 
-                regime_before = _detect_regime(bars=[], atr_value=None)
+                bars_before = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
+                regime_before = _detect_regime(
+                    bars=bars_before.get("bars", []), atr_value=None
+                )
                 regime_before_label = regime_before.get("regime", "unknown")
 
                 sym_info = tool_get_symbol_info(symbol)
@@ -308,7 +288,12 @@ def _register_wait_delay(mcp: FastMCP) -> None:
                 digits = int(sym_info.get("digits", 5))
                 pip_size = point * 10 if digits in (3, 5) else point
 
-                await asyncio.sleep(duration_seconds)
+                elapsed = 0
+                while elapsed < duration_seconds:
+                    remaining = duration_seconds - elapsed
+                    sleep_time = min(30, remaining)
+                    await asyncio.sleep(sleep_time)
+                    elapsed += sleep_time
 
                 book_after = tool_get_order_book(OrderBookRequest(symbol=symbol))
                 bid_after = float(book_after.get("bid", 0))
@@ -324,7 +309,10 @@ def _register_wait_delay(mcp: FastMCP) -> None:
                 )
                 rsi_after = rsi_after_resp.get("value")
 
-                regime_after = _detect_regime(bars=[], atr_value=None)
+                bars_after = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
+                regime_after = _detect_regime(
+                    bars=bars_after.get("bars", []), atr_value=None
+                )
                 regime_after_label = regime_after.get("regime", "unknown")
 
                 if mid_before > 0 and mid_after > 0 and pip_size > 0:
@@ -349,7 +337,12 @@ def _register_wait_delay(mcp: FastMCP) -> None:
                 capture_error = str(e)
                 market_summary = None
         else:
-            await asyncio.sleep(duration_seconds)
+            elapsed = 0
+            while elapsed < duration_seconds:
+                remaining = duration_seconds - elapsed
+                sleep_time = min(30, remaining)
+                await asyncio.sleep(sleep_time)
+                elapsed += sleep_time
 
         result: dict[str, Any] = {
             "waited_seconds": duration_seconds,
@@ -978,11 +971,6 @@ def _get_market_context(
     ask: float | None,
     point: float,
 ) -> dict:
-    """Fetch market context: regime, ATR, RSI, spread.
-
-    Regime detection requires historical bars. When called without bars
-    (as here), it returns 'unknown' — this is expected behavior, not an error.
-    """
     ctx: dict[str, Any] = {
         "regime": "unknown",
         "atr": atr_value,
@@ -990,8 +978,9 @@ def _get_market_context(
         "spread_points": None,
     }
     try:
+        bars = tool_get_bars(symbol=symbol, timeframe="H1", count=20)
         regime_result = _detect_regime(
-            bars=[], atr_value=atr_value if atr_value > 0 else None
+            bars=bars.get("bars", []), atr_value=atr_value if atr_value > 0 else None
         )
         ctx["regime"] = regime_result.get("regime", "unknown")
     except Exception as e:
