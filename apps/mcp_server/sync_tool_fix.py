@@ -32,12 +32,9 @@ async def _patched_call_fn_with_arg_validation(
             self, fn, fn_is_async, arguments_to_validate, arguments_to_pass_directly
         )
 
-    @wraps(fn)
-    async def async_wrapper(**kwargs):
-        return fn(**kwargs)
-
-    return await _original_call(
-        self, async_wrapper, True, arguments_to_validate, arguments_to_pass_directly
+    # Run sync function in thread pool to avoid blocking the event loop
+    return await asyncio.to_thread(
+        fn, **arguments_to_validate, **(arguments_to_pass_directly or {})
     )
 
 
