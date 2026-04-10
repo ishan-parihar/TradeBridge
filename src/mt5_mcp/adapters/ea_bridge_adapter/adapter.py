@@ -83,13 +83,18 @@ class EABridgeAdapter(ExecutionPort):
             return getattr(self._client, method)(url, **kwargs)
 
     def _check_ea_connected(self) -> bool:
-        """Check if EA is connected by checking bridge terminal status."""
+        """Check if EA is connected by checking bridge terminal status.
+
+        Considers EA connected if we have ANY heartbeat data (login/server present),
+        not just if heartbeat is fresh. A stale heartbeat means EA is slow, not gone.
+        """
         try:
             r = self._request("get", "/bridge/terminal/status")
             if r.status_code == 200:
                 data = r.json()
-                connected = data.get("connected", False)
-                return bool(connected)
+                if data.get("login") or data.get("server"):
+                    return True
+                return bool(data.get("connected", False))
         except Exception as e:
             logger.warning(f"EA connection check failed: {e}")
         return False

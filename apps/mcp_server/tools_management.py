@@ -50,7 +50,7 @@ def mt5_health() -> dict:
 
         # HTTP bridge health check
         try:
-            resp = get_http_client().get(
+            resp = get_http_client().post(
                 f"{get_settings_cached().gateway_url}/bridge/health"
             )
             subsystems["bridge"] = {
