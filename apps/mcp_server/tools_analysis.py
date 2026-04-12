@@ -12,6 +12,7 @@ from .shared import (
     get_http_client,
     get_settings_cached,
     _tcp_send_and_await,
+    _await_result,
     _batch_enqueue_and_await,
     _parse_payload,
     _parse_payload_dict,
@@ -23,6 +24,32 @@ from mt5_mcp.adapters.common.symbol_utils import normalize_symbol, denormalize_s
 _ANALYSIS_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
 )
+
+
+def _get_indicator_with_fallback(
+    symbol: str, timeframe: str, indicator: str, params: dict, timeout_s: float = 15.0
+) -> dict | None:
+    """Try TCP first, fall back to HTTP gateway enqueue + poll."""
+    result = _tcp_send_and_await("get_indicator", params, timeout_s=timeout_s)
+    if result and result.get("status") == "completed":
+        return result
+    # TCP failed - try HTTP gateway
+    try:
+        settings = get_settings_cached()
+        client = get_http_client()
+        cmd_params = {"type": "get_indicator", **params}
+        req = client.post(
+            f"{settings.gateway_url}/bridge/commands/enqueue",
+            params=cmd_params,
+            timeout=5.0,
+        )
+        req.raise_for_status()
+        req_id = req.json().get("id") or req.json().get("request_id")
+        if req_id:
+            return _await_result(req_id, timeout_s=10.0)
+    except Exception:
+        pass
+    return None
 
 
 def _get_bars_data(symbol_norm: str, timeframe: str, count: int) -> list[dict]:
@@ -201,6 +228,52 @@ def mt5_momentum_check(
         return {"error": str(e), "symbol": symbol}
 
 
+def _extract_mtf_indicator_value(result: dict | None) -> Any:
+    """Extract indicator value from gateway result, handling multiple payload formats."""
+    if not result or result.get("status") != "completed":
+        return None
+    payload = result.get("result", {}).get("payload", {})
+    if isinstance(payload, str):
+        try:
+            d = json.loads(payload)
+            v = d.get("value")
+            if v is not None:
+                return v
+            data_list = d.get("data")
+            if data_list and isinstance(data_list, list):
+                return data_list[-1] if data_list else None
+        except Exception:
+            return None
+    elif isinstance(payload, dict):
+        v = payload.get("value")
+        if v is not None:
+            return v
+        data_list = payload.get("data")
+        if data_list and isinstance(data_list, list):
+            return data_list[-1] if data_list else None
+        # For MACD and similar multi-value indicators, return the whole dict
+        if payload:
+            return payload
+    return None
+
+
+# Sensible defaults per indicator type so MT5 doesn't reject calls with missing params.
+_INDICATOR_DEFAULTS: dict[str, dict[str, int]] = {
+    "rsi": {"period": 14},
+    "ema": {"period": 20},
+    "sma": {"period": 20},
+    "wma": {"period": 20},
+    "atr": {"period": 14},
+    "macd": {"fast": 12, "slow": 26, "signal": 9},
+    "bbands": {"period": 20},
+    "stoch": {"k_period": 14, "d_period": 3, "slowing": 3},
+    "cci": {"period": 14},
+    "adx": {"period": 14},
+    "momentum": {"period": 14},
+    "williams": {"period": 14},
+}
+
+
 @mcp.tool(name="mt5_multi_timeframe_indicators", annotations=_ANALYSIS_ANNOTATIONS)
 def mt5_multi_timeframe_indicators(
     symbol: str,
@@ -216,29 +289,30 @@ def mt5_multi_timeframe_indicators(
         timeframes = timeframes or ["M5", "M15", "H1", "H4", "D1"]
         readings: dict[str, Any] = {}
 
+        # Merge user overrides with indicator-specific defaults
+        defaults = dict(_INDICATOR_DEFAULTS.get(indicator.lower(), {}))
+        if period is not None:
+            defaults["period"] = period
+        if fast is not None:
+            defaults["fast"] = fast
+        if slow is not None:
+            defaults["slow"] = slow
+        if signal is not None:
+            defaults["signal"] = signal
+
         for tf in timeframes:
             params: dict[str, Any] = {
                 "symbol": symbol_norm,
                 "timeframe": tf,
                 "indicator": indicator,
+                **defaults,
             }
-            if period is not None:
-                params["period"] = period
-            if fast is not None:
-                params["fast"] = fast
-            if slow is not None:
-                params["slow"] = slow
-            if signal is not None:
-                params["signal"] = signal
 
-            result = _tcp_send_and_await("get_indicator", params)
-            payload = _parse_payload_dict(result) if result else {}
-            value = payload.get("value")
-            if value is None and "data" in payload:
-                value = payload["data"]
+            result = _get_indicator_with_fallback(symbol_norm, tf, indicator, params)
+            value = _extract_mtf_indicator_value(result)
             readings[tf] = {
                 "value": value,
-                "status": result.get("status", "unknown") if result else "unknown",
+                "status": result.get("status", "unknown") if result else "unavailable",
             }
 
         return {"symbol": symbol, "indicator": indicator, "readings": readings}

@@ -592,6 +592,7 @@ class TradeDecisionLogRequest(BaseModel):
     quality_rating: int | None = None  # 1-5
 
     decision_id: str | None = None  # For updating existing decisions
+    note: str | None = None
 
 
 class TradeJournalReflectionRequest(BaseModel):
@@ -879,3 +880,81 @@ class DataStatsRequest(BaseModel):
     """Get stats about cached data."""
 
     pass
+
+
+# --- Inline models extracted from apps/mcp_server/main.py for MCP migration ---
+
+
+class MarketStructureRequest(BaseModel):
+    """Request for market structure detection (BOS, CHoCH, trend health)."""
+
+    symbol: str
+    timeframe: str = "H1"
+    swing_lookback: int = 5
+    confirm_bos_pips: float = 0.0
+
+
+class StrategySelectorRequest(BaseModel):
+    """Request for strategy selection by market regime."""
+
+    regime: str | None = None
+
+
+class VWAPRequest(BaseModel):
+    """Request for VWAP calculation with standard deviation bands."""
+
+    symbol: str
+    timeframe: str = "H1"
+    bar_count: int = 100
+    std_dev_multiplier: float = 2.0
+
+
+class VolumeAtPriceRequest(BaseModel):
+    """Request for volume-at-price distribution analysis."""
+
+    symbol: str
+    timeframe: str = "H1"
+    bar_count: int = 100
+    num_bins: int = 20
+
+
+class SetupProbabilityRequest(BaseModel):
+    """Request for historical setup win-rate estimation."""
+
+    symbol: str | None = None
+    regime: str | None = None
+    session: str | None = None
+    min_samples: int = 5
+
+
+class SupportResistanceRequest(BaseModel):
+    """Request for support/resistance level detection."""
+
+    symbol: str
+    timeframe: str = "H1"
+    lookback: int = 100
+
+
+class TradeMonitorRequest(BaseModel):
+    """Request for long-polling trade setup monitoring."""
+
+    symbol: str
+    side: Literal["buy", "sell"]
+    duration: str
+    expected: dict
+    invalidation: dict
+    check_interval_seconds: int = 5
+
+
+class ReconcileRequest(BaseModel):
+    """Request for position-to-journal reconciliation."""
+
+    intent_ids: list[str] = []
+
+
+class PortfolioRiskRequest(BaseModel):
+    """Request for portfolio risk metrics."""
+
+    symbol: str | None = None
+    days: int | None = None
+    limit: int | None = None

@@ -1,0 +1,13 @@
+○ mt5-mcp-server.service - TradeBridge MCP Server
+     Loaded: loaded (]8;;file://cachyos-x8664/etc/systemd/system/mt5-mcp-server.service\/etc/systemd/system/mt5-mcp-server.service]8;;\; [0;1;32menabled[0m; preset: [0;1;38:5:185mdisabled[0m)
+     Active: inactive (dead) since Fri 2026-04-10 12:06:03 IST; 1s ago
+   Duration: 621ms
+ Invocation: fcc55889d066495899db74e61a5c31c5
+       Docs: ]8;;file:///home/ishanp/Documents/GitHub/TradeBridge/deploy/README.md\file:///home/ishanp/Documents/GitHub/TradeBridge/deploy/README.md]8;;\
+    Process: 901671 ExecStart=/home/ishanp/Documents/GitHub/TradeBridge/.venv/bin/python /home/ishanp/Documents/GitHub/TradeBridge/tools/mcp_mt5_wrapper.py (code=exited, status=0/SUCCESS)
+   Main PID: 901671 (code=exited, status=0/SUCCESS)
+   Mem peak: 58.5M
+        CPU: 602ms
+
+Apr 10 12:06:02 cachyos-x8664 systemd[1]: Started TradeBridge MCP Server.
+Apr 10 12:06:03 cachyos-x8664 systemd[1]: mt5-mcp-server.service: Deactivated successfully.

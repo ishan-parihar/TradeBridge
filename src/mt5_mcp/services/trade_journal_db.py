@@ -79,7 +79,8 @@ class TradeJournalDB:
         lesson_learned TEXT,
         would_do_differently TEXT,
         mistake_category TEXT,
-        quality_rating INTEGER
+        quality_rating INTEGER,
+        note TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_symbol ON trade_decisions(symbol);
@@ -93,7 +94,7 @@ class TradeJournalDB:
 
     def __init__(self, db_path: Optional[str] = None) -> None:
         if db_path is None:
-            db_path = str(Path.home() / ".mt5-mcp" / "trading_journal.db")
+            db_path = str(Path.home() / ".TradeBridge" / "trading_journal.db")
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
@@ -109,6 +110,13 @@ class TradeJournalDB:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_intent_id ON trade_decisions(intent_id)"
             )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Idempotent migration: add note column if it doesn't exist
+        try:
+            self._conn.execute("ALTER TABLE trade_decisions ADD COLUMN note TEXT")
             self._conn.commit()
         except sqlite3.OperationalError:
             pass  # Column already exists
@@ -154,6 +162,7 @@ class TradeJournalDB:
         mistake_category: _MistakeCategoryInput = None,
         quality_rating: Optional[int] = None,
         decision_id: Optional[str] = None,
+        note: Optional[str] = None,
     ) -> str:
         """Log a trading decision with full reasoning context.
 
@@ -175,12 +184,12 @@ class TradeJournalDB:
                 model_justification, indicators_considered, confidence_level,
                 risk_assessment, emotional_self_report, alternatives_considered,
                 expected_duration, expected_move_points,
-                outcome, lesson_learned, would_do_differently, mistake_category, quality_rating
+                outcome, lesson_learned, would_do_differently, mistake_category, quality_rating, note
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -224,6 +233,7 @@ class TradeJournalDB:
                 would_do_differently,
                 _normalize_mistake_category(mistake_category),
                 quality_rating,
+                note,
             ),
         )
         self._conn.commit()
@@ -249,6 +259,7 @@ class TradeJournalDB:
             "intent_id",
             "session_id",
             "strategy_id",
+            "note",
         }
         filtered = {k: v for k, v in kwargs.items() if k in allowed_fields}
         if not filtered:

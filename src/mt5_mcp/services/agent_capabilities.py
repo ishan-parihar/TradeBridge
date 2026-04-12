@@ -55,6 +55,17 @@ def calculate_position_size(
     volume_max: float,
     volume_step: float,
 ) -> dict[str, float | bool]:
+    # Defensive type coercion — MCP clients and REST callers may send numeric strings
+    equity = float(equity)
+    risk_percent = float(risk_percent)
+    entry_price = float(entry_price)
+    stop_loss_price = float(stop_loss_price)
+    tick_size = float(tick_size)
+    tick_value = float(tick_value)
+    volume_min = float(volume_min)
+    volume_max = float(volume_max)
+    volume_step = float(volume_step)
+
     risk_amount = max(equity, 0.0) * max(risk_percent, 0.0) / 100.0
     stop_distance_ticks = (
         abs(entry_price - stop_loss_price) / tick_size if tick_size else 0.0
@@ -105,6 +116,15 @@ def validate_trade_setup(
 ) -> dict[str, object]:
     errors: list[str] = []
     warnings: list[str] = []
+
+    # Defensive type coercion — MCP clients may send numeric strings
+    volume_lots = float(volume_lots) if volume_lots is not None else 0.0
+    current_bid = float(current_bid) if current_bid is not None else 0.0
+    current_ask = float(current_ask) if current_ask is not None else 0.0
+    entry_price = float(entry_price) if entry_price is not None else None
+    sl = float(sl) if sl is not None else None
+    tp = float(tp) if tp is not None else None
+    required_margin = float(required_margin) if required_margin is not None else None
 
     volume_min = float(symbol_info.get("volume_min", 0.0) or 0.0)
     volume_max = float(symbol_info.get("volume_max", 0.0) or 0.0)

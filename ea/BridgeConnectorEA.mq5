@@ -2,7 +2,7 @@
 //|                                                BridgeConnectorEA |
 //|                             MT5 ↔ MCP EA bridge (heartbeat)       |
 //+------------------------------------------------------------------+
-#property copyright "MT5-mcp"
+#property copyright "TradeBridge"
 #property version   "2.51"
 
 // Trading includes

@@ -1,6 +1,6 @@
-# MT5-MCP Deployment Guide
+# TradeBridge Deployment Guide
 
-Production deployment files for the 3-process MT5-MCP architecture.
+Production deployment files for the 3-process TradeBridge architecture.
 
 ## Architecture
 
@@ -65,14 +65,14 @@ docker compose up -d --force-recreate http-gateway
 
 - Linux system with systemd (Ubuntu 22.04+, Debian 12+, RHEL 9+)
 - Python 3.11+
-- Project cloned to `/opt/mt5-mcp`
+- Project cloned to `/opt/TradeBridge`
 
 ### Install
 
 ```bash
 # Clone to target directory
-sudo git clone <repo-url> /opt/mt5-mcp
-cd /opt/mt5-mcp
+sudo git clone <repo-url> /opt/TradeBridge
+cd /opt/TradeBridge
 
 # Install dependencies
 python3 -m venv .venv
@@ -89,7 +89,7 @@ sudo deploy/systemd/install.sh
 # Check status
 systemctl status mt5-tcp-bridge
 systemctl status mt5-http-gateway
-systemctl status mt5-mcp-server
+systemctl status TradeBridge-server
 
 # Restart
 sudo systemctl restart mt5-tcp-bridge
@@ -97,17 +97,17 @@ sudo systemctl restart mt5-tcp-bridge
 # View logs
 journalctl -u mt5-tcp-bridge -f
 journalctl -u mt5-http-gateway -f
-journalctl -u mt5-mcp-server -f
+journalctl -u TradeBridge-server -f
 ```
 
 ### Upgrade
 
 ```bash
-cd /opt/mt5-mcp
+cd /opt/TradeBridge
 sudo git pull
 .venv/bin/poetry install --no-interaction --without dev
 
-sudo systemctl restart mt5-tcp-bridge mt5-http-gateway mt5-mcp-server
+sudo systemctl restart mt5-tcp-bridge mt5-http-gateway TradeBridge-server
 ```
 
 ## Environment Variables
@@ -184,7 +184,7 @@ Logs go to journald, accessible via:
 ```bash
 journalctl -u mt5-tcp-bridge --since "1 hour ago"
 journalctl -u mt5-http-gateway -e --no-pager
-journalctl -u mt5-mcp-server -f
+journalctl -u TradeBridge-server -f
 ```
 
 ### Application Log Files
@@ -222,7 +222,7 @@ curl -s http://127.0.0.1:8020/bridge/terminal/status
 
 ```bash
 # From MCP server container (Docker)
-docker exec mt5-mcp-server curl -s http://http-gateway:8020/bridge/health
+docker exec TradeBridge-server curl -s http://http-gateway:8020/bridge/health
 
 # On bare metal
 curl -s http://127.0.0.1:8020/bridge/health
@@ -232,18 +232,18 @@ curl -s http://127.0.0.1:8020/bridge/health
 
 ```bash
 # Reinstall dependencies
-cd /opt/mt5-mcp
+cd /opt/TradeBridge
 .venv/bin/poetry install --no-interaction --without dev
 
 # Restart
-sudo systemctl restart mt5-tcp-bridge mt5-http-gateway mt5-mcp-server
+sudo systemctl restart mt5-tcp-bridge mt5-http-gateway TradeBridge-server
 ```
 
 ### Permission Denied Errors
 
 ```bash
 # Fix ownership
-sudo chown -R mt5-bridge:mt5-bridge /opt/mt5-mcp
+sudo chown -R mt5-bridge:mt5-bridge /opt/TradeBridge
 ```
 
 ## Resource Usage

@@ -16,7 +16,7 @@ This gives the agent composure through DATA, not platitudes.
 CRITICAL: Unit normalization.
 - MT5 returns all indicator values (ATR, etc.) in PRICE units.
 - Baseline typical_atr_h1 is in PIPS.
-- "Points" in the MT5-MCP system = smallest price increment (5th decimal for forex).
+- "Points" in the TradeBridge system = smallest price increment (5th decimal for forex).
 - 1 pip = 10 points (for 5-digit forex).
 - All calculations normalize to PIPS for comparison, then convert back to points for display.
 """
@@ -157,10 +157,17 @@ SYMBOL_BASELINE: dict[str, dict] = {
 }
 
 
+def _normalize_symbol_for_spec(symbol: str) -> str:
+    """Strip broker suffixes (m, M, micro, etc.) to match base symbol specs."""
+    upper = symbol.upper().rstrip("M")
+    return upper
+
+
 def _get_symbol_spec(symbol: str) -> dict:
     """Get symbol specs (pip_size, point_size). Falls back to 5-digit forex defaults."""
+    base = _normalize_symbol_for_spec(symbol)
     return SYMBOL_SPECS.get(
-        symbol.upper(), {"pip_size": 0.0001, "point_size": 0.00001, "digits": 5}
+        base, {"pip_size": 0.0001, "point_size": 0.00001, "digits": 5}
     )
 
 

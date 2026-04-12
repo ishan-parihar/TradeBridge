@@ -86,7 +86,10 @@ def mt5_account_summary() -> dict:
 @mcp.tool(name="mt5_symbol_info", annotations=_READ_ANNOTATIONS)
 def mt5_symbol_info(symbol: str) -> dict:
     try:
-        from mt5_mcp.adapters.common.symbol_utils import denormalize_symbol
+        from mt5_mcp.adapters.common.symbol_utils import (
+            denormalize_symbol,
+            normalize_symbol,
+        )
 
         result = get_gateway().adapter.get_symbol_info(symbol)
         if result is not None and getattr(result, "symbol", None):
@@ -99,7 +102,7 @@ def mt5_symbol_info(symbol: str) -> dict:
 
     try:
         tcp_result = _tcp_send_and_await(
-            "get_symbol_info", {"symbol": symbol}, timeout_s=10.0
+            "get_symbol_info", {"symbol": normalize_symbol(symbol)}, timeout_s=10.0
         )
         data = _parse_payload_dict(tcp_result)
         if data:

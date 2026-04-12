@@ -2579,6 +2579,20 @@ def tool_volume_profile(req: VolumeProfileRequest) -> dict:
         bars = tool_get_bars(
             BarsRequest(symbol=req.symbol, timeframe=req.timeframe, count=req.lookback)
         )
+        has_volume = any(getattr(b, "tick_volume", 0) > 0 for b in bars.data)
+        if not has_volume and bars.data:
+            return {
+                "symbol": req.symbol,
+                "timeframe": req.timeframe,
+                "status": "unavailable",
+                "hint": (
+                    f"Tick volume is unavailable for {req.symbol} on this broker/demo account. "
+                    f"Volume analysis requires live market data. "
+                    f"Support/resistance and price action analysis remain available via other tools."
+                ),
+                "bars_count": len(bars.data),
+                "volume_points": 0,
+            }
         from mt5_mcp.services.volume_analysis import detect_volume_anomalies
 
         result = detect_volume_anomalies(
@@ -4272,13 +4286,15 @@ def tool_ea_bracket_tick() -> dict:
 
 @app.post("/resources/market/wait_for_price", response_model=PriceAlertResult)
 async def tool_wait_for_price(req: PriceAlertRequest) -> PriceAlertResult:
-    """Long-polling price alert. Holds connection until price condition is met.
-
-    Eliminates manual polling — the server checks and returns when triggered.
-    """
     import asyncio
+    import logging
 
-    end_time = asyncio.get_event_loop().time() + req.timeout_seconds
+    logger = logging.getLogger("mt5_mcp.wait_for_price")
+
+    timeout = max(5, min(3600, req.timeout_seconds))
+    end_time = asyncio.get_event_loop().time() + timeout
+
+    previous_price: float | None = None
 
     while asyncio.get_event_loop().time() < end_time:
         try:
@@ -4289,17 +4305,22 @@ async def tool_wait_for_price(req: PriceAlertRequest) -> PriceAlertResult:
                 await asyncio.sleep(1)
                 continue
 
-            # Use mid price for crosses, ask for above, bid for below
             if req.condition == "above":
                 current = ask
                 triggered = current >= req.price
             elif req.condition == "below":
                 current = bid
                 triggered = current <= req.price
-            else:  # crosses
+            else:
                 mid = (bid + ask) / 2
                 current = mid
-                triggered = True  # Any update is a "cross" in this mode
+                if previous_price is not None:
+                    triggered = (
+                        previous_price < req.price and current >= req.price
+                    ) or (previous_price >= req.price and current < req.price)
+                else:
+                    previous_price = current
+                    triggered = False
 
             if triggered:
                 return PriceAlertResult(
@@ -4309,12 +4330,15 @@ async def tool_wait_for_price(req: PriceAlertRequest) -> PriceAlertResult:
                     actual_price=current,
                     triggered=True,
                 )
-        except Exception:
-            pass
 
-        await asyncio.sleep(1)  # Check every second
+            if req.condition == "crosses":
+                previous_price = current
 
-    # Timeout
+        except Exception as e:
+            logger.warning("wait/price: error polling price for %s: %s", req.symbol, e)
+
+        await asyncio.sleep(1)
+
     try:
         book = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
         bid, ask = _first_bid_ask(book)
@@ -4398,6 +4422,7 @@ def tool_log_trade_decision(req: TradeDecisionLogRequest) -> dict:
                 would_do_differently=req.would_do_differently,
                 mistake_category=req.mistake_category,
                 quality_rating=req.quality_rating,
+                note=req.note,
             )
 
             return {
@@ -5342,83 +5367,148 @@ async def tool_monitor_position(req: PositionMonitorRequest) -> PositionMonitorR
 @app.post("/tools/wait/delay", response_model=WaitDelayResult)
 async def tool_wait_delay(req: WaitDelayRequest) -> WaitDelayResult:
     import asyncio
+    import logging
     from datetime import datetime, timezone
 
+    logger = logging.getLogger("mt5_mcp.wait_delay")
+
+    # Validate duration (BUG-001/BUG-007 fix)
+    if req.duration_seconds < 1:
+        raise ValueError("duration_seconds must be at least 1")
+    if req.duration_seconds > 3600:
+        raise ValueError("duration_seconds must not exceed 3600 (1 hour)")
+
     market_summary = None
+    capture_error: str | None = None
 
     if req.symbol:
         try:
             sym = normalize_symbol(req.symbol)
+        except Exception as e:
+            capture_error = str(e)
+            req.symbol = None  # Disable market capture, just sleep
 
-            # Capture pre-sleep state
+    def _capture_before() -> dict | None:
+        """Capture pre-wait market state."""
+        if not req.symbol:
+            return None
+        try:
             book_before = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
             bid_before = float(book_before.get("bid", 0))
             ask_before = float(book_before.get("ask", 0))
-            mid_before = (
-                (bid_before + ask_before) / 2 if bid_before and ask_before else 0
-            )
+            if not bid_before or not ask_before:
+                return None
+            mid_before = (bid_before + ask_before) / 2
 
             rsi_before_req = IndicatorRequest(
                 symbol=req.symbol, timeframe="H1", indicator="rsi", period=14
             )
             rsi_before_resp = tool_get_indicator(rsi_before_req)
-            rsi_before = rsi_before_resp.get("value")
+            rsi_before = (
+                rsi_before_resp.get("value") if "error" not in rsi_before_resp else None
+            )
 
-            regime_before = detect_regime(bars=[], atr_value=None)
+            bars_before = tool_get_bars(
+                BarsRequest(symbol=req.symbol, timeframe="H1", count=20)
+            )
+            bars_data = (
+                bars_before.get("data", []) if "error" not in bars_before else []
+            )
+            regime_before = detect_regime(bars=bars_data, atr_value=0)
             regime_before_label = regime_before.get("regime", "unknown")
 
-            # Get symbol info for pip calculation
             sym_info = tool_get_symbol_info(req.symbol)
             point = float(sym_info.get("point", 0))
             digits = int(sym_info.get("digits", 5))
-            # Pip is typically 10 * point for most symbols, or point for JPY pairs
             pip_size = point * 10 if digits in (3, 5) else point
 
-            # Async sleep (non-blocking)
-            await asyncio.sleep(req.duration_seconds)
+            return {
+                "bid": bid_before,
+                "ask": ask_before,
+                "mid": mid_before,
+                "rsi": rsi_before,
+                "regime": regime_before_label,
+                "point": point,
+                "digits": digits,
+                "pip_size": pip_size,
+            }
+        except Exception as e:
+            logger.warning("wait/delay: pre-capture failed for %s: %s", req.symbol, e)
+            return None
 
-            # Capture post-sleep state
+    def _build_summary(before: dict) -> dict | None:
+        """Build market summary comparing before/after state."""
+        if not req.symbol:
+            return None
+        try:
             book_after = tool_get_order_book(OrderBookRequest(symbol=req.symbol))
             bid_after = float(book_after.get("bid", 0))
             ask_after = float(book_after.get("ask", 0))
-            mid_after = (bid_after + ask_after) / 2 if bid_after and ask_after else 0
+            if not bid_after or not ask_after:
+                return None
+            mid_after = (bid_after + ask_after) / 2
 
             rsi_after_req = IndicatorRequest(
                 symbol=req.symbol, timeframe="H1", indicator="rsi", period=14
             )
             rsi_after_resp = tool_get_indicator(rsi_after_req)
-            rsi_after = rsi_after_resp.get("value")
+            rsi_after = (
+                rsi_after_resp.get("value") if "error" not in rsi_after_resp else None
+            )
 
-            regime_after = detect_regime(bars=[], atr_value=None)
+            bars_after = tool_get_bars(
+                BarsRequest(symbol=req.symbol, timeframe="H1", count=20)
+            )
+            bars_data = bars_after.get("data", []) if "error" not in bars_after else []
+            regime_after = detect_regime(bars=bars_data, atr_value=0)
             regime_after_label = regime_after.get("regime", "unknown")
 
-            # Compute price change in pips
+            pip_size = before.get("pip_size", 0)
+            digits = before.get("digits", 5)
+            mid_before = before.get("mid", 0)
+
             if mid_before > 0 and mid_after > 0 and pip_size > 0:
                 price_change_pips = round((mid_after - mid_before) / pip_size, 1)
             else:
                 price_change_pips = None
 
-            market_summary = {
+            return {
                 "symbol": req.symbol,
                 "price_before": round(mid_before, digits) if mid_before else None,
                 "price_after": round(mid_after, digits) if mid_after else None,
                 "price_change_pips": price_change_pips,
-                "regime_before": regime_before_label,
+                "regime_before": before.get("regime", "unknown"),
                 "regime_after": regime_after_label,
-                "rsi_before": rsi_before,
+                "rsi_before": before.get("rsi"),
                 "rsi_after": rsi_after,
             }
-        except Exception:
-            market_summary = None
-    else:
-        # No symbol provided — just sleep
-        await asyncio.sleep(req.duration_seconds)
+        except Exception as e:
+            logger.warning("wait/delay: post-capture failed for %s: %s", req.symbol, e)
+            return None
 
-    return WaitDelayResult(
-        waited_seconds=req.duration_seconds,
-        resumed_at=datetime.now(timezone.utc).isoformat(),
-        market_summary=market_summary,
-    )
+    if req.symbol:
+        before_data = _capture_before()
+    else:
+        before_data = None
+
+    elapsed = 0
+    while elapsed < req.duration_seconds:
+        remaining = req.duration_seconds - elapsed
+        sleep_time = min(30, remaining)
+        await asyncio.sleep(sleep_time)
+        elapsed += sleep_time
+
+    if req.symbol and before_data:
+        market_summary = _build_summary(before_data)
+
+    result_data: dict = {
+        "waited_seconds": req.duration_seconds,
+        "resumed_at": datetime.now(timezone.utc).isoformat(),
+        "market_summary": market_summary,
+    }
+    if capture_error:
+        result_data["capture_error"] = capture_error
+    return WaitDelayResult(**result_data)
 
 
 @app.post("/tools/wait/indicator", response_model=WaitForIndicatorResult)
@@ -5426,10 +5516,18 @@ async def tool_wait_for_indicator(
     req: WaitForIndicatorRequest,
 ) -> WaitForIndicatorResult:
     import asyncio
+    import logging
 
-    end_time = asyncio.get_event_loop().time() + req.timeout_seconds
+    logger = logging.getLogger("mt5_mcp.wait_indicator")
+
+    check_interval = max(1, min(60, req.check_interval_seconds))
+    timeout = max(5, min(3600, req.timeout_seconds))
+
+    end_time = asyncio.get_event_loop().time() + timeout
 
     previous_value: float | None = None
+    last_valid_value: float | None = None
+    poll_count = 0
 
     while asyncio.get_event_loop().time() < end_time:
         try:
@@ -5443,7 +5541,21 @@ async def tool_wait_for_indicator(
                 signal=req.signal,
             )
             result = tool_get_indicator(indicator_req)
-            current_value = result.get("value", 0.0) or 0.0
+
+            if "error" in result or result.get("value") is None:
+                poll_count += 1
+                logger.warning(
+                    "wait/indicator: poll returned no value for %s %s: %s",
+                    req.indicator,
+                    req.symbol,
+                    result.get("error", "value is None"),
+                )
+                await asyncio.sleep(check_interval)
+                continue
+
+            current_value = float(result["value"])
+            poll_count += 1
+            last_valid_value = current_value
 
             if req.condition == "above" and current_value >= req.value:
                 return WaitForIndicatorResult(
@@ -5488,30 +5600,25 @@ async def tool_wait_for_indicator(
                             actual_value=current_value,
                             triggered=True,
                         )
-        except Exception:
-            pass
+                previous_value = current_value
 
-        previous_value = current_value
-        await asyncio.sleep(req.check_interval_seconds)
+        except Exception as e:
+            poll_count += 1
+            logger.warning(
+                "wait/indicator: error polling %s for %s: %s",
+                req.indicator,
+                req.symbol,
+                e,
+            )
 
-    try:
-        indicator_req = IndicatorRequest(
-            symbol=req.symbol,
-            timeframe=req.timeframe,
-            indicator=req.indicator,
-            period=req.period,
-        )
-        result = tool_get_indicator(indicator_req)
-        current_value = result.get("value", 0.0) or 0.0
-    except Exception:
-        current_value = None
+        await asyncio.sleep(check_interval)
 
     return WaitForIndicatorResult(
         symbol=req.symbol,
         indicator=req.indicator,
         condition=req.condition,
         target_value=req.value,
-        actual_value=current_value,
+        actual_value=last_valid_value,
         triggered=False,
         timed_out=True,
     )

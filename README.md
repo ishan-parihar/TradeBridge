@@ -1,4 +1,4 @@
-# MT5-MCP Bridge
+# TradeBridge
 
 A production-ready bridge between MetaTrader 5 and Model Context Protocol (MCP), enabling AI-driven trading analysis and execution on Linux systems.
 
@@ -36,8 +36,8 @@ The SKILL.md contains everything an AI trading agent needs:
 
 ```bash
 # Prerequisites: Python 3.11+, Poetry, MT5 under Wine/Bottles
-git clone https://github.com/ishanp321/MT5-mcp.git
-cd MT5-mcp
+git clone https://github.com/ishanp321/TradeBridge.git
+cd TradeBridge
 poetry install
 
 # Start services (3 terminals):
@@ -56,7 +56,7 @@ poetry run uvicorn apps.mcp_server.main:app --host 127.0.0.1 --port 8010      # 
 ## Project Structure
 
 ```
-MT5-mcp/
+TradeBridge/
 ├── apps/
 │   ├── mcp_server/main.py          # MCP server (port 8010) — ALL tool endpoints
 │   ├── bridge_gateway/main.py      # Bridge gateway (port 8020)
@@ -109,7 +109,7 @@ poetry run pytest
 
 ## Related Projects
 
-- **[Jesse](https://github.com/ishanp321/jesse)** — Autonomous AI Trading Agent (LangChain ReAct) consuming MT5-MCP as trading backend
+- **[Jesse](https://github.com/ishanp321/jesse)** — Autonomous AI Trading Agent (LangChain ReAct) consuming TradeBridge as trading backend
 
 ## License
 
