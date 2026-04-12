@@ -664,9 +664,9 @@ class ChartIntelligenceService:
         swing_high = None
         swing_low = None
 
-        if n >= 5:
+        if n >= 6:
             # Find most recent swing high
-            for i in range(n - 2, 2, -1):
+            for i in range(n - 3, 2, -1):
                 h = float(bars[i].get("high", 0))
                 if (
                     h > float(bars[i - 1].get("high", 0))
@@ -678,7 +678,7 @@ class ChartIntelligenceService:
                     break
 
             # Find most recent swing low
-            for i in range(n - 2, 2, -1):
+            for i in range(n - 3, 2, -1):
                 l = float(bars[i].get("low", 0))
                 if (
                     l < float(bars[i - 1].get("low", 0))

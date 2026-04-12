@@ -420,6 +420,10 @@ class PortfolioRiskService:
         """Compute risk score 0-100 based on exposure concentration and margin usage."""
         if equity <= 0:
             if total_exposure > 0:
+                if total_exposure < 1000:
+                    return 25
+                elif total_exposure < 5000:
+                    return 50
                 return 100
             return 0
 
@@ -514,6 +518,7 @@ class PortfolioRiskService:
                     break
         if current_price <= 0:
             current_price = 1.0  # fallback
+        proposed_price_valid = current_price > 1.0
 
         class _ProposedPosition:
             def __init__(self, sym: str, s: str, v: float, p: float):
@@ -523,9 +528,11 @@ class PortfolioRiskService:
                 self.mark_price = p
                 self.entry_price = p
 
-        all_positions = positions + [
-            _ProposedPosition(symbol.upper(), side, volume, current_price)
-        ]
+        all_positions = list(positions)
+        if proposed_price_valid:
+            all_positions.append(
+                _ProposedPosition(symbol.upper(), side, volume, current_price)
+            )
 
         # Also include pending orders as positions
         for order in orders:
@@ -566,4 +573,5 @@ class PortfolioRiskService:
             "current_exposure": current,
             "projected_exposure": projected_full,
             "risk_score": projected_full.get("risk_score", 0),
+            "pending_orders_included": len(orders),
         }

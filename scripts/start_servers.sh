@@ -1,5 +1,5 @@
 #!/bin/bash
-# MT5-MCP Server Startup Script
+# TradeBridge Server Startup Script
 # Starts Bridge Gateway (8020) and MCP Server (8010) in correct order
 
 set -e
@@ -63,7 +63,7 @@ kill_on_port() {
 
 # Main startup sequence
 main() {
-    log_info "Starting MT5-MCP servers..."
+    log_info "Starting TradeBridge servers..."
     
     # Kill any existing processes on our ports
     kill_on_port 8020

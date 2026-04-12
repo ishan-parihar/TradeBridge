@@ -1,4 +1,4 @@
-# MT5-MCP Trading Agent Infrastructure Audit
+# TradeBridge Trading Agent Infrastructure Audit
 
 **Date:** 2026-04-09
 **Trigger:** Trading agent stopped mid-cycle after hitting 404 errors on analysis endpoints. Expected: continuous polling until session end. Actual: asked user a question and stopped.

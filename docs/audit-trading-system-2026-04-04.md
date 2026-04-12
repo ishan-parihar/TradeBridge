@@ -1,8 +1,8 @@
-# MT5-MCP Trading System Audit Report
+# TradeBridge Trading System Audit Report
 
 **Date:** 2026-04-04
 **Auditor:** AI Trading Agent (Autonomous)
-**System:** MT5-MCP Bridge v2.30 + MCP Server (53 endpoints)
+**System:** TradeBridge Bridge v2.30 + MCP Server (53 endpoints)
 **Account:** Demo | Exness-MT5Trial17 | $202.77 | 2000:1 Leverage
 **Period Reviewed:** Last 7 days (19 closed trades)
 
@@ -10,7 +10,7 @@
 
 ## 1. Executive Summary
 
-The MT5-MCP infrastructure is **architecturally sound** — bridge connectivity, EA batch processing, MCP endpoints, and observability are all operational. However, the system is currently **losing money** (-69.33 net, 21% win rate) and lacks several critical capabilities I need as an AI agent to generate profits autonomously.
+The TradeBridge infrastructure is **architecturally sound** — bridge connectivity, EA batch processing, MCP endpoints, and observability are all operational. However, the system is currently **losing money** (-69.33 net, 21% win rate) and lacks several critical capabilities I need as an AI agent to generate profits autonomously.
 
 **The infrastructure is ready. The strategy layer is not.**
 

@@ -6,17 +6,6 @@ from mt5_mcp.settings.config import get_settings
 
 
 def normalize_symbol(symbol: str) -> str:
-    """
-    Normalize a symbol by adding the configured suffix if not already present.
-
-    This handles broker-specific symbol naming conventions (e.g., XAUUSD -> XAUUSDm).
-
-    Args:
-        symbol: The base symbol name (e.g., 'XAUUSD', 'EURUSD')
-
-    Returns:
-        The normalized symbol with suffix (e.g., 'XAUUSDm', 'EURUSDm')
-    """
     settings = get_settings()
     suffix = settings.symbol_suffix
 
@@ -30,17 +19,6 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def denormalize_symbol(symbol: str) -> str:
-    """
-    Remove the configured suffix from a symbol if present.
-
-    This is useful for displaying symbols to users without broker-specific suffixes.
-
-    Args:
-        symbol: The symbol name possibly containing a suffix (e.g., 'XAUUSDm')
-
-    Returns:
-        The base symbol without suffix (e.g., 'XAUUSD')
-    """
     settings = get_settings()
     suffix = settings.symbol_suffix
 
@@ -51,3 +29,14 @@ def denormalize_symbol(symbol: str) -> str:
         return symbol[: -len(suffix)]
 
     return symbol
+
+
+def canonical_symbol(symbol: str) -> str:
+    """Return a case-stable canonical form of the symbol.
+
+    Strips suffix, uppercases the base, then re-applies normalization.
+    This ensures 'btcusd', 'BTCUSD', 'BTCUSDm' all resolve to the same
+    broker-correct symbol.
+    """
+    base = denormalize_symbol(symbol).upper()
+    return normalize_symbol(base)

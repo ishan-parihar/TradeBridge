@@ -20,18 +20,19 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="/opt/mt5-mcp"
+PROJECT_DIR="/opt/TradeBridge"
 SERVICE_USER="mt5-bridge"
 SERVICE_GROUP="mt5-bridge"
 
 SERVICES=(
+    "mt5-terminal"
     "mt5-tcp-bridge"
     "mt5-http-gateway"
     "mt5-mcp-server"
 )
 
 info "========================================="
-info "  MT5-MCP Systemd Services Installer"
+info "  TradeBridge Systemd Services Installer"
 info "========================================="
 echo
 
@@ -72,8 +73,21 @@ chown -R "$SERVICE_USER:$SERVICE_GROUP" "$PROJECT_DIR"
 success "Project directory ownership set to $SERVICE_USER:$SERVICE_GROUP"
 echo
 
-# Step 3: Install systemd service files
-info "Step 3: Installing systemd service files..."
+# Step 3: Install health check script
+info "Step 3: Installing MT5 health check script..."
+HEALTH_CHECK_SRC="${SCRIPT_DIR}/mt5-terminal-health-check.sh"
+HEALTH_CHECK_DST="$PROJECT_DIR/deploy/systemd/mt5-terminal-health-check.sh"
+if [[ ! -f "$HEALTH_CHECK_SRC" ]]; then
+    error "Health check script not found: $HEALTH_CHECK_SRC"
+    exit 1
+fi
+cp "$HEALTH_CHECK_SRC" "$HEALTH_CHECK_DST"
+chmod +x "$HEALTH_CHECK_DST"
+success "Installed MT5 health check script"
+echo
+
+# Step 4: Install systemd service files
+info "Step 4: Installing systemd service files..."
 for svc in "${SERVICES[@]}"; do
     src="${SCRIPT_DIR}/${svc}.service"
     dst="/etc/systemd/system/${svc}.service"
@@ -130,14 +144,17 @@ info "  Installation Complete"
 info "========================================="
 echo
 info "Services:"
+info "  MT5 Health:    systemctl status mt5-terminal-health-check"
+info "  MT5 Terminal:  systemctl status mt5-terminal"
 info "  TCP Bridge:    systemctl status mt5-tcp-bridge"
 info "  HTTP Gateway:  systemctl status mt5-http-gateway"
 info "  MCP Server:    systemctl status mt5-mcp-server"
 echo
 info "Logs:"
-info "  journalctl -u mt5-tcp-bridge -f"
-info "  journalctl -u mt5-http-gateway -f"
-info "  journalctl -u mt5-mcp-server -f"
+info "  MT5 Health:    journalctl -u mt5-terminal-health-check -f"
+info "  TCP Bridge:    journalctl -u mt5-tcp-bridge -f"
+info "  HTTP Gateway:  journalctl -u mt5-http-gateway -f"
+info "  MCP Server:    journalctl -u mt5-mcp-server -f"
 echo
 info "Health Checks:"
 info "  TCP Bridge:    curl -s http://127.0.0.1:8025/status"

@@ -1,7 +1,7 @@
 # Waiting Tools Bug Report
 
 **Date**: 2026-04-09
-**Project**: MT5-MCP
+**Project**: TradeBridge
 **Files Analyzed**: 
 - `apps/mcp_server/main.py` (lines 4334-4393, 5441-5930)
 - `src/mt5_mcp/schemas/tools.py` (lines 406-485)

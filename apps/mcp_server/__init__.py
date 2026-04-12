@@ -41,9 +41,4 @@ def create_mcp_server() -> FastMCP:
         tools_trading,
     )
 
-    # Also register the existing wait_tools.py (4 tools) for backward compat
-    from . import wait_tools
-
-    wait_tools.register_tools(mcp)
-
     return mcp

@@ -123,11 +123,18 @@ class TradingCoach:
 
             # Spread vs ATR — is the spread eating the edge?
             if spread_points is not None and spread_points > 0:
-                spread_atr_ratio = spread_points / atr_value if atr_value > 0 else 999
+                # Heuristic: if spread_points > 1, it's likely in MT5 points, convert to price units
+                effective_spread = spread_points
+                if point is not None and spread_points > 1:
+                    effective_spread = spread_points * point
+                spread_atr_ratio = (
+                    effective_spread / atr_value if atr_value > 0 else 999
+                )
                 advice.raw_metrics["spread_atr_ratio"] = round(spread_atr_ratio, 3)
                 if spread_atr_ratio > 0.1:
                     advice.warnings.append(
-                        f"Spread is {spread_points:.0f} points, which is {spread_atr_ratio * 100:.0f}% of ATR. "
+                        f"Spread is {effective_spread:.5f} ({spread_points:.0f} points), "
+                        f"which is {spread_atr_ratio * 100:.0f}% of ATR. "
                         f"The spread alone consumes {spread_atr_ratio * 100:.0f}% of your expected move. "
                         f"Edge may be eroded by transaction costs."
                     )

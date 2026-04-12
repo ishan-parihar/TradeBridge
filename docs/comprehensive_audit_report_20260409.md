@@ -1,4 +1,4 @@
-# MT5-MCP Comprehensive Codebase Audit — Full Bug Report
+# TradeBridge Comprehensive Codebase Audit — Full Bug Report
 
 **Date**: 2026-04-09
 **Scope**: All Python source files in `apps/`, `src/`, `tools/`

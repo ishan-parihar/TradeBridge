@@ -4,7 +4,7 @@
 //|                    Auto-closes positions after max holding time    |
 //|                    Survives MCP/gateway instability                |
 //+------------------------------------------------------------------+
-#property copyright "MT5-mcp"
+#property copyright "TradeBridge"
 #property version   "1.0"
 
 #include <Trade\Trade.mqh>

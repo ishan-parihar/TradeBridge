@@ -170,11 +170,13 @@ class RedisQueue:
             return False
 
     def fail(self, id_: str, error: str) -> bool:
-        if not self._r.hset(
-            self._hash_prefix + id_, mapping={"status": "error", "error": error}
-        ):
+        try:
+            self._r.hset(
+                self._hash_prefix + id_, mapping={"status": "error", "error": error}
+            )
+            return True
+        except Exception:
             return False
-        return True
 
     def get(self, id_: str) -> Optional[Command]:
         h = self._r.hgetall(self._hash_prefix + id_)
@@ -224,5 +226,6 @@ def get_queue():
     return _queue_singleton
 
 
-# Keep old name for backwards compatibility but use lazy init
-queue_singleton = None
+# Backwards-compatible accessor — call as function
+def get_queue_singleton():
+    return get_queue()

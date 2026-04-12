@@ -1,12 +1,12 @@
 [Unit]
-Description=MT5 MCP Server
+Description=TradeBridge Server
 After=network.target
 
 [Service]
 Type=simple
 Environment=PYTHONUNBUFFERED=1
 Environment=MT5_TERMINAL_PATH=/home/ishanp/.local/share/bottles/bottles/Apps/drive_c/Program Files/MetaTrader 5
-WorkingDirectory=/home/ishanp/Documents/GitHub/MT5-mcp
+WorkingDirectory=/home/ishanp/Documents/GitHub/TradeBridge
 ExecStart=sh -c 'poetry run uvicorn apps.mcp_server.main:app --host 0.0.0.0 --port 8010'
 Restart=always
 
