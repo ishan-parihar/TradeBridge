@@ -17,27 +17,15 @@ from .shared import (
     _parse_payload,
     _parse_payload_dict,
     _parse_indicator_value,
+    _parse_indicator_value_from_data,
     _first_bid_ask,
+    INDICATOR_DEFAULTS,
 )
 from mt5_mcp.adapters.common.symbol_utils import normalize_symbol, denormalize_symbol
 
 _READ_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
 )
-
-_INDICATOR_DEFAULTS = {
-    "macd": {"fast": 12, "slow": 26, "signal": 9},
-    "bbands": {"period": 20, "deviation": 2},
-    "stoch": {"k_period": 5, "d_period": 3, "slowing": 3},
-    "atr": {"period": 14},
-    "adx": {"period": 14},
-    "dmi": {"period": 14},
-    "ichimoku": {"tenkan": 9, "kijun": 26, "senkou": 52},
-    "cci": {"period": 14},
-    "rsi": {"period": 14},
-    "sma": {"period": 20},
-    "ema": {"period": 20},
-}
 
 
 @mcp.tool(name="mt5_get_bars", annotations=_READ_ANNOTATIONS)
@@ -101,7 +89,7 @@ def mt5_get_indicator(
     try:
         symbol_norm = normalize_symbol(symbol)
         indicator_lower = indicator.lower()
-        defaults = _INDICATOR_DEFAULTS.get(indicator_lower, {})
+        defaults = INDICATOR_DEFAULTS.get(indicator_lower, {})
         params: dict[str, Any] = {
             "type": "get_indicator",
             "symbol": symbol_norm,
@@ -143,9 +131,7 @@ def mt5_get_indicator(
         if "symbol" in data:
             data["symbol"] = denormalize_symbol(data["symbol"])
 
-        value = data.get("value")
-        if value is None and "data" in data:
-            value = data["data"]
+        value = _parse_indicator_value_from_data(data, indicator_lower)
 
         return {
             "symbol": denormalize_symbol(symbol_norm),

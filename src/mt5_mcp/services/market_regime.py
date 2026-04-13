@@ -34,12 +34,13 @@ MarketRegime = Literal[
 
 
 def _compute_ema(values: list[float], period: int) -> list[float]:
-    """Compute EMA over a list of values."""
-    if not values:
+    """EMA seeded with SMA of first `period` values (matches MT5 iMA and divergence.py)."""
+    if not values or len(values) < period:
         return []
     multiplier = 2.0 / (period + 1)
-    ema: list[float] = [values[0]]
-    for v in values[1:]:
+    seed = sum(values[:period]) / period
+    ema: list[float] = [seed]
+    for v in values[period:]:
         ema.append((v - ema[-1]) * multiplier + ema[-1])
     return ema
 
@@ -117,7 +118,7 @@ def _compute_atr_percentile(atr_series: list[float]) -> float:
 
 
 def _compute_adx(bars: list[dict], period: int = 14) -> float:
-    """Simplified ADX calculation from bar data."""
+    """ADX calculation using Wilder's smoothing on DX values."""
     if len(bars) < period * 2:
         return 0.0
 
@@ -153,35 +154,33 @@ def _compute_adx(bars: list[dict], period: int = 14) -> float:
     if len(tr_values) < period:
         return 0.0
 
-    # Smoothed values using Wilder's method
-    smooth_tr = sum(tr_values[:period])
-    smooth_plus = sum(plus_dm[:period])
-    smooth_minus = sum(minus_dm[:period])
+    # Wilder's smoothing: initialise with averages (not sums)
+    smooth_tr = sum(tr_values[:period]) / period
+    smooth_plus = sum(plus_dm[:period]) / period
+    smooth_minus = sum(minus_dm[:period]) / period
 
-    dx_values: list[float] = []
+    # Compute first DX to seed ADX
+    def _calc_dx(s_tr: float, s_plus: float, s_minus: float) -> float:
+        if s_tr == 0:
+            return 0.0
+        plus_di = (s_plus / s_tr) * 100.0
+        minus_di = (s_minus / s_tr) * 100.0
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            return 0.0
+        return abs(plus_di - minus_di) / di_sum * 100.0
+
+    adx = _calc_dx(smooth_tr, smooth_plus, smooth_minus)
 
     for i in range(period, len(tr_values)):
         smooth_tr = smooth_tr - (smooth_tr / period) + tr_values[i]
         smooth_plus = smooth_plus - (smooth_plus / period) + plus_dm[i]
         smooth_minus = smooth_minus - (smooth_minus / period) + minus_dm[i]
 
-        if smooth_tr == 0:
-            dx_values.append(0.0)
-            continue
+        dx = _calc_dx(smooth_tr, smooth_plus, smooth_minus)
+        adx = (adx * (period - 1) + dx) / period
 
-        plus_di = (smooth_plus / smooth_tr) * 100.0
-        minus_di = (smooth_minus / smooth_tr) * 100.0
-
-        di_sum = plus_di + minus_di
-        if di_sum == 0:
-            dx_values.append(0.0)
-        else:
-            dx_values.append(abs(plus_di - minus_di) / di_sum * 100.0)
-
-    if not dx_values:
-        return 0.0
-
-    return sum(dx_values) / len(dx_values)
+    return adx
 
 
 def detect_regime(
@@ -318,15 +317,14 @@ def detect_regime(
     # 3. Momentum push: ADX > 30, ATR expanding, price far from EMA20
     elif adx > 30 and range_expansion_ratio > 1.1 and ema20_deviation_atr > 1.5:
         if ema_fast is not None and ema_slow is not None:
-            regime = "trending_up" if ema_fast > ema_slow else "trending_down"
+            momentum_direction = "up" if ema_fast > ema_slow else "down"
         else:
             momentum = (
                 last_close - float(recent_bars[-3].get("close", 0))
                 if len(recent_bars) >= 3
                 else 0
             )
-            regime = "trending_up" if momentum > 0 else "trending_down"
-        # Override to momentum_push — stronger than plain trend
+            momentum_direction = "up" if momentum > 0 else "down"
         regime = "momentum_push"
         confidence = min(
             0.9, 0.5 + (adx - 30) / 60.0 + (ema20_deviation_atr - 1.5) * 0.1
@@ -405,6 +403,8 @@ def detect_regime(
         "atr_percentile": round(atr_percentile, 1),
         "ema20_deviation_atr": round(ema20_deviation_atr, 2),
     }
+    if regime == "momentum_push":
+        result["momentum_direction"] = momentum_direction
 
     return result
 

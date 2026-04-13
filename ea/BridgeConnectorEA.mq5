@@ -2035,32 +2035,36 @@ void ProcessCommand(const string cmd)
       ulong ticket = (ulong)StringToInteger(tk);
       bool ok = PositionCloseByTicket(ticket, vol);
       if(ok) Complete(rid, "{\"status\":\"ok\"}"); else Fail(rid, "close_failed");
-   } else if(type=="submit_pending_order"){
-       string sym; string side; string kind; string ps; string vols; string sls; string tps; string devs;
-       if(!ParseKV(cmd, "symbol", sym) || !ParseKV(cmd, "side", side) || !ParseKV(cmd, "kind", kind) || !ParseKV(cmd, "price", ps) || !ParseKV(cmd, "volume_lots", vols)) { Fail(rid, "bad_args"); return; }
-       if(!EnsureSymbolInMarketWatch(sym)) { Fail(rid, "symbol_not_found"); return; }
-       double price = StringToDouble(ps); double vol = StringToDouble(vols);
-       double sl=0, tp=0; int dev=20; if(ParseKV(cmd, "sl", sls)) sl=StringToDouble(sls); if(ParseKV(cmd, "tp", tps)) tp=StringToDouble(tps); if(ParseKV(cmd, "deviation", devs)) dev=(int)StringToInteger(devs);
-       int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-       price = NormalizeDouble(price, digits);
-       if(sl > 0) sl = NormalizeDouble(sl, digits);
-       if(tp > 0) tp = NormalizeDouble(tp, digits);
-       CTrade trade; trade.SetDeviationInPoints(dev); trade.SetTypeFillingBySymbol(sym); bool ok=false;
-       string s = side; StringToLower(s); string k = kind; StringToLower(k);
-       if(s=="buy" && k=="limit") ok=trade.BuyLimit(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
-       else if(s=="sell" && k=="limit") ok=trade.SellLimit(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
-       else if(s=="buy" && k=="stop") ok=trade.BuyStop(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
-       else if(s=="sell" && k=="stop") ok=trade.SellStop(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
-       uint retcode = trade.ResultRetcode();
-       string payload = StringFormat("{\"retcode\":%u,\"retcode_description\":\"%s\",\"order\":%I64d,\"deal\":%I64d,\"price\":%G,\"volume\":%G,\"symbol\":\"%s\"}",
-          retcode,
-          JsonEscape(trade.ResultRetcodeDescription()),
-          trade.ResultOrder(),
-          trade.ResultDeal(),
-          price,
-          vol,
-          sym);
-       if(ok && (retcode==10008 || retcode==10009)) Complete(rid, payload); else Fail(rid, payload);
+    } else if(type=="submit_pending_order"){
+        string sym; string side; string kind; string ps; string vols; string sls; string tps; string devs;
+        if(!ParseKV(cmd, "symbol", sym) || !ParseKV(cmd, "side", side) || !ParseKV(cmd, "kind", kind) || !ParseKV(cmd, "price", ps) || !ParseKV(cmd, "volume_lots", vols)) { Fail(rid, "bad_args"); return; }
+        if(!EnsureSymbolInMarketWatch(sym)) { Fail(rid, "symbol_not_found"); return; }
+        double price = StringToDouble(ps); double vol = StringToDouble(vols);
+        double sl=0, tp=0; int dev=20; if(ParseKV(cmd, "sl", sls)) sl=StringToDouble(sls); if(ParseKV(cmd, "tp", tps)) tp=StringToDouble(tps); if(ParseKV(cmd, "deviation", devs)) dev=(int)StringToInteger(devs);
+        int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+        price = NormalizeDouble(price, digits);
+        if(sl > 0) sl = NormalizeDouble(sl, digits);
+        if(tp > 0) tp = NormalizeDouble(tp, digits);
+        ResetLastError();
+        CTrade trade; trade.SetDeviationInPoints(dev); trade.SetTypeFillingBySymbol(sym); int setup_err = GetLastError(); bool ok=false;
+        string s = side; StringToLower(s); string k = kind; StringToLower(k);
+        if(s=="buy" && k=="limit") ok=trade.BuyLimit(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
+        else if(s=="sell" && k=="limit") ok=trade.SellLimit(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
+        else if(s=="buy" && k=="stop") ok=trade.BuyStop(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
+        else if(s=="sell" && k=="stop") ok=trade.SellStop(vol, price, sym, sl, tp, ORDER_TIME_GTC, 0, "");
+        int last_err = GetLastError();
+        uint retcode = trade.ResultRetcode();
+        string payload = StringFormat("{\"retcode\":%u,\"retcode_description\":\"%s\",\"order\":%I64d,\"deal\":%I64d,\"price\":%G,\"volume\":%G,\"symbol\":\"%s\",\"last_error\":%d,\"setup_error\":%d}",
+           retcode,
+           JsonEscape(trade.ResultRetcodeDescription()),
+           trade.ResultOrder(),
+           trade.ResultDeal(),
+           price,
+           vol,
+           sym,
+           last_err,
+           setup_err);
+        if(ok && (retcode==10008 || retcode==10009)) Complete(rid, payload); else Fail(rid, payload);
    } else if(type=="cancel_order"){
       string okid; if(!ParseKV(cmd, "order_id", okid)) { Fail(rid, "bad_args"); return; }
       ulong ticket = (ulong)StringToInteger(okid);
@@ -2152,22 +2156,35 @@ void ProcessCommand(const string cmd)
       } else if(type=="trailing_tick"){
          int processed = g_trailing_manager.ProcessAll();
          Complete(rid, StringFormat("{\"processed\":%d,\"active\":%d}", processed, g_trailing_manager.GetActiveCount()));
-      } else if(type=="bracket_start"){
-         string buy_tk; string sell_tk; string bid;
-         if(!ParseKV(cmd, "buy_order_ticket", buy_tk) || !ParseKV(cmd, "sell_order_ticket", sell_tk) || !ParseKV(cmd, "bracket_id", bid)) { Fail(rid, "bad_args"); return; }
-         ulong buy_ticket = (ulong)StringToInteger(buy_tk);
-         ulong sell_ticket = (ulong)StringToInteger(sell_tk);
-         string bracket_id = bid;
-         string comment = "";
-         ParseKV(cmd, "comment", comment);
-         long magic_filter = 0;
-         string mns;
-         if(ParseKV(cmd, "magic_filter", mns)) magic_filter = (long)StringToInteger(mns);
-         bool ok = g_bracket_manager.StartBracket(buy_ticket, sell_ticket, bracket_id, comment, magic_filter);
-         if(ok)
-            Complete(rid, StringFormat("{\"status\":\"ok\",\"bracket_id\":\"%s\",\"buy_ticket\":\"%I64d\",\"sell_ticket\":\"%I64d\"}", bracket_id, buy_ticket, sell_ticket));
-         else
-            Fail(rid, StringFormat("{\"error\":\"bracket_start_failed\",\"bracket_id\":\"%s\"}", bracket_id));
+       } else if(type=="bracket_start"){
+          string buy_tk; string sell_tk; string bid;
+          if(!ParseKV(cmd, "buy_order_ticket", buy_tk) || !ParseKV(cmd, "sell_order_ticket", sell_tk) || !ParseKV(cmd, "bracket_id", bid)) { Fail(rid, "bad_args"); return; }
+          ulong buy_ticket = (ulong)StringToInteger(buy_tk);
+          ulong sell_ticket = (ulong)StringToInteger(sell_tk);
+          string bracket_id = bid;
+          string comment = "";
+          ParseKV(cmd, "comment", comment);
+          long magic_filter = 0;
+          string mns;
+          if(ParseKV(cmd, "magic_filter", mns)) magic_filter = (long)StringToInteger(mns);
+
+          // Retry loop: pending orders may not be immediately visible in OrdersTotal()
+          // after placement. Retry up to 5 times with 50ms between attempts.
+          bool ok = false;
+          for(int retry = 0; retry < 5; retry++)
+          {
+             if(retry > 0)
+             {
+                Sleep(50);
+                ::OrdersTotal(); // Force MT5 to refresh order cache
+             }
+             ok = g_bracket_manager.StartBracket(buy_ticket, sell_ticket, bracket_id, comment, magic_filter);
+             if(ok) break;
+          }
+          if(ok)
+             Complete(rid, StringFormat("{\"status\":\"ok\",\"bracket_id\":\"%s\",\"buy_ticket\":\"%I64d\",\"sell_ticket\":\"%I64d\"}", bracket_id, buy_ticket, sell_ticket));
+          else
+             Fail(rid, StringFormat("{\"error\":\"bracket_start_failed\",\"bracket_id\":\"%s\"}", bracket_id));
       } else if(type=="bracket_stop"){
          string bid;
          if(!ParseKV(cmd, "bracket_id", bid)) { Fail(rid, "bad_args"); return; }

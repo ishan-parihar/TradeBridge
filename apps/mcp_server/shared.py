@@ -32,6 +32,28 @@ _settings: Any | None = None
 
 _TCP_BRIDGE_ENABLED = os.getenv("MT5_TCP_BRIDGE_ENABLED", "true").lower() == "true"
 
+# ---------------------------------------------------------------------------
+# Shared indicator defaults — single source of truth.
+# All tool modules should import this instead of maintaining local copies.
+# ---------------------------------------------------------------------------
+
+INDICATOR_DEFAULTS: dict[str, dict[str, int]] = {
+    "macd": {"fast": 12, "slow": 26, "signal": 9},
+    "bbands": {"period": 20, "deviation": 2},
+    "stoch": {"k_period": 5, "d_period": 3, "slowing": 3},
+    "atr": {"period": 14},
+    "adx": {"period": 14},
+    "dmi": {"period": 14},
+    "ichimoku": {"tenkan": 9, "kijun": 26, "senkou": 52},
+    "cci": {"period": 14},
+    "rsi": {"period": 14},
+    "sma": {"period": 20},
+    "ema": {"period": 20},
+    "wma": {"period": 20},
+    "momentum": {"period": 14},
+    "williams": {"period": 14},
+}
+
 
 def get_http_client() -> httpx.Client:
     global _http_client
@@ -302,18 +324,105 @@ def _parse_payload_dict(result: dict) -> dict:
     return {}
 
 
+# Mapping of indicator name → primary value key in EA JSON responses.
+# The EA returns different key names depending on indicator type.
+_INDICATOR_VALUE_KEYS: dict[str, str] = {
+    "rsi": "value",
+    "atr": "value",
+    "sma": "value",
+    "ema": "value",
+    "wma": "value",
+    "smma": "value",
+    "cci": "value",
+    "obv": "value",
+    "adx": "adx",
+    "dmi": "adx",
+    "macd": "main",
+    "stoch": "k_val",
+    "bbands": "upper",  # representative; full result has upper/middle/lower
+    "ichimoku": "tenkan",  # representative; full result has 5 lines
+}
+
+
 def _parse_indicator_value(result: dict) -> float | None:
+    """Extract the primary numeric value from an indicator EA response.
+
+    Handles the variety of key names the EA uses:
+      - RSI/ATR/SMA/EMA/WMA/SMMA/CCI/OBV → "value"
+      - ADX/DMI → "adx"
+      - MACD → "main"
+      - Stochastic → "k_val"
+      - Bollinger Bands → "upper"
+      - Ichimoku → "tenkan"
+
+    Returns None (not 0.0) when the value is unavailable, so callers
+    can distinguish "zero" from "missing".
+    """
     if not result or result.get("status") != "completed":
         return None
     payload = result.get("result", {}).get("payload", {})
     if isinstance(payload, str):
         try:
-            return float(json.loads(payload).get("value", 0) or 0)
+            data = json.loads(payload)
         except Exception:
             return None
     elif isinstance(payload, dict):
-        v = payload.get("value")
-        return float(v) if v is not None else None
+        data = payload
+    else:
+        return None
+
+    if not data:
+        return None
+
+    # Detect indicator type from the EA response
+    indicator_name = (data.get("indicator") or "").lower()
+    primary_key = _INDICATOR_VALUE_KEYS.get(indicator_name, "value")
+
+    v = data.get(primary_key)
+    if v is not None:
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    # Fallback: try "value" key for any indicator
+    v = data.get("value")
+    if v is not None:
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    return None
+
+
+def _parse_indicator_value_from_data(data: dict, indicator_name: str) -> float | None:
+    """Extract the primary numeric value from already-parsed indicator data.
+
+    Prefers the indicator name from the EA response data itself (more reliable
+    than the caller-provided name, which may use different aliases).
+    """
+    if not data:
+        return None
+
+    ea_indicator = (data.get("indicator") or indicator_name or "").lower()
+    primary_key = _INDICATOR_VALUE_KEYS.get(ea_indicator, "value")
+
+    v = data.get(primary_key)
+    if v is not None:
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    # Fallback: try "value" key for any indicator
+    v = data.get("value")
+    if v is not None:
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
     return None
 
 
