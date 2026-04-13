@@ -1277,6 +1277,7 @@ def tool_get_bars(req: BarsRequest) -> Bars:
 
 # Sensible defaults for advanced indicators — AI agent should never get bad_args
 # for standard indicator calls. These match MT5 standard defaults.
+# MASTER COPY: apps/mcp_server/shared.py:INDICATOR_DEFAULTS — keep in sync.
 _INDICATOR_DEFAULTS: dict[str, dict[str, int]] = {
     "macd": {"fast": 12, "slow": 26, "signal": 9},
     "bbands": {"period": 20, "deviation": 2},
@@ -1289,6 +1290,9 @@ _INDICATOR_DEFAULTS: dict[str, dict[str, int]] = {
     "rsi": {"period": 14},
     "sma": {"period": 20},
     "ema": {"period": 20},
+    "wma": {"period": 20},
+    "momentum": {"period": 14},
+    "williams": {"period": 14},
 }
 
 

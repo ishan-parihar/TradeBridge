@@ -18,6 +18,7 @@ from .shared import (
     _parse_payload_dict,
     _parse_indicator_value,
     _first_bid_ask,
+    INDICATOR_DEFAULTS,
 )
 from mt5_mcp.adapters.common.symbol_utils import normalize_symbol, denormalize_symbol
 
@@ -257,23 +258,6 @@ def _extract_mtf_indicator_value(result: dict | None) -> Any:
     return None
 
 
-# Sensible defaults per indicator type so MT5 doesn't reject calls with missing params.
-_INDICATOR_DEFAULTS: dict[str, dict[str, int]] = {
-    "rsi": {"period": 14},
-    "ema": {"period": 20},
-    "sma": {"period": 20},
-    "wma": {"period": 20},
-    "atr": {"period": 14},
-    "macd": {"fast": 12, "slow": 26, "signal": 9},
-    "bbands": {"period": 20},
-    "stoch": {"k_period": 14, "d_period": 3, "slowing": 3},
-    "cci": {"period": 14},
-    "adx": {"period": 14},
-    "momentum": {"period": 14},
-    "williams": {"period": 14},
-}
-
-
 @mcp.tool(name="mt5_multi_timeframe_indicators", annotations=_ANALYSIS_ANNOTATIONS)
 def mt5_multi_timeframe_indicators(
     symbol: str,
@@ -288,9 +272,10 @@ def mt5_multi_timeframe_indicators(
         symbol_norm = normalize_symbol(symbol)
         timeframes = timeframes or ["M5", "M15", "H1", "H4", "D1"]
         readings: dict[str, Any] = {}
+        indicator_lower = indicator.lower()
 
         # Merge user overrides with indicator-specific defaults
-        defaults = dict(_INDICATOR_DEFAULTS.get(indicator.lower(), {}))
+        defaults = dict(INDICATOR_DEFAULTS.get(indicator_lower, {}))
         if period is not None:
             defaults["period"] = period
         if fast is not None:
@@ -304,18 +289,20 @@ def mt5_multi_timeframe_indicators(
             params: dict[str, Any] = {
                 "symbol": symbol_norm,
                 "timeframe": tf,
-                "indicator": indicator,
+                "indicator": indicator_lower,
                 **defaults,
             }
 
-            result = _get_indicator_with_fallback(symbol_norm, tf, indicator, params)
+            result = _get_indicator_with_fallback(
+                symbol_norm, tf, indicator_lower, params
+            )
             value = _extract_mtf_indicator_value(result)
             readings[tf] = {
                 "value": value,
                 "status": result.get("status", "unknown") if result else "unavailable",
             }
 
-        return {"symbol": symbol, "indicator": indicator, "readings": readings}
+        return {"symbol": symbol, "indicator": indicator_lower, "readings": readings}
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
 
