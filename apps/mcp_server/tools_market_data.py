@@ -113,6 +113,12 @@ def mt5_get_indicator(
         elif "signal" in defaults:
             params["signal"] = defaults["signal"]
 
+        # Forward remaining defaults not covered by explicit parameters
+        _HANDLED_PARAMS = {"period", "fast", "slow", "signal"}
+        for key, val in defaults.items():
+            if key not in _HANDLED_PARAMS and key not in params:
+                params[key] = val
+
         result = _tcp_send_and_await(
             params["type"], {k: v for k, v in params.items() if k != "type"}
         )
