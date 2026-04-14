@@ -71,7 +71,7 @@ class TradeSignal:
         """Map Vibe-Trading symbol format to MT5 symbol format."""
         mapping = {
             "XAU/USD": "XAUUSD",
-            "XAUUSDm": "XAUUSD",
+            "XAUUSDM": "XAUUSD",
             "GOLD": "XAUUSD",
             "EUR/USD": "EURUSD",
             "GBP/USD": "GBPUSD",
