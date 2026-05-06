@@ -1,4 +1,4 @@
-"""Comprehensive production-grade test suite for all 93 TradeBridge tools.
+"""Comprehensive production-grade test suite for all TradeBridge tools.
 
 Tests each tool for:
 1. Registration — tool exists and is callable
@@ -196,11 +196,7 @@ def mock_tcp_bridge():
                 ]
             },
             "get_indicator": {"values": [55.0, 58.0, 62.0]},
-            "get_ticks": {
-                "ticks": [
-                    {"time": "2026-04-09T10:00:00Z", "bid": 2650.0, "ask": 2650.15}
-                ]
-            },
+            "get_ticks": {"ticks": [{"time": "2026-04-09T10:00:00Z", "bid": 2650.0, "ask": 2650.15}]},
             "get_order_book": {"bids": [[2650.0, 1.0]], "asks": [[2650.15, 1.0]]},
             "get_chart_screenshot": {
                 "screenshot_path": "/tmp/ss.png",
@@ -246,14 +242,12 @@ def mock_tcp_bridge():
     for name in [
         "tools_resources",
         "tools_market_data",
-        "tools_analysis",
         "tools_trading",
         "tools_metacognition",
         "tools_context",
         "tools_portfolio",
         "tools_ea_native",
         "tools_data",
-        "tools_ml",
         "tools_management",
     ]:
         mod = __import__(f"apps.mcp_server.{name}", fromlist=["mcp"])
@@ -276,9 +270,7 @@ def mock_policy():
 
 
 @pytest.fixture
-def mcp_server(
-    mock_settings, mock_gateway, mock_http_client, mock_tcp_bridge, mock_policy
-):
+def mcp_server(mock_settings, mock_gateway, mock_http_client, mock_tcp_bridge, mock_policy):
     """Create MCP server with all mocks."""
     from apps.mcp_server import create_mcp_server
 
@@ -323,9 +315,7 @@ def call_tool_sync(server, tool_name: str, arguments: dict | None = None):
 
 def verify_tool_result(tool_name: str, result: dict, expect_error: bool = False):
     """Verify a tool's result meets production standards."""
-    assert isinstance(result, dict), (
-        f"{tool_name}: Expected dict, got {type(result).__name__}"
-    )
+    assert isinstance(result, dict), f"{tool_name}: Expected dict, got {type(result).__name__}"
 
     # Check JSON serializable
     try:
@@ -401,36 +391,10 @@ class TestMarketDataTools:
 
 
 # ---------------------------------------------------------------------------
-# Tier 3: Analysis Tools (16 tools)
+# Tier 3: Analysis Tools — REMOVED
+# These 16 tools were redundant with Vibe-Trading integration and crashing
+# on Python 3.14. Superseded by vibe_* proxy tools.
 # ---------------------------------------------------------------------------
-
-
-class TestAnalysisTools:
-    """Test analysis tools."""
-
-    TOOLS = [
-        ("mt5_volatility_profile", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_divergence", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_multi_bar_patterns", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_volume_profile", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_momentum_check", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_multi_timeframe_indicators", {"symbol": "XAUUSDm"}),
-        ("mt5_correlation_matrix", {"symbols": ["XAUUSDm", "EURUSD"]}),
-        ("mt5_market_structure", {"symbol": "XAUUSDm", "timeframe": "H4"}),
-        ("mt5_strategy_selector", {"symbol": "XAUUSDm"}),
-        ("mt5_vwap", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_volume_at_price", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_setup_probability", {"symbol": "XAUUSDm", "setup_type": "trend_follow"}),
-        ("mt5_support_resistance", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_market_regime", {"symbol": "XAUUSDm", "timeframe": "H1"}),
-        ("mt5_market_scan", {}),
-        ("mt5_opportunity_rank", {}),
-    ]
-
-    @pytest.mark.parametrize("tool_name,kwargs", TOOLS)
-    def test_analysis_tool(self, mcp_server, tool_name, kwargs):
-        result = call_tool_sync(mcp_server, tool_name, kwargs)
-        verify_tool_result(tool_name, result)
 
 
 # ---------------------------------------------------------------------------
@@ -646,23 +610,8 @@ class TestDataStoreTools:
 
 
 # ---------------------------------------------------------------------------
-# Tier 9: ML Tools (3 tools)
+# Tier 9: ML Tools — REMOVED (dead placeholder code, no models shipped)
 # ---------------------------------------------------------------------------
-
-
-class TestMLTools:
-    """Test ML prediction tools."""
-
-    TOOLS = [
-        ("mt5_ml_predict", {"symbol": "XAUUSDm", "features": {}}),
-        ("mt5_ml_models", {}),
-        ("mt5_ml_models_reload", {}),
-    ]
-
-    @pytest.mark.parametrize("tool_name,kwargs", TOOLS)
-    def test_ml_tool(self, mcp_server, tool_name, kwargs):
-        result = call_tool_sync(mcp_server, tool_name, kwargs)
-        verify_tool_result(tool_name, result)
 
 
 # ---------------------------------------------------------------------------
@@ -707,9 +656,7 @@ class TestErrorResilience:
 
     def test_tool_with_invalid_symbol(self, mcp_server):
         """Tools should handle invalid symbols gracefully."""
-        result = call_tool_sync(
-            mcp_server, "mt5_symbol_info", {"symbol": "INVALID_SYMBOL_12345"}
-        )
+        result = call_tool_sync(mcp_server, "mt5_symbol_info", {"symbol": "INVALID_SYMBOL_12345"})
         verify_tool_result("mt5_symbol_info", result, expect_error=True)
 
     def test_tool_with_missing_params(self, mcp_server):
@@ -749,9 +696,9 @@ class TestErrorResilience:
 
 
 class TestToolRegistration:
-    """Verify all 93 tools are properly registered."""
+    """Verify all tools are properly registered."""
 
-    EXPECTED_TOOL_COUNT = 89
+    EXPECTED_TOOL_COUNT = 70
 
     EXPECTED_TOOLS = {
         # Resources (8)
@@ -776,23 +723,7 @@ class TestToolRegistration:
         "mt5_get_chart_screenshot",
         "mt5_market_snapshot",
         "mt5_chart_intelligence",
-        # Analysis (16)
-        "mt5_volatility_profile",
-        "mt5_divergence",
-        "mt5_multi_bar_patterns",
-        "mt5_volume_profile",
-        "mt5_momentum_check",
-        "mt5_multi_timeframe_indicators",
-        "mt5_correlation_matrix",
-        "mt5_market_structure",
-        "mt5_strategy_selector",
-        "mt5_vwap",
-        "mt5_volume_at_price",
-        "mt5_setup_probability",
-        "mt5_support_resistance",
-        "mt5_market_regime",
-        "mt5_market_scan",
-        "mt5_opportunity_rank",
+        # Analysis tools — REMOVED (16 tools, superseded by Vibe-Trading integration)
         # Trading (16)
         "mt5_submit_market_order",
         "mt5_submit_market_order_via_bridge",
@@ -844,10 +775,7 @@ class TestToolRegistration:
         "mt5_data_ticks",
         "mt5_data_deals",
         "mt5_data_stats",
-        # ML (3)
-        "mt5_ml_predict",
-        "mt5_ml_models",
-        "mt5_ml_models_reload",
+        # ML tools — REMOVED (dead placeholder code)
         # Management (5)
         "mt5_health",
         "mt5_tool_status",
@@ -857,11 +785,9 @@ class TestToolRegistration:
     }
 
     def test_tool_count(self, mcp_server):
-        """Verify exactly 89 tools registered."""
+        """Verify exactly 70 tools registered."""
         tools = mcp_server._tool_manager.list_tools()
-        assert len(tools) == self.EXPECTED_TOOL_COUNT, (
-            f"Expected {self.EXPECTED_TOOL_COUNT} tools, got {len(tools)}"
-        )
+        assert len(tools) == self.EXPECTED_TOOL_COUNT, f"Expected {self.EXPECTED_TOOL_COUNT} tools, got {len(tools)}"
 
     def test_all_expected_tools_registered(self, mcp_server):
         """Verify every expected tool name is registered."""
@@ -872,7 +798,6 @@ class TestToolRegistration:
         assert not missing, f"Missing tools: {sorted(missing)}"
 
         extra = registered - self.EXPECTED_TOOLS
-        # Extra tools are OK but worth noting
         if extra:
             print(f"Note: Extra tools registered: {sorted(extra)}")
 
@@ -884,17 +809,13 @@ class TestToolRegistration:
         pattern = re.compile(r"^mt5_[a-z][a-z0-9_]*$")
 
         for tool in tools:
-            assert pattern.match(tool.name), (
-                f"Tool '{tool.name}' doesn't follow mt5_snake_case convention"
-            )
+            assert pattern.match(tool.name), f"Tool '{tool.name}' doesn't follow mt5_snake_case convention"
 
     def test_tool_annotations(self, mcp_server):
         """All tools must have annotations set."""
         tools = mcp_server._tool_manager.list_tools()
         for tool in tools:
-            assert tool.annotations is not None, (
-                f"Tool '{tool.name}' missing annotations"
-            )
+            assert tool.annotations is not None, f"Tool '{tool.name}' missing annotations"
 
 
 # ---------------------------------------------------------------------------
@@ -922,14 +843,12 @@ class TestProductionReadiness:
     def test_no_circular_imports(self):
         """All tool modules must import without circular dependency errors."""
         from apps.mcp_server import (
-            tools_analysis,
             tools_context,
             tools_data,
             tools_ea_native,
             tools_management,
             tools_market_data,
             tools_metacognition,
-            tools_ml,
             tools_portfolio,
             tools_resources,
             tools_trading,
@@ -958,6 +877,4 @@ class TestProductionReadiness:
         for tool_name, kwargs in critical_tools:
             result = call_tool_sync(mcp_server, tool_name, kwargs)
             assert result is not None, f"{tool_name} returned None"
-            assert isinstance(result, dict), (
-                f"{tool_name} returned {type(result).__name__}, not dict"
-            )
+            assert isinstance(result, dict), f"{tool_name} returned {type(result).__name__}, not dict"

@@ -28,14 +28,12 @@ def create_mcp_server() -> FastMCP:
     # Deferred imports to avoid circular dependency.
     # Each module's import triggers @mcp.tool() decorators at module level.
     from . import (
-        tools_analysis,
         tools_context,
         tools_data,
         tools_ea_native,
         tools_management,
         tools_market_data,
         tools_metacognition,
-        tools_ml,
         tools_portfolio,
         tools_resources,
         tools_trading,

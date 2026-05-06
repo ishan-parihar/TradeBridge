@@ -1,0 +1,6 @@
+{
+  "updatedAt": 1778056434354,
+  "uncheckedTodos": [],
+  "lastAgentSummary": "Now let me check how the Docker compose reservations compare to actual usage, and prepare concrete recommendations. OK, here's the full report: --- ## Pending Git State **Branch:** `feature/vibe-trading-integration` — 9 commits ahead of `main`, 10 files modified but **uncommitted**. **What's pending:** | File | Change | |---|---| | `apps/mcp_server/tools_analysis.py` | 🗑️ **Deleted** (793 lines — analysis tools) | | `apps/mcp_server/tools_ml.py` | 🗑️ **Deleted** (88 lines — ML tools) | | `apps/mcp_server/main.py` | Refactored TCP bridge lazy connect + removed analysis/ML registrations | | `apps/tcp_bridge/server.py` | Added `async stop()` method for graceful shutdown | | `deploy/systemd/*.service` | Switched to system Python (no .venv), absolute paths, removed `mt5-terminal.service` dependency | | `tests/mcp_tools/test_all_tools.py` | Removed analysis/ML test cases | **⚠️ Start-fresh recommendation:** Commit or stash this branch before switching. The `feature/vibe-trading-integration` branch is 9 commits ahead of `main` and has 881 lines of cleanup that aren't saved. --- ## Resource Profile Summary ``` Service Port Runtime Actual RSS Docker Reserve ───────────────────────────────…",
+  "recentBackgroundTaskIds": []
+}
