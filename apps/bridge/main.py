@@ -79,17 +79,20 @@ async def run_http_gateway(stop_event: asyncio.Event):
     import uvicorn
     from apps.bridge_gateway.main import app
 
+    bind_host = os.getenv("MT5_GATEWAY_HOST", "127.0.0.1")
+    bind_port = int(os.getenv("MT5_GATEWAY_PORT", "8020"))
+
     config = uvicorn.Config(
         app,
-        host="127.0.0.1",
-        port=8020,
+        host=bind_host,
+        port=bind_port,
         log_level="info",
         access_log=False,
     )
     server = uvicorn.Server(config)
     # Override shutdown trigger
     server.install_signal_handlers = lambda: None
-    logger.info("HTTP Gateway starting on :8020")
+    logger.info(f"HTTP Gateway starting on {bind_host}:{bind_port}")
     asyncio.create_task(server.serve())
     await stop_event.wait()
     await server.shutdown()
@@ -101,16 +104,19 @@ async def run_mcp_server(stop_event: asyncio.Event):
     import uvicorn
     from apps.mcp_server.main import app
 
+    bind_host = os.getenv("MT5_MCP_HOST", "127.0.0.1")
+    bind_port = int(os.getenv("MT5_MCP_PORT", "8010"))
+
     config = uvicorn.Config(
         app,
-        host="127.0.0.1",
-        port=8010,
+        host=bind_host,
+        port=bind_port,
         log_level="info",
         access_log=False,
     )
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None
-    logger.info("MCP Server starting on :8010")
+    logger.info(f"MCP Server starting on {bind_host}:{bind_port}")
     asyncio.create_task(server.serve())
     await stop_event.wait()
     await server.shutdown()
