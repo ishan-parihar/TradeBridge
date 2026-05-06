@@ -259,31 +259,33 @@ def get_settings_cached():
 
 
 _tcp_client: Any | None = None
+_tcp_client_connected: bool = False
 
 
 def _get_tcp_client() -> Any | None:
-    global _tcp_client
-    if _tcp_client is None:
+    """Get or create persistent TCP bridge client.
+
+    Returns None if TCP bridge is unavailable. Client connects lazily
+    on first use and maintains connection via internal reconnect loop.
+    """
+    global _tcp_client, _tcp_client_connected
+    if _tcp_client is None and not _tcp_client_connected:
         try:
             from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
-            import asyncio
 
             _tcp_client = TCPBridgeClient()
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(_tcp_client.connect())
-            finally:
-                loop.close()
+            _tcp_client_connected = True
             _logger = __import__(
                 "mt5_mcp.observability.logging", fromlist=["logger"]
             ).logger
-            _logger.info("TCP bridge client connected (shared)")
+            _logger.info("TCP bridge client initialized (connects on first use)")
         except Exception as e:
             _logger = __import__(
                 "mt5_mcp.observability.logging", fromlist=["logger"]
             ).logger
-            _logger.warning(f"TCP bridge client connect failed: {e}")
+            _logger.warning(f"TCP bridge client init failed: {e}")
             _tcp_client = None
+            _tcp_client_connected = True  # Don't retry on this import error
     return _tcp_client
 
 
@@ -764,22 +766,10 @@ def health() -> dict:
     tcp_connected = False
     if _TCP_BRIDGE_ENABLED:
         try:
-            from mt5_mcp.services.tcp_bridge_client import TCPBridgeClient
-            import asyncio
-
-            tcp_client = TCPBridgeClient()
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(tcp_client.connect())
-                tcp_connected = True
-            except Exception:
-                tcp_connected = False
-            finally:
-                try:
-                    loop.run_until_complete(tcp_client.close())
-                except Exception:
-                    pass
-                loop.close()
+            tcp_client = _get_tcp_client()
+            tcp_connected = tcp_client is not None and getattr(
+                tcp_client, "is_connected", False
+            )
         except Exception as e:
             tcp_connected = False
             issues.append(f"TCP bridge unavailable: {e}")
@@ -988,12 +978,30 @@ def _await_result(req_id: str, timeout_s: float = 20.0, poll_s: float = 0.1) -> 
 def _tcp_send_and_await(
     type: str, payload: dict[str, Any], timeout_s: float = 20.0
 ) -> dict[str, Any] | None:
+    """Send command via TCP bridge and await response.
+
+    Connects lazily on first call, then reuses persistent connection.
+    Falls back to None if TCP bridge unavailable.
+    """
     if not _TCP_BRIDGE_ENABLED:
         return None
     try:
         client = _get_tcp_client()
         if client is None:
             return None
+
+        # Lazy connect on first use
+        if not client.is_connected:
+            import asyncio
+
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(client.connect())
+            except Exception:
+                return None
+            finally:
+                loop.close()
+
         import asyncio
 
         loop = asyncio.new_event_loop()
@@ -1348,40 +1356,7 @@ def tool_get_indicator(req: IndicatorRequest) -> dict:
             data["symbol"] = denormalize_symbol(data["symbol"])
         return data
 
-    gw_url = get_settings_cached().gateway_url
-    params = {
-        "type": "get_indicator",
-        "symbol": symbol_normalized,
-        "timeframe": req.timeframe,
-        "indicator": req.indicator,
-    }
-
-    # Inject sensible defaults for advanced indicators so AI agent never gets bad_args
-    indicator_lower = req.indicator.lower() if req.indicator else ""
-    defaults = _INDICATOR_DEFAULTS.get(indicator_lower, {})
-    for key, default_val in defaults.items():
-        current = getattr(req, key, None)
-        if current is None:
-            setattr(req, key, default_val)
-
-    # Only include optional params when provided
-    for key, val in (
-        ("period", req.period),
-        ("fast", req.fast),
-        ("slow", req.slow),
-        ("signal", req.signal),
-        ("deviation", req.deviation),
-        ("shift", req.shift),
-        ("k_period", req.k_period),
-        ("d_period", req.d_period),
-        ("slowing", req.slowing),
-        ("tenkan", req.tenkan),
-        ("kijun", req.kijun),
-        ("senkou", req.senkou),
-        ("window", req.window),
-    ):
-        if val is not None:
-            params[key] = val
+    # HTTP fallback: reuse params dict (already built above)
     client = get_http_client()
     r = client.post(
         f"{gw_url}/bridge/commands/enqueue",

@@ -15,6 +15,7 @@ Environment=MT5_TCP_BRIDGE_MCP_PORT=8026
 Environment=MT5_TCP_BRIDGE_STATUS_PORT=8027
 Environment=MT5_GATEWAY_URL=http://127.0.0.1:8020
 Environment=MT5_TCP_BRIDGE_ENABLED=true
+Environment=PYTHONPATH=/home/ishanp/Documents/GitHub/TradeBridge/src
 Environment=PYTHONUNBUFFERED=1
 
 ExecStart=/home/ishanp/Documents/GitHub/TradeBridge/.venv/bin/python -m apps.bridge.main

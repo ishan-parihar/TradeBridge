@@ -117,6 +117,29 @@ class TCPBridgeServer:
             async with self._mcp_server:
                 await self._mcp_server.serve_forever()
 
+    async def stop(self) -> None:
+        """Gracefully shutdown the TCP bridge server."""
+        logger.info("Shutting down TCP Bridge Server...")
+
+        # Close EA connection
+        if self._ea_writer and not self._ea_writer.is_closing():
+            self._ea_writer.close()
+            try:
+                await self._ea_writer.wait_closed()
+            except Exception:
+                pass
+
+        # Close HTTP client
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+
+        # Fail any pending commands
+        self._fail_pending_on_disconnect()
+
+        # Servers are closed via async context manager in start()
+        logger.info("TCP Bridge Server stopped")
+
     async def _handle_ea_connection(
         self, reader: StreamReader, writer: StreamWriter
     ) -> None:
