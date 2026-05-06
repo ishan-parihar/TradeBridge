@@ -20,7 +20,8 @@ MetaTrader5 = {version = "^5.0.45", optional = true}
 prometheus-client = "^0.20.0"
 uvloop = {version = "^0.21.0", markers = "sys_platform != 'win32'"}
 mcp = "^1.0.0"
-vibe-trading-ai = { path = "../Vibe-Trading", develop = true }
+feedparser = "^6.0.0"
+requests = "^2.31.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

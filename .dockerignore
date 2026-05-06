@@ -1,0 +1,48 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+venv*/
+
+# IDE & editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker working files
+.dockerignore
+
+# Logs
+*.log
+
+# Tests & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.benchmarks/
+
+# Data / config (not needed at build time)
+ea/data/

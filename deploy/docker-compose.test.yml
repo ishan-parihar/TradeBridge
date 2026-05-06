@@ -3,13 +3,13 @@ version: "3.9"
 services:
   redis:
     image: redis:7-alpine
-    container_name: mt5-redis
+    container_name: mt5-redis-test
     ports:
-      - "${MT5_REDIS_PORT:-6379}:6379"
+      - "6379"
     volumes:
-      - redis-data:/data
+      - redis-test-data:/data
     networks:
-      - TradeBridge-net
+      - TradeBridge-test-net
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -17,20 +17,13 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
-    deploy:
-      resources:
-        limits:
-          memory: 64M
-          cpus: "0.25"
-        reservations:
-          memory: 16M
 
   tcp-bridge:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
       target: tcp-bridge-target
-    container_name: mt5-tcp-bridge
+    container_name: mt5-tcp-bridge-test
     environment:
       - MT5_TCP_BRIDGE_PORT=8025
       - MT5_TCP_BRIDGE_HOST=0.0.0.0
@@ -38,27 +31,20 @@ services:
       - MT5_GATEWAY_URL=http://http-gateway:8020
       - PYTHONUNBUFFERED=1
     ports:
-      - "${MT5_TCP_BRIDGE_PORT:-8025}:8025"
+      - "8024:8025"
     networks:
-      - TradeBridge-net
+      - TradeBridge-test-net
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 64M
-          cpus: "0.25"
-        reservations:
-          memory: 32M
 
   http-gateway:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
       target: http-gateway-target
-    container_name: mt5-http-gateway
+    container_name: mt5-http-gateway-test
     environment:
       - MT5_GATEWAY_URL=http://0.0.0.0:8020
       - MT5_REDIS_URL=redis://redis:6379/0
@@ -66,27 +52,20 @@ services:
       - MT5_TCP_BRIDGE_PORT=8025
       - PYTHONUNBUFFERED=1
     ports:
-      - "${MT5_GATEWAY_PORT:-8020}:8020"
+      - "8019:8020"
     networks:
-      - TradeBridge-net
+      - TradeBridge-test-net
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-          cpus: "0.50"
-        reservations:
-          memory: 64M
 
   mcp-server:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
       target: mcp-server-target
-    container_name: TradeBridge-server
+    container_name: mt5-mcp-server-test
     environment:
       - MT5_GATEWAY_URL=http://http-gateway:8020
       - MT5_REDIS_URL=redis://redis:6379/0
@@ -94,28 +73,21 @@ services:
       - MT5_TCP_BRIDGE_PORT=8025
       - PYTHONUNBUFFERED=1
     ports:
-      - "${MT5_MCP_SERVER_PORT:-8010}:8010"
+      - "8009:8010"
     networks:
-      - TradeBridge-net
+      - TradeBridge-test-net
     depends_on:
       http-gateway:
         condition: service_healthy
       tcp-bridge:
         condition: service_healthy
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-          cpus: "0.50"
-        reservations:
-          memory: 64M
 
 networks:
-  TradeBridge-net:
+  TradeBridge-test-net:
     driver: bridge
-    name: TradeBridge-net
+    name: TradeBridge-test-net
 
 volumes:
-  redis-data:
-    name: mt5-redis-data
+  redis-test-data:
+    name: mt5-redis-test-data

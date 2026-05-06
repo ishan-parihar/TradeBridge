@@ -54,9 +54,9 @@ RUN groupadd -r mt5bridge && \
 
 WORKDIR /app
 
-# Install runtime system dependencies
+# Install runtime system dependencies (curl, netcat for health checks)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
+    apt-get install -y --no-install-recommends curl netcat-openbsd && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy Python packages from build stage
@@ -76,22 +76,29 @@ EXPOSE 8010
 EXPOSE 8020
 EXPOSE 8025
 
-# Health check
-HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)" || exit 1
+# Set stop signal for graceful shutdown
+STOPSIGNAL SIGTERM
 
 USER mt5bridge
 
-# Entry point based on TARGET
-CMD ["sh", "-c", "\
-    if [ \"$TARGET\" = \"tcp-bridge\" ]; then \
-        python -m apps.tcp_bridge.main; \
-    elif [ \"$TARGET\" = \"http-gateway\" ]; then \
-        uvicorn apps.bridge_gateway.main:app --host 0.0.0.0 --port 8020; \
-    elif [ \"$TARGET\" = \"mcp-server\" ]; then \
-        uvicorn apps.mcp_server.main:app --host 0.0.0.0 --port 8010; \
-    else \
-        echo \"Unknown TARGET: $TARGET\"; \
-        exit 1; \
-    fi \
-"]
+# ============================================================================
+# Target-specific health checks and entrypoints
+# ============================================================================
+
+# tcp-bridge: expose TCP port for MT5 EA and MCP sub-protocol ports
+FROM runtime AS tcp-bridge-target
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD nc -z 127.0.0.1 8025 || exit 1
+CMD ["python", "-m", "apps.tcp_bridge.main"]
+
+# http-gateway: FastAPI on port 8020
+FROM runtime AS http-gateway-target
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import json, urllib.request; req = urllib.request.Request('http://127.0.0.1:8020/bridge/health', method='POST', data=b'{}'); urllib.request.urlopen(req, timeout=3)" || exit 1
+CMD ["uvicorn", "apps.bridge_gateway.main:app", "--host", "0.0.0.0", "--port", "8020", "--no-access-log"]
+
+# mcp-server: FastAPI on port 8010
+FROM runtime AS mcp-server-target
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)" || exit 1
+CMD ["uvicorn", "apps.mcp_server.main:app", "--host", "0.0.0.0", "--port", "8010", "--no-access-log"]

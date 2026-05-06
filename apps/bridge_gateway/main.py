@@ -16,8 +16,6 @@ from mt5_mcp.schemas.models import (
     Order,
     Position,
     ExecutionResult,
-    MarginEstimate,
-    MarginEstimateRequest,
     TerminalStatus,
     TradeIntent,
 )
@@ -164,6 +162,12 @@ def _secret_ok(request: Request, params: dict | None = None) -> bool:
     qp = dict(request.query_params)
     provided = data.get("secret") or qp.get("secret")
     return provided == secret_cfg
+
+
+@app.get("/bridge/health")
+def bridge_health_get() -> dict[str, str]:
+    """Simple GET health check for Docker/K8s probes."""
+    return {"state": get_gateway_cached().health().state}
 
 
 @app.post("/bridge/health")
