@@ -57,12 +57,6 @@ services:
     build:
       context: ..
       dockerfile: deploy/mt5-terminal/Dockerfile
-      args:
-        MT5_BROKER_SERVER: "${MT5_BROKER_SERVER:-MetaQuotes-Demo}"
-        MT5_BROKER_LOGIN: "${MT5_BROKER_LOGIN:-}"
-        MT5_BROKER_PASSWORD: "${MT5_BROKER_PASSWORD:-}"
-        EA_TCP_HOST: "tradebridge"
-        EA_TCP_PORT: "8025"
     container_name: mt5-terminal
     environment:
       - MT5_BROKER_LOGIN=${MT5_BROKER_LOGIN:-}
@@ -72,10 +66,12 @@ services:
       - EA_TCP_PORT=8025
       - DISPLAY=:99
       - WINEDEBUG=-all
+      - MT5_CMD_OPTIONS=
+      - MT5_ENABLE_VNC=
     ports:
       - "${MT5_TERMINAL_VNC_PORT:-5900}:5900"
     volumes:
-      - mt5-wine:/home/mt5/.wine
+      - mt5-config:/config
     networks:
       - TradeBridge-net
     depends_on:
@@ -91,5 +87,5 @@ networks:
 volumes:
   redis-data:
     name: mt5-redis-data
-  mt5-wine:
-    name: mt5-wine-data
+  mt5-config:
+    name: mt5-config
