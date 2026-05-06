@@ -4,8 +4,11 @@ import os
 from pathlib import Path
 
 
-def get_vibe_trading_dir() -> Path:
-    """Get path to Vibe-Trading agent directory."""
+def get_vibe_trading_dir() -> Path | None:
+    """Get path to Vibe-Trading agent directory.
+
+    Returns None if Vibe-Trading directory is not configured or not found.
+    """
     env_path = os.getenv("VIBE_TRADING_DIR")
     if env_path:
         return Path(env_path).resolve()
@@ -14,9 +17,7 @@ def get_vibe_trading_dir() -> Path:
     default = (tradebridge_root.parent / "Vibe-Trading" / "agent").resolve()
     if default.exists():
         return default
-    raise FileNotFoundError(
-        f"Vibe-Trading agent directory not found. Set VIBE_TRADING_DIR env var or place Vibe-Trading at: {default}"
-    )
+    return None
 
 
 def get_vibe_mcp_port() -> int:
@@ -29,7 +30,7 @@ def get_vibe_env_overrides() -> dict[str, str]:
     env = {}
     if provider := os.getenv("VIBE_TRADING_LLM_PROVIDER"):
         env["LANGCHAIN_PROVIDER"] = provider
-    if base_url := os.getenv("VIBE_TRADING_LLM_BASE_URL"):
+    if provider and (base_url := os.getenv("VIBE_TRADING_LLM_BASE_URL")):
         env[f"{provider.upper()}_BASE_URL"] = base_url
     if model := os.getenv("VIBE_TRADING_LLM_MODEL"):
         env["LANGCHAIN_MODEL_NAME"] = model

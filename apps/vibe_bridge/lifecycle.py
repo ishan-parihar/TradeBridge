@@ -4,7 +4,7 @@ import asyncio
 import os
 import signal
 import subprocess
-from typing import Optional
+from pathlib import Path
 
 import httpx
 import structlog
@@ -18,10 +18,11 @@ class VibeBridgeLifecycle:
     """Manages the Vibe-Trading MCP server process."""
 
     def __init__(self) -> None:
-        self._process: Optional[subprocess.Popen] = None
+        self._process: subprocess.Popen | None = None
         self._port = get_vibe_mcp_port()
-        self._vibe_dir = get_vibe_trading_dir()
+        self._vibe_dir: Path | None = get_vibe_trading_dir()
         self._started = False
+        self._disabled = self._vibe_dir is None
 
     @property
     def is_running(self) -> bool:
@@ -40,18 +41,25 @@ class VibeBridgeLifecycle:
 
         Returns True if server is ready, False if it failed to start.
         """
+        if self._disabled:
+            logger.warning("Vibe-Trading not configured — skipping start")
+            return False
+
+        assert self._vibe_dir is not None  # guaranteed by _disabled check
+        vibe_dir: Path = self._vibe_dir
+
         if self.is_running:
             logger.info("vibe-trading-mcp already running")
             return True
 
-        mcp_server_path = self._vibe_dir / "mcp_server.py"
+        mcp_server_path = vibe_dir / "mcp_server.py"
         if not mcp_server_path.exists():
             logger.error("Vibe-Trading mcp_server.py not found", path=str(mcp_server_path))
             return False
 
         env = os.environ.copy()
         env.update(get_vibe_env_overrides())
-        env["PYTHONPATH"] = str(self._vibe_dir) + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(vibe_dir) + os.pathsep + env.get("PYTHONPATH", "")
 
         try:
             self._process = subprocess.Popen(
@@ -64,7 +72,7 @@ class VibeBridgeLifecycle:
                     str(self._port),
                 ],
                 env=env,
-                cwd=str(self._vibe_dir),
+                cwd=str(vibe_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,

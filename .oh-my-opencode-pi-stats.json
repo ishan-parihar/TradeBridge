@@ -1,12 +1,17 @@
 {
-  "updatedAt": 1778055250784,
+  "updatedAt": 1778056902349,
   "categories": {},
   "agents": {},
   "tools": {
     "pantheon_repo_map": {
+      "success": 2,
+      "failed": 0,
+      "totalDurationMs": 30
+    },
+    "pantheon_resume_context": {
       "success": 1,
       "failed": 0,
-      "totalDurationMs": 16
+      "totalDurationMs": 7
     }
   },
   "adapters": {},
@@ -24,6 +29,20 @@
       "status": "success",
       "durationMs": 16,
       "ts": 1778055250784
+    },
+    {
+      "kind": "tool",
+      "label": "pantheon_repo_map",
+      "status": "success",
+      "durationMs": 14,
+      "ts": 1778056785184
+    },
+    {
+      "kind": "tool",
+      "label": "pantheon_resume_context",
+      "status": "success",
+      "durationMs": 7,
+      "ts": 1778056902349
     }
   ]
 }
