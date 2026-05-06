@@ -1,6 +1,5 @@
 {
-  "updatedAt": 1778068297193,
+  "updatedAt": 1778070920513,
   "uncheckedTodos": [],
-  "lastAgentSummary": "Let me examine the bridge implementation and EA structure to plan the full implementation. Good, I have the full picture. Let me implement this step by step. **Step 1**: Make the combined bridge bind to `0.0.0.0` for Docker **Step 2**: Add combined target to Dockerfile **Step 3**: Build & test combined container **Step 4**: Create headless MT5 Docker container **Step 5**: Build & test full stack **Step 6**: Phase 4 reductions Good. Now let me add the combined target to the Dockerfile: Now create the full docker-compose with combined service + MT5 terminal: Now create the MT5 terminal Docker directory and Dockerfile: Now build and test the combined TradeBridge container first: All 7 tests pass for the combined container at **91 MB RSS**. Now let me build the MT5 terminal container. First let me check how the current Bottles setup attaches the EA: Let me take a pragmatic approach. I'll copy the pre-compiled EA and use a smart startup script: Now let me build the MT5 terminal container. This will take ~5-10 minutes (Wine + MT5 download): The build hangs on `wine wineboot --init`. Let me fix the Dockerfile with proper timeout and display: The MT5 installer in Wine is still running afte…",
   "recentBackgroundTaskIds": []
 }

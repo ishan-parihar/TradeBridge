@@ -55,6 +55,11 @@ RUN mkdir -pm755 /etc/apt/keyrings && \
 RUN rm -f /etc/apt/keyrings/winehq-archive.key
 
 # ============================================================================
+# MT5 binaries (pre-copied from host Bottles installation, avoids installer)
+# ============================================================================
+COPY deploy/mt5-terminal/mt5-bin/ /opt/tradebridge/mt5/
+
+# ============================================================================
 # Copy TradeBridge EA files (pre-compiled .ex5 + source)
 # ============================================================================
 COPY deploy/mt5-terminal/BridgeConnectorEA.ex5 /opt/tradebridge/ea/
