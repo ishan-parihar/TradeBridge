@@ -35,6 +35,10 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Large binaries (MT5 terminal) — copy from local Bottles installation
+# before Docker build using deploy/mt5-terminal/prepare-build.sh
+deploy/mt5-terminal/mt5-bin/
+
 # Build
 dist/
 build/

@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ─── Redis (optional message queue / cache) ──────────────────────────
   redis:
@@ -9,8 +7,6 @@ services:
       - "${MT5_REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
-    networks:
-      - TradeBridge-net
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -39,14 +35,16 @@ services:
       - "${MT5_MCP_PORT:-8010}:8010"
       - "${MT5_GATEWAY_PORT:-8020}:8020"
       - "${MT5_TCP_BRIDGE_PORT:-8025}:8025"
-    networks:
-      - TradeBridge-net
     depends_on:
       redis:
         condition: service_started
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8010/health\", timeout=5)'"]
+      test:
+        [
+          "CMD-SHELL",
+          'python -c ''import urllib.request; urllib.request.urlopen("http://127.0.0.1:8010/health", timeout=5)''',
+        ]
       interval: 15s
       timeout: 10s
       start_period: 20s
@@ -58,6 +56,9 @@ services:
       context: ..
       dockerfile: deploy/mt5-terminal/Dockerfile
     container_name: mt5-terminal
+    # Wine needs socket syscalls blocked by Docker's default seccomp profile
+    security_opt:
+      - seccomp:unconfined
     environment:
       - MT5_BROKER_LOGIN=${MT5_BROKER_LOGIN:-}
       - MT5_BROKER_PASSWORD=${MT5_BROKER_PASSWORD:-}
@@ -72,17 +73,10 @@ services:
       - "${MT5_TERMINAL_VNC_PORT:-5900}:5900"
     volumes:
       - mt5-config:/config
-    networks:
-      - TradeBridge-net
     depends_on:
       tradebridge:
         condition: service_healthy
     restart: unless-stopped
-
-networks:
-  TradeBridge-net:
-    driver: bridge
-    name: TradeBridge-net
 
 volumes:
   redis-data:
