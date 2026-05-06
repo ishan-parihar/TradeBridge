@@ -54,7 +54,9 @@ class VibeBridgeLifecycle:
 
         mcp_server_path = vibe_dir / "mcp_server.py"
         if not mcp_server_path.exists():
-            logger.error("Vibe-Trading mcp_server.py not found", path=str(mcp_server_path))
+            logger.error(
+                "Vibe-Trading mcp_server.py not found", path=str(mcp_server_path)
+            )
             return False
 
         env = os.environ.copy()
@@ -77,7 +79,11 @@ class VibeBridgeLifecycle:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-            logger.info("Started Vibe-Trading MCP server", pid=self._process.pid, port=self._port)
+            logger.info(
+                "Started Vibe-Trading MCP server",
+                pid=self._process.pid,
+                port=self._port,
+            )
         except Exception as e:
             logger.error("Failed to start Vibe-Trading MCP server", error=str(e))
             return False

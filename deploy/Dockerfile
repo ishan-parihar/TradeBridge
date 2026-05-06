@@ -102,3 +102,14 @@ FROM runtime AS mcp-server-target
 HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)" || exit 1
 CMD ["uvicorn", "apps.mcp_server.main:app", "--host", "0.0.0.0", "--port", "8010", "--no-access-log"]
+
+# combined: all 3 services in 1 process (TCP + HTTP Gateway + MCP Server)
+FROM runtime AS combined-target
+ENV MT5_MCP_HOST=0.0.0.0 \
+    MT5_MCP_PORT=8010 \
+    MT5_GATEWAY_HOST=0.0.0.0 \
+    MT5_GATEWAY_PORT=8020 \
+    MT5_TCP_BRIDGE_HOST=0.0.0.0
+HEALTHCHECK --interval=15s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=5)" || exit 1
+CMD ["python", "-m", "apps.bridge.main"]

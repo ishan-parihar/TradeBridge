@@ -50,7 +50,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Failed to auto-start Vibe-Trading", error=str(e))
     else:
-        logger.info("Vibe-Trading auto-start disabled (set VIBE_TRADING_AUTO_START=true to enable)")
+        logger.info(
+            "Vibe-Trading auto-start disabled (set VIBE_TRADING_AUTO_START=true to enable)"
+        )
 
     yield
 
@@ -196,7 +198,9 @@ async def bridge_bars(symbol: str, timeframe: str, count: int = 100) -> Bars:
 
     if ea_connected:
         # Use EA bridge
-        cmd_id = Q.enqueue("get_bars", {"symbol": symbol, "timeframe": timeframe, "count": count})
+        cmd_id = Q.enqueue(
+            "get_bars", {"symbol": symbol, "timeframe": timeframe, "count": count}
+        )
 
         # Poll for result (max 10 seconds)
         for _ in range(20):
@@ -282,8 +286,12 @@ async def bridge_terminal_heartbeat(request: Request) -> dict[str, str]:
 
     build = _to_int(data.get("build"))
     login = _to_int(data.get("login"))
-    account_id = data.get("account_id") if isinstance(data.get("account_id"), (str,)) else None
-    timestamp = data.get("timestamp") if isinstance(data.get("timestamp"), (str,)) else None
+    account_id = (
+        data.get("account_id") if isinstance(data.get("account_id"), (str,)) else None
+    )
+    timestamp = (
+        data.get("timestamp") if isinstance(data.get("timestamp"), (str,)) else None
+    )
 
     async with _heartbeat_lock:
         _last_heartbeat = {
@@ -529,7 +537,9 @@ async def bridge_results(request: Request) -> dict[str, str]:
     payload = data.get("payload")
     error = data.get("error")
 
-    logger.info(f"RESULTS_PARSED: request_id={request_id!r} status={status!r} error={error!r}")
+    logger.info(
+        f"RESULTS_PARSED: request_id={request_id!r} status={status!r} error={error!r}"
+    )
 
     if not request_id:
         raise HTTPException(status_code=422, detail="missing request_id")
