@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Any, Literal
 import httpx
 import time
 import uuid
 from datetime import datetime, timezone
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from mt5_mcp.observability.logging import setup_logging
@@ -21,7 +21,6 @@ from mt5_mcp.schemas.models import (
     PerformanceSummary,
     Position,
     ExecutionResult,
-    HealthStatus,
     MarginEstimateRequest,
     SymbolInfo,
     TerminalStatus,
@@ -81,7 +80,7 @@ from mt5_mcp.schemas.tools import (
     PortfolioExposureRequest,
     PreTradeGateRequest,
 )
-from mt5_mcp.policy.engine import validate_submit_order, get_policy
+from mt5_mcp.policy.engine import get_policy
 from mt5_mcp.services.agent_capabilities import (
     build_volatility_profile,
     calculate_position_size,
@@ -116,53 +115,37 @@ from mt5_mcp.services.news_service import (
     get_available_sources as _get_available_sources,
 )
 from mt5_mcp.schemas.tools import (
-    BracketOrderRequest,
-    BracketOrderResult,
-    SetTrailingStopRequest,
-    TrailingStopResult,
-    PriceAlertRequest,
-    PriceAlertResult,
-    PositionMonitorRequest,
-    PositionMonitorResult,
-    MarketRegimeRequest,
-    TradingPolicyStatusRequest,
     TradingPolicyConfigRequest,
-    PolicyConfigResult,
-    PolicyStatusResult,
-    TradeJournalQueryRequest,
-    MarketScanRequest,
     TradingDecisionSupportRequest,
     NewsFetchRequest,
     EconomicCalendarRequest,
     EATrailingStartRequest,
     EATrailingStopRequest,
-    EATrailingListResult,
-    EATrailingTickResult,
     EABracketStartRequest,
     EABracketStopRequest,
-    EABracketListResult,
-    EABracketTickResult,
     SafeShutdownRequest,
-    SafeShutdownResult,
     MLPredictRequest,
     DataImportRequest,
     HistoricalBarsRequest,
     HistoricalTicksRequest,
     HistoricalDealsRequest,
-    DataStatsRequest,
 )
 
 
-from mt5_mcp.services.cache import (
-    cache_get,
-    cache_set,
-    cache_invalidate_symbol,
-    get_all_cache_stats,
-)
 
 
 setup_logging()
 app = FastAPI(title="MT5 MCP Server", version="0.1.0")
+
+# Mount FastMCP SSE app for standard MCP protocol (Hermes/Claude connect here)
+from apps.mcp_server import mcp as fastmcp
+try:
+    app.mount("/mcp", fastmcp.sse_app())
+except Exception as e:
+    import logging
+    logging.getLogger("mt5_mcp.observability.logging").warning(
+        f"Failed to mount MCP SSE app: {e}",
+    )
 
 
 @app.middleware("http")
@@ -1774,7 +1757,6 @@ def tool_submit_market_order_via_bridge(req: TradeIntent) -> ExecutionResult:
 
         set_intent_id(req.intent_id)
     # Policy gate — enhanced with TradingPolicy engine
-    from mt5_mcp.policy.engine import get_policy
 
     policy = get_policy()
     decision = policy.validate_submit_order(
@@ -2132,7 +2114,6 @@ def tool_submit_pending_order(req: SubmitPendingOrderRequest) -> dict:
         from mt5_mcp.observability.logging import set_intent_id
 
         set_intent_id(req.intent_id)
-    from mt5_mcp.policy.engine import get_policy
 
     decision = get_policy().validate_submit_order(
         environment=get_settings_cached().environment,
@@ -3659,7 +3640,6 @@ def tool_place_bracket_order(req: BracketOrderRequest) -> BracketOrderResult:
             status="error",
             message="Trading is frozen",
         )
-    from mt5_mcp.policy.engine import get_policy
     import uuid
 
     # Policy gate
@@ -6227,7 +6207,6 @@ def tool_freeze_status() -> dict:
 @app.post("/tools/trading/policy_config", response_model=dict)
 def tool_policy_config(req: TradingPolicyConfigRequest) -> dict:
     """Update trading policy limits at runtime."""
-    from mt5_mcp.policy.engine import get_policy
 
     config_dict = req.model_dump(exclude_none=True)
     result = get_policy().update_limits(**config_dict)
@@ -6237,7 +6216,6 @@ def tool_policy_config(req: TradingPolicyConfigRequest) -> dict:
 @app.get("/tools/trading/policy_status", response_model=dict)
 def tool_policy_status() -> dict:
     """Return current policy limits and status."""
-    from mt5_mcp.policy.engine import get_policy
 
     policy = get_policy()
     return {
