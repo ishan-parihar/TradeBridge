@@ -1,5 +1,5 @@
 {
-  "updatedAt": 1778124648364,
+  "updatedAt": 1778127583300,
   "categories": {},
   "agents": {},
   "tools": {
@@ -19,7 +19,7 @@
   "background": {
     "queued": 0,
     "completed": 0,
-    "failed": 25,
+    "failed": 27,
     "cancelled": 0
   },
   "recent": [
@@ -217,6 +217,20 @@
       "label": "fixer:pantheon_lkg7qyjn",
       "status": "failed",
       "ts": 1778124648364,
+      "failureKind": "background"
+    },
+    {
+      "kind": "background",
+      "label": "fixer:pantheon_r2oxlzcv",
+      "status": "failed",
+      "ts": 1778127577296,
+      "failureKind": "background"
+    },
+    {
+      "kind": "background",
+      "label": "fixer:pantheon_o93dg234",
+      "status": "failed",
+      "ts": 1778127583300,
       "failureKind": "background"
     }
   ]
