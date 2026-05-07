@@ -67,6 +67,7 @@ services:
       - EA_TCP_PORT=8025
       - DISPLAY=:99
       - WINEDEBUG=-all
+      - XDG_RUNTIME_DIR=/tmp/runtime-root
       - MT5_CMD_OPTIONS=
       - MT5_ENABLE_VNC=
     ports:
@@ -76,7 +77,7 @@ services:
     depends_on:
       tradebridge:
         condition: service_healthy
-    restart: unless-stopped
+    restart: on-failure:2
 
 volumes:
   redis-data:

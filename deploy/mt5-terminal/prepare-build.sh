@@ -7,13 +7,13 @@ set -e
 # Find MT5 binary in Bottles or standard Wine prefix
 MT5_SOURCE=""
 if [ -f "$HOME/.local/share/bottles/bottles/Apps/drive_c/Program Files/MetaTrader 5/terminal64.exe" ]; then
-    MT5_SOURCE="$HOME/.local/share/bottles/bottles/Apps/drive_c/Program Files/MetaTrader 5"
+	MT5_SOURCE="$HOME/.local/share/bottles/bottles/Apps/drive_c/Program Files/MetaTrader 5"
 elif [ -f "$HOME/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" ]; then
-    MT5_SOURCE="$HOME/.wine/drive_c/Program Files/MetaTrader 5"
+	MT5_SOURCE="$HOME/.wine/drive_c/Program Files/MetaTrader 5"
 else
-    echo "ERROR: MT5 terminal64.exe not found in Bottles or Wine prefix."
-    echo "Install MetaTrader 5 first via Bottles or Wine."
-    exit 1
+	echo "ERROR: MT5 terminal64.exe not found in Bottles or Wine prefix."
+	echo "Install MetaTrader 5 first via Bottles or Wine."
+	exit 1
 fi
 
 DEST="$(cd "$(dirname "$0")/../.." && pwd)/deploy/mt5-terminal/mt5-bin"
@@ -33,8 +33,8 @@ echo "  ✅ Config/ ($(du -sh "$MT5_SOURCE/Config/" | cut -f1))"
 
 # Copy EA files (if compiled)
 if [ -f "$MT5_SOURCE/MQL5/Experts/BridgeConnectorEA.ex5" ]; then
-    cp "$MT5_SOURCE/MQL5/Experts/BridgeConnectorEA.ex5" "$(dirname "$0")/BridgeConnectorEA.ex5"
-    echo "  ✅ EA binary updated"
+	cp "$MT5_SOURCE/MQL5/Experts/BridgeConnectorEA.ex5" "$(dirname "$0")/BridgeConnectorEA.ex5"
+	echo "  ✅ EA binary updated"
 fi
 
 echo ""
