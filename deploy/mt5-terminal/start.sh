@@ -231,62 +231,51 @@ if [ -n "$MT5_BROKER_LOGIN" ] && [ -n "$MT5_BROKER_PASSWORD" ]; then
 	fi
 fi
 
-# ── Step 8d: Python 3.11 embeddable + MetaTrader5 pip → broker login ──────
-# Uses pre-cached Python 3.11 embeddable zip (not installer — WineHQ 11 handles it)
+# ── Step 8d: mt5linux bridge + Wine Python → MetaTrader5 login ─────────
 if [ -n "$MT5_BROKER_LOGIN" ] && [ -n "$MT5_BROKER_PASSWORD" ]; then
 	PY311="$WINEPREFIX/drive_c/Python311/python.exe"
-	GET_PIP="/opt/tradebridge/get-pip.py"
 	PY_ZIP="/opt/tradebridge/python-embed.zip"
+	GET_PIP="/opt/tradebridge/get-pip.py"
+	echo "[8d] mt5linux bridge for MT5 login..."
 	
-	echo "[8d] Setting up Python 3.11 + MetaTrader5 in Wine..."
-	
-	# Extract embeddable Python 3.11 if not present
+	# Setup Wine Python 3.11 + MetaTrader5
 	if [ ! -f "$PY311" ] && [ -f "$PY_ZIP" ]; then
-		echo "  Extracting Python 3.11 embeddable..."
 		mkdir -p "$WINEPREFIX/drive_c/Python311"
 		unzip -qo "$PY_ZIP" -d "$WINEPREFIX/drive_c/Python311"
-		# Enable site-packages (embeddable has it disabled)
 		sed -i 's/^#import site/import site/' "$WINEPREFIX/drive_c/Python311/python311._pth" 2>/dev/null || true
+		$wine_executable "$PY311" "$GET_PIP" --no-warn-script-location 2>/dev/null || true
 	fi
-	
-	# Bootstrap pip if needed
-	if [ -f "$PY311" ] && [ -f "$GET_PIP" ]; then
-		$wine_executable "$PY311" -m pip --version 2>/dev/null || {
-			echo "  Bootstrapping pip..."
-			$wine_executable "$PY311" "$GET_PIP" --no-warn-script-location 2>/dev/null || true
-		}
-	fi
-	
-	# Install MetaTrader5 if needed
 	if [ -f "$PY311" ]; then
-		$wine_executable "$PY311" -c "import MetaTrader5" 2>/dev/null || {
-			echo "  Installing MetaTrader5 pip package..."
-			$wine_executable "$PY311" -m pip install --no-cache-dir MetaTrader5 2>/dev/null || true
-		}
-		
-		# Login via Python (write script to file, avoid -c quoting issues)
-		echo "  Logging in via MetaTrader5 API..."
-		PY_SCRIPT="$WINEPREFIX/drive_c/Python311/mt5_login.py"
-		cat > "$PY_SCRIPT" << PYEOF
-import MetaTrader5 as mt5
-import sys, time
-# Try initialize — the key difference: NO path parameter, let it find running terminal
-init = mt5.initialize(timeout=15000)
+		$wine_executable "$PY311" -m pip install --no-cache-dir MetaTrader5 2>/dev/null || true
+	fi
+	
+	if [ -f "$PY311" ]; then
+		# Start persistent Wine Python backend that holds mt5.initialize()
+		$wine_executable "$PY311" -c "
+import MetaTrader5 as mt5, sys, json, signal
+signal.signal(signal.SIGINT, lambda *_: (mt5.shutdown(), sys.exit()))
+init = mt5.initialize()
 if init:
-    auth = mt5.login($MT5_BROKER_LOGIN, password='$MT5_BROKER_PASSWORD', server='$MT5_BROKER_SERVER')
+    auth = mt5.login(int(sys.argv[1]), password=sys.argv[2], server=sys.argv[3])
     if auth:
-        acct = mt5.account_info()
-        print(f'SUCCESS: {acct.login} balance={acct.balance} {acct.currency} equity={acct.equity}')
+        a = mt5.account_info()
+        json.dump({'status':'ok','login':a.login,'balance':a.balance}, open('/config/mt5_ok.json','w'))
+        print('LOGGED_IN', a.login, a.balance, a.currency)
+        import time
+        while True: time.sleep(60)
     else:
-        print(f'LOGIN_FAILED: {mt5.last_error()}')
-    mt5.shutdown()
+        json.dump({'status':'login_fail','error':str(mt5.last_error())}, open('/config/mt5_ok.json','w'))
+        print('LOGIN_FAIL', mt5.last_error())
 else:
-    print(f'INIT_FAILED: {mt5.last_error()}')
-PYEOF
-		LOGIN_RESULT=$($wine_executable "$PY311" "$PY_SCRIPT" 2>/dev/null || echo "EXECUTION_ERROR")
-		echo "  $LOGIN_RESULT"
-		if echo "$LOGIN_RESULT" | grep -q "SUCCESS"; then
-			echo "  ✅ Broker authenticated via MetaTrader5 API"
+    json.dump({'status':'init_fail','error':str(mt5.last_error())}, open('/config/mt5_ok.json','w'))
+    print('INIT_FAIL', mt5.last_error())
+" "$MT5_BROKER_LOGIN" "$MT5_BROKER_PASSWORD" "$MT5_BROKER_SERVER" >/dev/null 2>&1 &
+		echo "  Backend started (holds mt5.initialize() connection)"
+		
+		# Give it time, then check status
+		sleep 15
+		if [ -f "/config/mt5_ok.json" ]; then
+			echo "  Status: $(cat /config/mt5_ok.json)"
 		fi
 	fi
 fi
