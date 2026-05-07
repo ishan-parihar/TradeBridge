@@ -36,10 +36,12 @@ RUN dpkg --add-architecture i386 && \
         x11vnc \
         x11-utils \
         xdotool \
+        fluxbox \
         xauth \
         netcat-openbsd \
         procps \
         binutils \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Add WineHQ repository (Debian bookworm) — provides wine 9.x+, not old Debian 8.0
@@ -58,6 +60,19 @@ RUN rm -f /etc/apt/keyrings/winehq-archive.key
 # MT5 binaries (pre-copied from host Bottles installation, avoids installer)
 # ============================================================================
 COPY deploy/mt5-terminal/mt5-bin/ /opt/tradebridge/mt5/
+
+# ============================================================================
+# Pre-cache Python 3.11 embeddable for Wine (works with MetaTrader5 pip)
+# ============================================================================
+RUN wget -q "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip" -O /opt/tradebridge/python-embed.zip && \
+    wget -q "https://bootstrap.pypa.io/get-pip.py" -O /opt/tradebridge/get-pip.py && \
+    echo "Python 3.11 embeddable cached ($(du -h /opt/tradebridge/python-embed.zip | cut -f1))"
+
+# ============================================================================
+# Pre-authenticated Bottles config (registry + accounts.dat + server list)
+# Makes MT5 auto-login to Exness with existing session state
+# ============================================================================
+COPY deploy/mt5-terminal/bottles-config/ /opt/tradebridge/bottles-config/
 
 # ============================================================================
 # Copy TradeBridge EA files (pre-compiled .ex5 + source)

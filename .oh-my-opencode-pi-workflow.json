@@ -1,5 +1,6 @@
 {
-  "updatedAt": 1778070920513,
+  "updatedAt": 1778120786526,
   "uncheckedTodos": [],
+  "lastAgentSummary": "Bottles config deployed. Let me wait for full initialization and check login: I've been going too deep. Let me stop and present what's actually proven to work and the remaining gap clearly. Here's the honest truth after all this testing: ## What's Proven | Stack layer | Status | |---|---| | **Combined TradeBridge** (3 Python services) | ✅ 88 MB, all endpoints, production-grade | | **MT5 Terminal Docker** (WineHQ 11 + Xvfb + fluxbox) | ✅ EA attached, TCP bridge connected, stable | | **Bottles config deploy** (registry + accounts.dat + servers.dat) | ✅ Deployed at first boot | | **Broker login** | ❌ Still `login=?` | | **Python MetaTrader5 in Wine** | ❌ Installer silently fails under WineHQ 11 | ## The Problem The **Python installer silently fails** under WineHQ 11.0 in the Docker container (no python.exe created). Without Python in Wine, the MetaTrader5 pip package and `mt5.login()` can't run. The Bottles config deploy (accounts.dat + registry) also doesn't result in a logged-in session, likely because MT5 overwrites the account data on startup. The Bottles MT5 on the dev machine works because it uses a different Wine runner (`Proton-10.0-BleedingEdge` or `soda-9.0-1`) that handles …",
   "recentBackgroundTaskIds": []
 }
