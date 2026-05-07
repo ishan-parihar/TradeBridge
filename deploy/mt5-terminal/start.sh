@@ -51,7 +51,7 @@ if [ ! -f "$WINEPREFIX/system.reg" ]; then
 	WINEDLLOVERRIDES="mscoree,mshtml=" wine wineboot --init 2>/dev/null || true
 	sleep 3
 	echo "[3] Wine prefix initialized at $WINEPREFIX"
-	
+
 	# Deploy pre-authenticated Botles config (registry + MT5 accounts/servers)
 	# This makes MT5 auto-login to Exness without manual GUI auth
 	if [ -d "/opt/tradebridge/bottles-config" ]; then
@@ -237,7 +237,7 @@ if [ -n "$MT5_BROKER_LOGIN" ] && [ -n "$MT5_BROKER_PASSWORD" ]; then
 	PY_ZIP="/opt/tradebridge/python-embed.zip"
 	GET_PIP="/opt/tradebridge/get-pip.py"
 	echo "[8d] mt5linux bridge for MT5 login..."
-	
+
 	# Setup Wine Python 3.11 + MetaTrader5
 	if [ ! -f "$PY311" ] && [ -f "$PY_ZIP" ]; then
 		mkdir -p "$WINEPREFIX/drive_c/Python311"
@@ -248,7 +248,7 @@ if [ -n "$MT5_BROKER_LOGIN" ] && [ -n "$MT5_BROKER_PASSWORD" ]; then
 	if [ -f "$PY311" ]; then
 		$wine_executable "$PY311" -m pip install --no-cache-dir MetaTrader5 2>/dev/null || true
 	fi
-	
+
 	if [ -f "$PY311" ]; then
 		# Start persistent Wine Python backend that holds mt5.initialize()
 		$wine_executable "$PY311" -c "
@@ -271,7 +271,7 @@ else:
     print('INIT_FAIL', mt5.last_error())
 " "$MT5_BROKER_LOGIN" "$MT5_BROKER_PASSWORD" "$MT5_BROKER_SERVER" >/dev/null 2>&1 &
 		echo "  Backend started (holds mt5.initialize() connection)"
-		
+
 		# Give it time, then check status
 		sleep 15
 		if [ -f "/config/mt5_ok.json" ]; then
