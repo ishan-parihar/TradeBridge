@@ -231,53 +231,59 @@ if [ -n "$MT5_BROKER_LOGIN" ] && [ -n "$MT5_BROKER_PASSWORD" ]; then
 	fi
 fi
 
-# ── Step 8d: Python in Wine — programmatic broker login via MetaTrader5 API ──
-# Uses full Python installer (pre-cached in image at /opt/tradebridge/python-installer.exe)
-# with MetaTrader5 pip package for reliable broker login (works where /login: CLI flags fail)
+# ── Step 8d: Python 3.11 embeddable + MetaTrader5 pip → broker login ──────
+# Uses pre-cached Python 3.11 embeddable zip (not installer — WineHQ 11 handles it)
 if [ -n "$MT5_BROKER_LOGIN" ] && [ -n "$MT5_BROKER_PASSWORD" ]; then
-	echo "[8d] Python in Wine for MT5 login..."
-	
-	PY_INSTALLER="/opt/tradebridge/python-installer.exe"
+	PY311="$WINEPREFIX/drive_c/Python311/python.exe"
 	GET_PIP="/opt/tradebridge/get-pip.py"
+	PY_ZIP="/opt/tradebridge/python-embed.zip"
 	
-	# Install full Python if not present (use pre-cached installer, no download needed)
-	if ! $wine_executable python --version 2>/dev/null; then
-		if [ -f "$PY_INSTALLER" ]; then
-			echo "  Installing Python 3.9.13 (from cached installer)..."
-			# DISPLAY=:99 from the running Xvfb — do NOT use xvfb-run (causes conflict)
-			$wine_executable "$PY_INSTALLER" /quiet InstallAllUsers=1 PrependPath=1 2>/dev/null || true
-			sleep 15
-			# Bootstrap pip and verify
-			if $wine_executable python --version 2>/dev/null; then
-				echo "  ✅ Python installed: $($wine_executable python --version 2>&1)"
-				$wine_executable python "$GET_PIP" 2>/dev/null || true
-			else
-				echo "  Checking C:\\Python39 directly..."
-				PY_ALT="$WINEPREFIX/drive_c/Python39/python.exe"
-				if $wine_executable "$PY_ALT" --version 2>/dev/null; then
-					echo "  ✅ Python at alternative path"
-					# Can't use PATH, use full path for pip
-					$wine_executable "$PY_ALT" "$GET_PIP" 2>/dev/null || true
-				fi
-			fi
-		else
-			echo "  Python installer not found in image"
-		fi
+	echo "[8d] Setting up Python 3.11 + MetaTrader5 in Wine..."
+	
+	# Extract embeddable Python 3.11 if not present
+	if [ ! -f "$PY311" ] && [ -f "$PY_ZIP" ]; then
+		echo "  Extracting Python 3.11 embeddable..."
+		mkdir -p "$WINEPREFIX/drive_c/Python311"
+		unzip -qo "$PY_ZIP" -d "$WINEPREFIX/drive_c/Python311"
+		# Enable site-packages (embeddable has it disabled)
+		sed -i 's/^#import site/import site/' "$WINEPREFIX/drive_c/Python311/python311._pth" 2>/dev/null || true
 	fi
 	
-	# Install MetaTrader5 and login
-	if $wine_executable python --version 2>/dev/null; then
-		echo "  Installing MetaTrader5 pip package..."
-		$wine_executable python -m pip install --no-cache-dir MetaTrader5 2>/dev/null || true
+	# Bootstrap pip if needed
+	if [ -f "$PY311" ] && [ -f "$GET_PIP" ]; then
+		$wine_executable "$PY311" -m pip --version 2>/dev/null || {
+			echo "  Bootstrapping pip..."
+			$wine_executable "$PY311" "$GET_PIP" --no-warn-script-location 2>/dev/null || true
+		}
+	fi
+	
+	# Install MetaTrader5 if needed
+	if [ -f "$PY311" ]; then
+		$wine_executable "$PY311" -c "import MetaTrader5" 2>/dev/null || {
+			echo "  Installing MetaTrader5 pip package..."
+			$wine_executable "$PY311" -m pip install --no-cache-dir MetaTrader5 2>/dev/null || true
+		}
 		
-		echo "  Logging in via Python MetaTrader5 API..."
-		MT5_CMD="import MetaTrader5 as mt5"
-		MT5_CMD="$MT5_CMD; mt5.initialize()"
-		MT5_CMD="$MT5_CMD; auth=mt5.login($MT5_BROKER_LOGIN, password='$MT5_BROKER_PASSWORD', server='$MT5_BROKER_SERVER')"
-		MT5_CMD="$MT5_CMD; print('SUCCESS') if auth else print('FAILED:', mt5.last_error())"
-		MT5_CMD="$MT5_CMD; mt5.shutdown()"
-		
-		LOGIN_RESULT=$($wine_executable python -c "$MT5_CMD" 2>/dev/null)
+		# Login via Python (write script to file, avoid -c quoting issues)
+		echo "  Logging in via MetaTrader5 API..."
+		PY_SCRIPT="$WINEPREFIX/drive_c/Python311/mt5_login.py"
+		cat > "$PY_SCRIPT" << PYEOF
+import MetaTrader5 as mt5
+import sys, time
+# Try initialize — the key difference: NO path parameter, let it find running terminal
+init = mt5.initialize(timeout=15000)
+if init:
+    auth = mt5.login($MT5_BROKER_LOGIN, password='$MT5_BROKER_PASSWORD', server='$MT5_BROKER_SERVER')
+    if auth:
+        acct = mt5.account_info()
+        print(f'SUCCESS: {acct.login} balance={acct.balance} {acct.currency} equity={acct.equity}')
+    else:
+        print(f'LOGIN_FAILED: {mt5.last_error()}')
+    mt5.shutdown()
+else:
+    print(f'INIT_FAILED: {mt5.last_error()}')
+PYEOF
+		LOGIN_RESULT=$($wine_executable "$PY311" "$PY_SCRIPT" 2>/dev/null || echo "EXECUTION_ERROR")
 		echo "  $LOGIN_RESULT"
 		if echo "$LOGIN_RESULT" | grep -q "SUCCESS"; then
 			echo "  ✅ Broker authenticated via MetaTrader5 API"
