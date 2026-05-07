@@ -132,17 +132,17 @@ from mt5_mcp.schemas.tools import (
 )
 
 
-
-
 setup_logging()
 app = FastAPI(title="MT5 MCP Server", version="0.1.0")
 
 # Mount FastMCP SSE app for standard MCP protocol (Hermes/Claude connect here)
 from apps.mcp_server import mcp as fastmcp
+
 try:
     app.mount("/mcp", fastmcp.sse_app())
 except Exception as e:
     import logging
+
     logging.getLogger("mt5_mcp.observability.logging").warning(
         f"Failed to mount MCP SSE app: {e}",
     )
