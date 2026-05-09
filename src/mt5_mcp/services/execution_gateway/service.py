@@ -66,6 +66,19 @@ class ExecutionGateway:
         )
         self._idempotency_registry = IdempotencyCache()
 
+    def reload_adapter(self) -> ExecutionPort:
+        """Re-evaluate adapter selection. Replaces current adapter if EA is now connected."""
+        try:
+            ea_adapter = EABridgeAdapter()
+            if ea_adapter._check_ea_connected():
+                if not isinstance(self.adapter, EABridgeAdapter):
+                    logger.info("EA Bridge adapter re-connected, upgrading from fallback")
+                    self.adapter = ea_adapter
+                return self.adapter
+        except Exception as e:
+            logger.warning(f"EA Bridge adapter reload failed: {e}")
+        return self.adapter
+
     def _load_adapter(self, name: str) -> ExecutionPort:
         # Try EA Bridge adapter first (preferred when EA is connected)
         # Fall back to PyMT5 adapter if EA is not available

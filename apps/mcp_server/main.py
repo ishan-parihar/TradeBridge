@@ -136,9 +136,10 @@ setup_logging()
 app = FastAPI(title="MT5 MCP Server", version="0.1.0")
 
 # Mount FastMCP SSE app for standard MCP protocol (Hermes/Claude connect here)
-from apps.mcp_server import mcp as fastmcp
+from apps.mcp_server import create_mcp_server
 
 try:
+    fastmcp = create_mcp_server()
     app.mount("/mcp", fastmcp.sse_app())
 except Exception as e:
     import logging
@@ -731,6 +732,12 @@ def health() -> dict:
 
     status = "healthy"
     issues = []
+
+    # Re-evaluate adapter selection (detect EA bridge reconnection)
+    try:
+        get_gateway().reload_adapter()
+    except Exception as e:
+        issues.append(f"Adapter reload failed: {e}")
 
     # Check bridge connection
     bridge_connected = False
