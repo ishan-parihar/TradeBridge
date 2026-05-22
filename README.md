@@ -249,3 +249,5 @@ curl http://localhost:8010/health
 ## License
 
 MIT
+---
+Developed by [Ishan Parihar](https://github.com/ishan-parihar) — If you find this useful, [consider supporting](https://rzp.io/rzp/ishan-parihar)
